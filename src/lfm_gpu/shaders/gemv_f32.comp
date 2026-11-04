@@ -1,0 +1,41 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufferW {
+    float W[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer BufferX {
+    float x[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer BufferOut {
+    float out_vec[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n_cols;
+    uint n_rows;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.n_rows) return;
+
+    float sum = 0.0;
+    uint base = row * pc.n_cols;
+
+    /* Loop unrolled 4x for GPU instruction-level parallelism */
+    uint c = 0;
+    for (; c + 4 <= pc.n_cols; c += 4) {
+        sum += W[base + c + 0] * x[c + 0]
+             + W[base + c + 1] * x[c + 1]
+             + W[base + c + 2] * x[c + 2]
+             + W[base + c + 3] * x[c + 3];
+    }
+    for (; c < pc.n_cols; ++c) {
+        sum += W[base + c] * x[c];
+    }
+
+    out_vec[row] = sum;
+}

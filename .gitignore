@@ -1,0 +1,120 @@
+# ==============================================================================
+# Build Artifacts & Compiled Binaries
+# ==============================================================================
+build/
+bin/
+lib/
+lfm-run
+lfm-server
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# ==============================================================================
+# Debug Symbols, Crash Dumps & Profiling
+# ==============================================================================
+*.dSYM/
+*.su
+*.idb
+*.pdb
+core
+core.*
+vgcore.*
+gmon.out
+*.gcda
+*.gcno
+*.gcov
+asan.log*
+ubsan.log*
+tsan.log*
+
+# ==============================================================================
+# Heavy Model Weights & Binary Checkpoints (GGUF, SafeTensors, PyTorch)
+# Do NOT commit heavy weights to git.
+# Keep tests/ fixtures via explicit whitelist negation (!).
+# ==============================================================================
+models/*.gguf
+models/*.bin
+models/*.safetensors
+*.gguf
+!tests/*.gguf
+*.safetensors
+*.bin
+!tests/*.bin
+*.pth
+*.pt
+*.onnx
+
+# ==============================================================================
+# Prompt Caches & Golden Artifacts
+# ==============================================================================
+*.lfmcache
+*.lfm_golden
+tests/*.lfm_golden
+
+# ==============================================================================
+# Python Virtual Environments, Caches & Packaging
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+parts/
+var/
+wheels/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ==============================================================================
+# IDE, Editor & OS Artifacts
+# ==============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==============================================================================
+# Logs & Scratch Files
+# ==============================================================================
+*.log
+scratch/
+tmp/

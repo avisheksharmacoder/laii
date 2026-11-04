@@ -1,0 +1,131 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+/* Binding 0: Quantized Q4_K weight matrix stored in DEDICATED GDDR5 VRAM */
+layout(std430, set = 0, binding = 0) readonly buffer BufferW {
+    uint W[];
+};
+
+/* Binding 1: Input activation vector */
+layout(std430, set = 0, binding = 1) readonly buffer BufferX {
+    float x[];
+};
+
+/* Binding 2: Output vector */
+layout(std430, set = 0, binding = 2) writeonly buffer BufferOut {
+    float out_vec[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n_cols;
+    uint n_rows;
+} pc;
+
+/* Helper to extract a single byte from 3 packed uints holding scales[12] */
+uint get_scale_byte(uint w1, uint w2, uint w3, uint idx) {
+    if (idx < 4) return (w1 >> (idx * 8)) & 0xFFu;
+    if (idx < 8) return (w2 >> ((idx - 4) * 8)) & 0xFFu;
+    return (w3 >> ((idx - 8) * 8)) & 0xFFu;
+}
+
+void get_scale_min_k4(uint j, uint w1, uint w2, uint w3, out float sc, out float m) {
+    uint d_raw, m_raw;
+    if (j < 4) {
+        d_raw = get_scale_byte(w1, w2, w3, j) & 63u;
+        m_raw = get_scale_byte(w1, w2, w3, j + 4) & 63u;
+    } else {
+        d_raw = (get_scale_byte(w1, w2, w3, j + 4) & 0x0Fu) | ((get_scale_byte(w1, w2, w3, j - 4) >> 6) << 4);
+        m_raw = (get_scale_byte(w1, w2, w3, j + 4) >> 4)   | ((get_scale_byte(w1, w2, w3, j - 0) >> 6) << 4);
+    }
+    sc = float(d_raw);
+    m  = float(m_raw);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.n_rows) return;
+
+    uint nb = pc.n_cols / 256;
+    uint row_sb_base = row * nb * 36; /* 36 uints per 256-weight block in GDDR5 */
+
+    float total_sum = 0.0;
+
+    for (uint b = 0; b < nb; ++b) {
+        uint sb = row_sb_base + b * 36;
+
+        /* Unpack FP16 super-block scale d and min dmin */
+        vec2 d_dmin = unpackHalf2x16(W[sb + 0]);
+        float d_super    = d_dmin.x;
+        float dmin_super = d_dmin.y;
+
+        uint sc_w1 = W[sb + 1];
+        uint sc_w2 = W[sb + 2];
+        uint sc_w3 = W[sb + 3];
+
+        /* GGML Q4_K layout: 4 pairs of 32-element sub-blocks (256 weights total) */
+        for (uint p = 0; p < 4; ++p) {
+            uint is = p * 2;
+            float sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, sc_w1, sc_w2, sc_w3, sc1, m1);
+            get_scale_min_k4(is + 1, sc_w1, sc_w2, sc_w3, sc2, m2);
+
+            float d1   = d_super * sc1;
+            float min1 = dmin_super * m1;
+            float d2   = d_super * sc2;
+            float min2 = dmin_super * m2;
+
+            uint q_word_base = sb + 4 + p * 8;
+            uint j = b * 256 + p * 64;
+
+            float s1 = 0.0;
+            float s1_x = 0.0;
+            float s2 = 0.0;
+            float s2_x = 0.0;
+
+            for (uint u = 0; u < 8; ++u) {
+                uint word = W[q_word_base + u];
+                uint l = u * 4;
+
+                /* Byte 0 */
+                uint b0 = (word >> 0) & 0xFFu;
+                float x1_0 = x[j + l + 0];
+                float x2_0 = x[j + 32 + l + 0];
+                s1 += float(b0 & 0x0Fu) * x1_0;
+                s1_x += x1_0;
+                s2 += float(b0 >> 4) * x2_0;
+                s2_x += x2_0;
+
+                /* Byte 1 */
+                uint b1 = (word >> 8) & 0xFFu;
+                float x1_1 = x[j + l + 1];
+                float x2_1 = x[j + 32 + l + 1];
+                s1 += float(b1 & 0x0Fu) * x1_1;
+                s1_x += x1_1;
+                s2 += float(b1 >> 4) * x2_1;
+                s2_x += x2_1;
+
+                /* Byte 2 */
+                uint b2 = (word >> 16) & 0xFFu;
+                float x1_2 = x[j + l + 2];
+                float x2_2 = x[j + 32 + l + 2];
+                s1 += float(b2 & 0x0Fu) * x1_2;
+                s1_x += x1_2;
+                s2 += float(b2 >> 4) * x2_2;
+                s2_x += x2_2;
+
+                /* Byte 3 */
+                uint b3 = (word >> 24) & 0xFFu;
+                float x1_3 = x[j + l + 3];
+                float x2_3 = x[j + 32 + l + 3];
+                s1 += float(b3 & 0x0Fu) * x1_3;
+                s1_x += x1_3;
+                s2 += float(b3 >> 4) * x2_3;
+                s2_x += x2_3;
+            }
+
+            total_sum += (d1 * s1 - min1 * s1_x) + (d2 * s2 - min2 * s2_x);
+        }
+    }
+
+    out_vec[row] = total_sum;
+}

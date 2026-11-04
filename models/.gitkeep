@@ -1,0 +1,2 @@
+# Keep models directory in git. Model files (.gguf) are ignored by .gitignore.
+
