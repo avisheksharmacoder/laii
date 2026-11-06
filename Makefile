@@ -10,14 +10,18 @@ ifeq ($(HAS_AVX2), 1)
     CFLAGS += -mavx2 -mfma -mf16c
 endif
 
+ifeq ($(NATIVE), 1)
+    CFLAGS += -march=native
+endif
+
 SRC_CORE = src/arena.c src/gguf.c src/lfm_model.c src/lfm_simd.c src/lfm_fused.c src/lfm_threadpool.c src/lfm_forward.c src/lfm_tokenizer.c src/lfm_engine.c src/lfm_c_api.c src/lfm_server.c
 OBJ_CORE = $(SRC_CORE:src/%.c=build/%.o)
 
 TEST_BINS = bin/test_arena bin/test_math bin/test_simd_avx2 bin/test_quants bin/test_simd_kquants bin/test_fused_conv bin/test_threads bin/test_tokenizer bin/test_bpe bin/test_gguf bin/test_conv1d bin/test_attention bin/test_forward bin/test_c_api bin/test_lfm2_threadpool bin/test_optimizations bin/test_prefill_batch bin/test_decode_1x4 bin/test_kernels_fast bin/test_cpuid_quants bin/test_runtime_features bin/test_moe_checkpoint bin/test_cli_stream bin/test_sys_cache bin/test_lfm2_api bin/test_lfm2_server bin/test_hardening bin/test_simd_arm64 bin/test_android_io bin/test_speculative_pld
 
-.PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-parity
+.PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-parity cli server shared android python-wheel asan tsan parity help
 
-all: dirs lib lfm-run lfm-server bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld $(TEST_BINS)
+all: dirs lib lfm-run lfm-server bin/lfm2 bin/lfm2-server bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld $(TEST_BINS)
 
 dirs:
 	@mkdir -p build bin lib
@@ -34,7 +38,8 @@ lib/liblfm.so: $(OBJ_CORE)
 	$(CC) -shared $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 lib/liblfm2.so: src/lfm2_api.c include/lfm2.h | dirs
-	$(CC) -shared -fPIC -fvisibility=hidden $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(CC) -shared -fPIC -fvisibility=hidden $(CFLAGS) -Wl,-soname,liblfm2.so -Wl,-z,max-page-size=16384 $< -o $@ $(LDFLAGS)
+	@cp -f $@ ./liblfm2.so
 
 lfm-run: $(OBJ_CORE) build/main.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -51,8 +56,11 @@ bin/lfm2_bpe: tools/lfm2_bpe.c tools/lfm2_loader.c | dirs
 bin/lfm2_forward: tools/lfm2_forward.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-bin/lfm2_chat: tools/lfm2_chat.c tools/lfm2_bpe.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c | dirs
+bin/lfm2: tools/lfm2_chat.c tools/lfm2_bpe.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c | dirs
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+bin/lfm2_chat: bin/lfm2
+	@cp -f $< $@
 
 bin/lfm2_threadpool: tools/lfm2_threadpool.c | dirs
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -81,8 +89,15 @@ bin/lfm2_cli_stream: tools/lfm2_cli_stream.c | dirs
 bin/lfm2_sys_cache: tools/lfm2_sys_cache.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
 
-bin/lfm2_server: tools/lfm2_server.c lib/liblfm2.so | dirs
+bin/lfm2-server: tools/lfm2_server.c lib/liblfm2.so | dirs
 	$(CC) $(CFLAGS) -I. $< -Llib -llfm2 -Wl,-rpath,'$$ORIGIN/../lib' -o $@ $(LDFLAGS)
+
+bin/lfm2_server: bin/lfm2-server
+	@cp -f $< $@
+
+cli: bin/lfm2
+server: bin/lfm2-server
+shared: lib/liblfm2.so
 
 bin/lfm2_simd_arm64: tools/lfm2_simd_arm64.c | dirs
 	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
@@ -439,6 +454,39 @@ static-musl: dirs
 		echo "NOTE: $(MUSL_CC) not found on PATH. Install musl-tools (e.g. 'sudo apt install musl-tools') to build musl static binaries."; \
 	fi
 
+# Android NDK Configuration (Override via ANDROID_NDK_HOME and ANDROID_API)
+ANDROID_API   ?= 26
+NDK_HOST_TAG  ?= linux-x86_64
+NDK_LLVM_BIN  := $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(NDK_HOST_TAG)/bin
+ANDROID_CC    := $(NDK_LLVM_BIN)/aarch64-linux-android$(ANDROID_API)-clang
+
+android:
+	@if [ -z "$(ANDROID_NDK_HOME)" ]; then \
+		echo "[ERROR] ANDROID_NDK_HOME is not set."; exit 1; \
+	fi
+	@mkdir -p lib/android-arm64-v8a
+	@echo "[ANDROID-NDK] Compiling lib/android-arm64-v8a/liblfm2.so with $(ANDROID_CC)..."
+	@$(ANDROID_CC) -std=c11 -O3 -fPIC -fvisibility=hidden -pthread -Wall -Wextra \
+		-march=armv8.2-a+dotprod+fp16 \
+		-Iinclude -D_GNU_SOURCE \
+		-shared -Wl,-soname,liblfm2.so \
+		-Wl,-z,max-page-size=16384 \
+		src/lfm2_api.c -o lib/android-arm64-v8a/liblfm2.so -lm -llog
+	@echo "[ANDROID-NDK] Built lib/android-arm64-v8a/liblfm2.so"
+
+python-wheel:
+	@$(PYTHON) -m pip install -e . --no-build-isolation
+
+parity: lib fixtures
+	@if [ -z "$(MODEL)" ]; then \
+		echo "Usage: make parity MODEL=/path/to/LFM2.5-1.2B-Instruct-Q4_K_M.gguf [QUANT=Q4_K_M]"; \
+		exit 1; \
+	fi
+	@$(PYTHON) tests/verify_parity.py -m $(MODEL) --lib ./lib/liblfm2.so -q $(or $(QUANT),Q4_K_M)
+
+asan: test-asan
+tsan: test-tsan
+
 # AddressSanitizer and UndefinedBehaviorSanitizer memory safety test suite
 test-asan:
 	@echo "======================================================="
@@ -448,5 +496,19 @@ test-asan:
 	$(MAKE) all test-c-bins CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c)" LDFLAGS="-fsanitize=address,undefined -lm -lpthread"
 	$(MAKE) clean
 
+help:
+	@echo "LFM2.c Production C11 Build Targets:"
+	@echo "  make all                        - Build CLI, epoll HTTP server, static binaries, benchmarks and tests"
+	@echo "  make cli                        - Build interactive terminal CLI (bin/lfm2)"
+	@echo "  make server                     - Build epoll HTTP/SSE server (bin/lfm2-server)"
+	@echo "  make shared                     - Build liblfm2.so shared library"
+	@echo "  make static                     - Build stripped static Linux binaries (musl-gcc / gcc -static)"
+	@echo "  make NATIVE=1                   - Build with -march=native for host CPU"
+	@echo "  make android                    - Cross-compile arm64-v8a liblfm2.so via ANDROID_NDK_HOME"
+	@echo "  make python-wheel               - Build and install editable Python ctypes wheel"
+	@echo "  make asan / make tsan           - Run Address/UB Sanitizer or ThreadSanitizer suites"
+	@echo "  make parity MODEL=model.gguf    - Run 5-tier numerical & contract verification suite"
+	@echo "  make test                       - Run complete C, Python, and HTTP integration test suite"
+
 clean:
-	rm -rf build bin lib lfm-run lfm-server tests/fixtures_*.bin tests/*.gguf
+	rm -rf build bin lib lfm-run lfm-server ./liblfm2.so ./dist ./lfm2.egg-info

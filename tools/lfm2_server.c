@@ -956,15 +956,36 @@ int main(int argc, char **argv) {
     struct lfm2_context mock_c = {0};
     return lfm2_run_http_server(&mock_m, &mock_c, bind_ip, port);
 #else
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model.gguf> [port=8080] [bind_ip=127.0.0.1] [threads=0] [ctx=2048]\n", argv[0]);
+    const char *gguf_path = NULL;
+    uint16_t port = 8080;
+    const char *bind_ip = "127.0.0.1";
+    uint32_t threads = 0;
+    uint32_t max_seq_len = 2048;
+
+    for (int i = 1; i < argc; ++i) {
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
+            gguf_path = argv[++i];
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc) {
+            port = (uint16_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            bind_ip = argv[++i];
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = (uint32_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
+            max_seq_len = (uint32_t)atoi(argv[++i]);
+        } else if (argv[i][0] != '-') {
+            if (!gguf_path) {
+                gguf_path = argv[i];
+            } else if (port == 8080 && atoi(argv[i]) > 0) {
+                port = (uint16_t)atoi(argv[i]);
+            }
+        }
+    }
+
+    if (!gguf_path) {
+        fprintf(stderr, "Usage: %s -m <model.gguf> [--port 8080] [--bind 127.0.0.1] [--threads 0] [--ctx 2048]\n", argv[0]);
         return 1;
     }
-    const char *gguf_path = argv[1];
-    uint16_t port = (argc >= 3) ? (uint16_t)atoi(argv[2]) : 8080;
-    const char *bind_ip = (argc >= 4) ? argv[3] : "127.0.0.1";
-    uint32_t threads = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 0;
-    uint32_t max_seq_len = (argc >= 6) ? (uint32_t)atoi(argv[5]) : 2048;
 
     printf("[lfm2_server] Loading model: %s...\n", gguf_path);
     lfm2_model_t *model = lfm2_model_load(gguf_path, 1);

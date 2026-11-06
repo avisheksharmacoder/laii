@@ -290,7 +290,7 @@ static double time_now_ms(void) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <path-to-lfm2.gguf> [system_prompt] [--stop <string>]...\n", argv[0]);
+        fprintf(stderr, "Usage: %s -m <path-to-lfm2.gguf> [system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -298,25 +298,38 @@ int main(int argc, char **argv) {
     LFM2TerminalEnv term;
     lfm2_detect_terminal_env(&term);
 
-    const char *model_path = argv[1];
+    const char *model_path = NULL;
     const char *system_prompt = NULL;
     const char *prompt_cache_path = NULL;
     bool do_warmup = false;
     const char *extra_stops[LFM2_MAX_STOP_STRINGS];
     uint32_t n_extra_stops = 0;
 
-    for (int i = 2; i < argc; ++i) {
-        if (strcmp(argv[i], "--stop") == 0 && i + 1 < argc) {
+    for (int i = 1; i < argc; ++i) {
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
+            model_path = argv[++i];
+        } else if (strcmp(argv[i], "--stop") == 0 && i + 1 < argc) {
             if (n_extra_stops < LFM2_MAX_STOP_STRINGS) {
                 extra_stops[n_extra_stops++] = argv[++i];
             }
         } else if (strcmp(argv[i], "--prompt-cache") == 0 && i + 1 < argc) {
             prompt_cache_path = argv[++i];
-        } else if (strcmp(argv[i], "--warmup") == 0) {
+        } else if (strcmp(argv[i], "--warmup") == 0 || strcmp(argv[i], "--preload") == 0) {
             do_warmup = true;
-        } else if (argv[i][0] != '-' && system_prompt == NULL) {
-            system_prompt = argv[i];
+        } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
+            system_prompt = argv[++i];
+        } else if (argv[i][0] != '-') {
+            if (!model_path) {
+                model_path = argv[i];
+            } else if (!system_prompt) {
+                system_prompt = argv[i];
+            }
         }
+    }
+
+    if (!model_path) {
+        fprintf(stderr, "Usage: %s -m <path-to-lfm2.gguf> [system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
     LFM2Model model;
