@@ -1,0 +1,148 @@
+stages:
+  - verify
+  - build
+  - release
+
+variables:
+  GIT_SUBMODULE_STRATEGY: none
+  CI_GGUF_PATH: "build/ci_lfm2_tiny.gguf"
+
+# ==============================================================================
+# Stage 1: Sanitizer & Multi-ISA Numerical Parity Gates (Runs on Every Commit)
+# ==============================================================================
+verify:asan-ubsan-parity:
+  stage: verify
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends
+        build-essential gcc clang llvm python3 ca-certificates
+  script:
+    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+    - make asan
+    # 1. Run 5-Tier Parity Suite under ASan + UBSan with Hardware SIMD (AVX2 / VNNI)
+    - ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:verify_asan_link_order=0"
+      UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+      python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
+        --golden-file build/ci.lfm_golden --generate-golden
+    # 2. Verify Portable Scalar Fallback against the SIMD Golden Fixture (0.0 ULP check)
+    - LFM2_FORCE_ISA=scalar
+      ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:verify_asan_link_order=0"
+      python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
+        --golden-file build/ci.lfm_golden -q F32
+
+verify:tsan-threadpool:
+  stage: verify
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends
+        build-essential gcc clang llvm python3 util-linux ca-certificates
+  script:
+    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+    - make tsan
+    - TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1"
+      setarch x86_64 -R ./bin/lfm2-tsan -m "$CI_GGUF_PATH" -p "Test lock-free spin-barrier thread pool" -n 16
+
+# ==============================================================================
+# Stage 2: Production Artifacts (Static musl ELF, manylinux Wheel, Android NDK)
+# ==============================================================================
+build:linux-musl-static:
+  stage: build
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache build-base musl-dev linux-headers file binutils python3
+  script:
+    - make static CC=gcc
+    - strip --strip-unneeded bin/lfm2-static bin/lfm2-server-static
+    # Programmatically certify that the binary is 100% statically linked
+    - file bin/lfm2-static | grep -E "statically linked|static-pie linked"
+    - file bin/lfm2-server-static | grep -E "statically linked|static-pie linked"
+    - mkdir -p dist/linux-x86_64-static
+    - cp bin/lfm2-static dist/linux-x86_64-static/lfm2
+    - cp bin/lfm2-server-static dist/linux-x86_64-static/lfm2-server
+    - cp include/lfm2.h README.md dist/linux-x86_64-static/
+    - tar -czvf dist/lfm2-linux-x86_64-static.tar.gz -C dist/linux-x86_64-static .
+  artifacts:
+    name: "lfm2-linux-x86_64-static-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - dist/lfm2-linux-x86_64-static.tar.gz
+    expire_in: 30 days
+
+build:python-manylinux-x86_64:
+  stage: build
+  image: quay.io/pypa/manylinux_2_28_x86_64
+  script:
+    - /opt/python/cp312-cp312/bin/python -m pip wheel . --no-deps -w build/raw_wheel
+    # Repackage as ABI-agnostic py3-none-manylinux_2_28_x86_64 (works on Python 3.10-3.14+)
+    - /opt/python/cp312-cp312/bin/python -m pip install wheel
+    - |
+      for whl in build/raw_wheel/*.whl; do
+        /opt/python/cp312-cp312/bin/wheel tags --python-tag py3 --abi-tag none \
+          --platform-tag manylinux_2_28_x86_64 --remove "$whl"
+      done
+    - mkdir -p dist
+    - cp build/raw_wheel/*.whl dist/
+    # Smoke-test the built wheel on Python 3.13 inside the container
+    - /opt/python/cp313-cp313/bin/pip install dist/*.whl
+    - /opt/python/cp313-cp313/bin/python tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+    - /opt/python/cp313-cp313/bin/python -c "
+      from lfm2 import LFM2Model;
+      m = LFM2Model('$CI_GGUF_PATH');
+      print('Verified manylinux wheel on Python 3.13:', m.info)
+      "
+  artifacts:
+    name: "lfm2-manylinux-x86_64-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - dist/*.whl
+    expire_in: 30 days
+
+build:android-arm64-ndk:
+  stage: build
+  image: debian:bookworm-slim
+  variables:
+    NDK_VERSION: "r27c"
+    ANDROID_NDK_HOME: "/opt/android-ndk-${NDK_VERSION}"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends
+        curl unzip make ca-certificates binutils
+    - curl -fsSL "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" -o /tmp/ndk.zip
+    - unzip -q /tmp/ndk.zip -d /opt && rm /tmp/ndk.zip
+  script:
+    - make android ANDROID_NDK_HOME="$ANDROID_NDK_HOME" ANDROID_API=26
+    # Certify Android 15+ (API 35) 16 KB (0x4000) ELF LOAD segment alignment
+    - |
+      "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -l \
+        lib/android-arm64-v8a/liblfm2.so | grep "LOAD" | awk '{print $NF}' | while read -r align; do
+        if [ "$align" != "0x4000" ] && [ "$align" != "0x10000" ]; then
+          echo "[FAIL] Android ELF LOAD segment alignment is $align (expected >= 0x4000 for 16KB pages)";
+          exit 1;
+        fi
+      done
+    - echo "[PASS] Android arm64-v8a liblfm2.so verified with 16 KB page alignment"
+    - mkdir -p dist/android-arm64-v8a
+    - cp lib/android-arm64-v8a/liblfm2.so include/lfm2.h python/lfm2.py dist/android-arm64-v8a/
+    - tar -czvf dist/lfm2-android-arm64-v8a.tar.gz -C dist/android-arm64-v8a .
+  artifacts:
+    name: "lfm2-android-arm64-v8a-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - dist/lfm2-android-arm64-v8a.tar.gz
+    expire_in: 30 days
+
+# ==============================================================================
+# Stage 3: Automated Release Publishing on Git Tags (v*)
+# ==============================================================================
+release:publish:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - build:linux-musl-static
+    - build:python-manylinux-x86_64
+    - build:android-arm64-ndk
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+.*$/
+  script:
+    - echo "Publishing LFM2.c release ${CI_COMMIT_TAG}"
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "LFM2.c ${CI_COMMIT_TAG}"
+    description: "Zero-dependency C11 LFM2/LFM2.5 inference engine release (${CI_COMMIT_TAG})."
+

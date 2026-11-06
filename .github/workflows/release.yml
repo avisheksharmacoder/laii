@@ -1,0 +1,195 @@
+name: LFM2.c CI & Release Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+env:
+  CI_GGUF_PATH: build/ci_lfm2_tiny.gguf
+
+jobs:
+  # ============================================================================
+  # Job 1: AddressSanitizer, UBSan, ThreadSanitizer & Numerical Parity Gate
+  # ============================================================================
+  sanitizers-and-parity:
+    name: "Sanitizers (ASan/UBSan/TSan) & 5-Tier Parity"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Synthetic 4-Layer Hybrid LFM2 GGUF Fixture
+        run: python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+
+      - name: Build & Run ASan + UBSan Parity Suite (AVX2/VNNI vs Scalar)
+        run: |
+          make asan
+          export ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:verify_asan_link_order=0"
+          export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+
+          # 1. Generate golden logits using hardware SIMD path
+          python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
+            --golden-file build/ci.lfm_golden --generate-golden
+
+          # 2. Verify portable scalar fallback matches SIMD golden logits
+          LFM2_FORCE_ISA=scalar python3 tests/verify_parity.py \
+            -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
+            --golden-file build/ci.lfm_golden -q F32
+
+      - name: Build & Run ThreadSanitizer (TSan) on Spin-Barrier Pool
+        run: |
+          make clean
+          make tsan
+          TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
+            setarch x86_64 -R ./bin/lfm2-tsan -m "$CI_GGUF_PATH" -p "Verify lock-free barrier" -n 16
+
+  # ============================================================================
+  # Job 2: Zero-Dependency Static Linux ELF Binaries (musl-gcc)
+  # ============================================================================
+  build-static-linux:
+    name: "Static Linux ELF (musl-gcc x86_64)"
+    needs: sanitizers-and-parity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools file
+
+      - name: Build Stripped Static CLI & epoll HTTP Server
+        run: |
+          make static MUSL_CC=musl-gcc
+          strip --strip-unneeded bin/lfm2-static bin/lfm2-server-static
+
+          # Verify zero dynamic library dependencies
+          file bin/lfm2-static | grep -E "statically linked|static-pie linked"
+          file bin/lfm2-server-static | grep -E "statically linked|static-pie linked"
+
+          mkdir -p dist/lfm2-linux-x86_64-static
+          cp bin/lfm2-static dist/lfm2-linux-x86_64-static/lfm2
+          cp bin/lfm2-server-static dist/lfm2-linux-x86_64-static/lfm2-server
+          cp include/lfm2.h README.md dist/lfm2-linux-x86_64-static/
+          tar -czvf dist/lfm2-linux-x86_64-static.tar.gz -C dist/lfm2-linux-x86_64-static .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lfm2-linux-x86_64-static
+          path: dist/lfm2-linux-x86_64-static.tar.gz
+
+  # ============================================================================
+  # Job 3: Python manylinux Wheels (x86_64 & ARM64 aarch64)
+  # ============================================================================
+  build-manylinux-wheels:
+    name: "Python manylinux Wheel (${{ matrix.arch }})"
+    needs: sanitizers-and-parity
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            plat_tag: manylinux_2_28_x86_64
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & Retag ABI-Agnostic py3-none-${{ matrix.plat_tag }} Wheel
+        run: |
+          /opt/python/cp312-cp312/bin/python -m pip wheel . --no-deps -w build/raw_wheel
+          /opt/python/cp312-cp312/bin/python -m pip install wheel
+          for whl in build/raw_wheel/*.whl; do
+            /opt/python/cp312-cp312/bin/wheel tags \
+              --python-tag py3 \
+              --abi-tag none \
+              --platform-tag "${{ matrix.plat_tag }}" \
+              --remove "$whl"
+          done
+          mkdir -p dist
+          cp build/raw_wheel/*.whl dist/
+
+      - name: Test Installed Wheel on Python 3.13
+        run: |
+          /opt/python/cp313-cp313/bin/pip install dist/*.whl
+          /opt/python/cp313-cp313/bin/python tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+          /opt/python/cp313-cp313/bin/python -c "
+          from lfm2 import LFM2Model
+          with LFM2Model('$CI_GGUF_PATH') as m:
+              print('Loaded on ${{ matrix.arch }}:', m.info)
+              with m.create_context(max_seq_len=256) as ctx:
+                  emb = ctx.embed('CI smoke test')
+                  assert len(emb) == 256
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lfm2-wheel-${{ matrix.arch }}
+          path: dist/*.whl
+
+  # ============================================================================
+  # Job 4: Android NDK arm64-v8a Build & 16 KB Page-Alignment Audit
+  # ============================================================================
+  build-android-arm64:
+    name: "Android NDK arm64-v8a (16KB Page Safe)"
+    needs: sanitizers-and-parity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross-Compile Android arm64-v8a liblfm2.so & Verify 16KB ELF Alignment
+        run: |
+          make android ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ANDROID_API=26
+
+          READELF="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -l lib/android-arm64-v8a/liblfm2.so | grep "LOAD" | awk '{print $NF}' | while read -r align; do
+            if [ "$align" != "0x4000" ] && [ "$align" != "0x10000" ]; then
+              echo "::error::Android ELF LOAD alignment is $align (expected >= 0x4000)"
+              exit 1
+            fi
+          done
+
+          mkdir -p dist/android-arm64-v8a
+          cp lib/android-arm64-v8a/liblfm2.so include/lfm2.h python/lfm2.py dist/android-arm64-v8a/
+          cp -r p4a-recipes dist/android-arm64-v8a/ 2>/dev/null || true
+          tar -czvf dist/lfm2-android-arm64-v8a.tar.gz -C dist/android-arm64-v8a .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lfm2-android-arm64-v8a
+          path: dist/lfm2-android-arm64-v8a.tar.gz
+
+  # ============================================================================
+  # Job 5: Publish GitHub Release on Tag Push (v*)
+  # ============================================================================
+  publish-release:
+    name: "Publish GitHub Release"
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-static-linux
+      - build-manylinux-wheels
+      - build-android-arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Generate SHA256 Checksums
+        run: |
+          cd release_assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release & Upload Binaries / Wheels
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          generate_release_notes: true
+

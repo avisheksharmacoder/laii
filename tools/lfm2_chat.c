@@ -301,6 +301,8 @@ int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *system_prompt = NULL;
     const char *prompt_cache_path = NULL;
+    const char *single_prompt = NULL;
+    uint32_t max_turn_tokens = 256;
     bool do_warmup = false;
     const char *extra_stops[LFM2_MAX_STOP_STRINGS];
     uint32_t n_extra_stops = 0;
@@ -308,6 +310,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
             model_path = argv[++i];
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
+            single_prompt = argv[++i];
+        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--n-predict") == 0) && i + 1 < argc) {
+            max_turn_tokens = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--stop") == 0 && i + 1 < argc) {
             if (n_extra_stops < LFM2_MAX_STOP_STRINGS) {
                 extra_stops[n_extra_stops++] = argv[++i];
@@ -328,7 +334,7 @@ int main(int argc, char **argv) {
     }
 
     if (!model_path) {
-        fprintf(stderr, "Usage: %s -m <path-to-lfm2.gguf> [system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s -m <path-to-lfm2.gguf> [-p <prompt>] [-n <max_tokens>] [system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -377,20 +383,22 @@ int main(int argc, char **argv) {
         lfm2_stream_filter_add_stop(&stream_filter, extra_stops[i]);
     }
 
-    FILE *out = term.log_stream;
-    fprintf(out, "================================================================\n");
-    fprintf(out, " Liquid AI LFM2 / LFM2.5 Zero-Dependency C11 Terminal Chat\n");
-    fprintf(out, " Model   : %s (%u layers, %u vocab, max_seq=%u)\n",
-            model.cfg.arch, model.cfg.n_layers, model.cfg.n_vocab, state.max_seq_len);
-    fprintf(out, " Tokens  : BOS=%u (<|startoftext|>) | IM_START=%u | IM_END=%u\n",
-            vocab.id_bos, vocab.id_im_start, vocab.id_im_end);
-    fprintf(out, " Sampler : temp=%.2f | min_p=%.2f | top_k=%u | rep_penalty=%.2f\n",
-            sampler.temperature, sampler.min_p, sampler.top_k, sampler.rep_penalty);
-    fprintf(out, " Filter  : UTF-8 boundary buffer active | %u stop strings registered\n",
-            stream_filter.n_stops);
-    fprintf(out, " Signals : Two-stage SIGINT active (Ctrl+C cancels turn, 2nd exits)\n");
-    fprintf(out, " Commands: /reset (clear state), /temp <f>, /minp <f>, /max <n>, /exit\n");
-    fprintf(out, "================================================================\n");
+    if (!single_prompt) {
+        FILE *out = term.log_stream;
+        fprintf(out, "================================================================\n");
+        fprintf(out, " Liquid AI LFM2 / LFM2.5 Zero-Dependency C11 Terminal Chat\n");
+        fprintf(out, " Model   : %s (%u layers, %u vocab, max_seq=%u)\n",
+                model.cfg.arch, model.cfg.n_layers, model.cfg.n_vocab, state.max_seq_len);
+        fprintf(out, " Tokens  : BOS=%u (<|startoftext|>) | IM_START=%u | IM_END=%u\n",
+                vocab.id_bos, vocab.id_im_start, vocab.id_im_end);
+        fprintf(out, " Sampler : temp=%.2f | min_p=%.2f | top_k=%u | rep_penalty=%.2f\n",
+                sampler.temperature, sampler.min_p, sampler.top_k, sampler.rep_penalty);
+        fprintf(out, " Filter  : UTF-8 boundary buffer active | %u stop strings registered\n",
+                stream_filter.n_stops);
+        fprintf(out, " Signals : Two-stage SIGINT active (Ctrl+C cancels turn, 2nd exits)\n");
+        fprintf(out, " Commands: /reset (clear state), /temp <f>, /minp <f>, /max <n>, /exit\n");
+        fprintf(out, "================================================================\n");
+    }
 
     uint32_t pos = 0;
     bool cache_restored = false;
@@ -427,10 +435,70 @@ int main(int argc, char **argv) {
         }
     }
 
-    uint32_t max_turn_tokens = 256;
     char user_input[2048];
     char formatted_prompt[4096];
     uint32_t prompt_ids[2048];
+
+    if (single_prompt != NULL) {
+        /* Single-shot non-interactive or UNIX pipe mode */
+        lfm2_format_chatml_turn(&formatter, single_prompt, (pos == 0),
+                                formatted_prompt, sizeof(formatted_prompt));
+        uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, 2048);
+        if (n_prompt == 0 || pos + n_prompt >= state.max_seq_len) {
+            fprintf(stderr, "[ERROR] Prompt empty or exceeds max context length (%u >= %u)\n",
+                    pos + n_prompt, state.max_seq_len);
+            lfm2_sampler_free(&sampler);
+            lfm2_batch_state_free(&state);
+            lfm2_vocab_free(&vocab);
+            lfm2_free_model(&model);
+            return EXIT_FAILURE;
+        }
+
+        double t_prefill_start = time_now_ms();
+        for (uint32_t i = 0; i < n_prompt; ++i) {
+            lfm2_sampler_accept(&sampler, prompt_ids[i]);
+        }
+        float *logits = lfm2_prefill_prompt(&model, &state, prompt_ids, n_prompt, &pos);
+        double prefill_ms = time_now_ms() - t_prefill_start;
+
+        double t_decode_start = time_now_ms();
+        uint32_t gen_tokens = 0;
+        lfm2_stream_filter_reset(&stream_filter);
+
+        while (pos < state.max_seq_len && gen_tokens < max_turn_tokens) {
+            uint32_t next_id = lfm2_sample_token(&sampler, logits);
+            gen_tokens++;
+
+            if (next_id == vocab.id_im_end || next_id == vocab.id_bos) {
+                break;
+            }
+
+            char tok_buf[512];
+            size_t tok_len = lfm2_detokenize_token(&vocab, next_id, tok_buf, sizeof(tok_buf));
+            lfm2_stream_status_t s_st = lfm2_stream_filter_feed(&stream_filter, tok_buf, tok_len);
+            if (s_st == LFM2_STREAM_STOPPED) {
+                break;
+            }
+
+            logits = lfm2_forward_batch(&model, &state, &next_id, 1, pos++, true);
+        }
+
+        lfm2_stream_filter_flush(&stream_filter);
+        printf("\n");
+        fflush(stdout);
+        double decode_ms = time_now_ms() - t_decode_start;
+
+        fprintf(term.log_stream, "[prefill: %u tok in %.1f ms (%.1f tok/s) | "
+                                 "decode: %u tok in %.1f ms (%.2f tok/s) | ctx: %u]\n",
+                n_prompt, prefill_ms, (n_prompt * 1000.0) / (prefill_ms + 1e-6),
+                gen_tokens, decode_ms, (gen_tokens * 1000.0) / (decode_ms + 1e-6), pos);
+
+        lfm2_sampler_free(&sampler);
+        lfm2_batch_state_free(&state);
+        lfm2_vocab_free(&vocab);
+        lfm2_free_model(&model);
+        return EXIT_SUCCESS;
+    }
 
     while (1) {
         if (lfm2_sigint_should_exit()) break;

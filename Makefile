@@ -119,7 +119,10 @@ bin/lfm_nv_generate: src/lfm_nv/lfm_nv_vulkan.c src/lfm_nv/lfm_nv_engine.c src/l
 
 
 
-static: dirs bin/lfm-run-static bin/lfm-server-static bin/lfm2-loader-static bin/lfm2-bpe-static bin/lfm2-threadpool-static bin/lfm2-forward-static bin/lfm2-chat-static bin/lfm2-prefill-static bin/lfm2-decode-1x4-static bin/lfm2-kernels-fast-static bin/lfm2-cpuid-quants-static bin/lfm2-runtime-features-static bin/lfm2-moe-checkpoint-static bin/lfm2-cli-stream-static bin/lfm2-sys-cache-static bin/lfm2-server-static bin/lfm2-simd-arm64-static bin/lfm2-speculative-pld-static
+static: dirs bin/lfm2-static bin/lfm-run-static bin/lfm-server-static bin/lfm2-loader-static bin/lfm2-bpe-static bin/lfm2-threadpool-static bin/lfm2-forward-static bin/lfm2-chat-static bin/lfm2-prefill-static bin/lfm2-decode-1x4-static bin/lfm2-kernels-fast-static bin/lfm2-cpuid-quants-static bin/lfm2-runtime-features-static bin/lfm2-moe-checkpoint-static bin/lfm2-cli-stream-static bin/lfm2-sys-cache-static bin/lfm2-server-static bin/lfm2-simd-arm64-static bin/lfm2-speculative-pld-static
+
+bin/lfm2-static: bin/lfm2-chat-static
+	@cp -f $< $@
 
 bin/lfm-run-static: $(OBJ_CORE) build/main.o
 	$(CC) $(CFLAGS) -static $^ -o $@ $(LDFLAGS)
@@ -429,7 +432,10 @@ test: test-core static-test
 
 
 # ThreadSanitizer data race detection test suite
-test-tsan: lib fixtures
+bin/lfm2-tsan: tools/lfm2_chat.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c | dirs
+	$(CC) -std=c11 -O1 -g -fsanitize=thread -fPIC -Wall -Wextra -Wno-unused-function -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c) $< -o $@ $(LDFLAGS)
+
+test-tsan: lib fixtures bin/lfm2-tsan
 	@echo "======================================================="
 	@echo "Running ThreadSanitizer Concurrency & Data Race Suite  "
 	@echo "======================================================="
@@ -494,7 +500,6 @@ test-asan:
 	@echo "======================================================="
 	$(MAKE) clean
 	$(MAKE) all test-c-bins CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c)" LDFLAGS="-fsanitize=address,undefined -lm -lpthread"
-	$(MAKE) clean
 
 help:
 	@echo "LFM2.c Production C11 Build Targets:"
