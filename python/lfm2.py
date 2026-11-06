@@ -10,6 +10,8 @@ Not affiliated with, endorsed by, or sponsored by Liquid AI, Inc.
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
@@ -142,15 +144,41 @@ def _find_liblfm2(lib_path: str | Path | None = None) -> Path:
         p = Path(lib_path)
         if p.exists():
             return p
+
+    # 1. Check explicit environment override
+    env_path = os.environ.get("LFM2_LIB_PATH")
+    if env_path and Path(env_path).exists():
+        return Path(env_path)
+
+    # 2. Package directory (for wheel/pip installed distributions) and workspace
+    pkg_dir = Path(__file__).resolve().parent
     candidates = [
+        pkg_dir / "liblfm2.so",
+        pkg_dir / "lib" / "liblfm2.so",
+        pkg_dir.parent / "lib" / "liblfm2.so",
+        pkg_dir.parent / "liblfm2.so",
         Path("./lib/liblfm2.so"),
         Path("./liblfm2.so"),
-        Path(__file__).resolve().parent.parent / "lib" / "liblfm2.so",
-        Path(__file__).resolve().parent.parent / "liblfm2.so",
     ]
+
+    # 3. Android Scoped Storage / Private native library locations
+    for env_var in ("ANDROID_PRIVATE", "ANDROID_APP_PATH"):
+        android_dir = os.environ.get(env_var)
+        if android_dir:
+            candidates.extend([
+                Path(android_dir) / "lib" / "liblfm2.so",
+                Path(android_dir) / "liblfm2.so",
+            ])
+
     for c in candidates:
         if c.exists():
             return c
+
+    # 4. System library fallback via ld.so
+    sys_lib = ctypes.util.find_library("lfm2")
+    if sys_lib:
+        return Path(sys_lib)
+
     return Path(lib_path or "./lib/liblfm2.so")
 
 

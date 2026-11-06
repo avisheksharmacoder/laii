@@ -8,8 +8,26 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#ifndef LFM2_SPECULATIVE_PLD_INCLUDED
+#define LFM2_SPECULATIVE_PLD_INCLUDED 1
+
+#if __has_include("lfm2_speculative_pld.h")
+#include "lfm2_speculative_pld.h"
+#elif __has_include("include/lfm2_speculative_pld.h")
 #include "include/lfm2_speculative_pld.h"
+#else
+#include "../include/lfm2_speculative_pld.h"
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -492,8 +510,10 @@ uint32_t lfm2_speculative_decode_step(const LFM2Model *m,
     uint32_t n_accepted = 0;
     uint32_t n_emitted  = 0;
     uint32_t final_tok  = 0;
+    uint32_t last_b     = 0;
 
     for (uint32_t b = 0; b < B; ++b) {
+        last_b = b;
         float *slot_logits = logits_batch + (size_t)b * V;
         const uint32_t sampled_id = sample_fn(slot_logits, V, user_sampler);
 
@@ -518,6 +538,10 @@ uint32_t lfm2_speculative_decode_step(const LFM2Model *m,
     /* 5. If fewer than K drafts accepted, snap ShortConv state to conv_trace[n_accepted] in <10 us */
     if (n_accepted < K) {
         lfm2_restore_shortconv_trace_slot(ss, m, n_accepted);
+    }
+
+    if (ss->base.logits && logits_batch) {
+        memcpy(ss->base.logits, logits_batch + (size_t)last_b * V, V * sizeof(float));
     }
 
     /* 6. Update state cursors and adaptive draft window */
@@ -732,4 +756,6 @@ int main(int argc, char **argv) {
 }
 
 #endif /* LFM2_SPECULATIVE_PLD_NO_MAIN */
+
+#endif /* LFM2_SPECULATIVE_PLD_INCLUDED */
 

@@ -64,9 +64,20 @@ This checklist outlines the four actionable tasks identified from the system har
 
 ---
 
-### Task 7: Tag the `v1.0.0` Release [COMPLETED]
+### Task 8: Cross-Platform & Packaging Seams Closure (`v1.0.0` Polish) [COMPLETED]
+- **Objective:** Close the three cross-platform and packaging seams: ARM64 non-matmul kernels, 8-token speculative verification FIFO in public C ABI, and turnkey Python wheel builder.
+- **Status:** **Completed & Verified.**
+  - **ARM64 NEON Non-MatMul Kernels:** Implemented `#elif defined(__aarch64__)` vector routines in `tools/lfm2_kernels_fast.c` and `tools/lfm2_runtime_features.c` (`lfm2_shortconv_gate_conv_quant_neon`, `lfm2_qk_norm_rope_neon`, `lfm2_online_gqa_f16_worker_neon`, `lfm2_kv_cache_shift_sinks_neon`) with `vfmsq_f32` and `vfmaq_f32` numerical parity.
+  - **8-Token Speculative FIFO in C API:** Integrated `LFM2SpecFifoItem` and `LFM2SpecState` directly into `struct lfm2_context` in `src/lfm2_api.c`. Enforced 64-byte aligned context allocation via `posix_memalign`, causal PDA/<think> budget verification callbacks, mid-batch stop-string rollback via `lfm2_restore_shortconv_trace_slot`, and zero heap allocations during decode.
+  - **Turnkey Python Wheel Packaging:** Added PEP 517 `pyproject.toml` and C11-compiling `setup.py` producing platform-tagged wheels (`lfm2-1.0.0-cp314-cp314-linux_x86_64.whl`) bundling `liblfm2.so`.
+  - **Shared Library Resolver:** Updated `_find_liblfm2()` in `python/lfm2.py` with multi-tier discovery (wheel package dir, workspace `./lib/liblfm2.so`, `LFM2_LIB_PATH` env var, Android `ANDROID_PRIVATE`/`ANDROID_APP_PATH`, and system `ld.so`).
+  - **Sanitizer Certification:** All 30 C tests and standalone CLI tools pass 100% under AddressSanitizer/UBSan (`make test-asan`) with 0 leaks and ThreadSanitizer (`make test-tsan`) with 0 data races.
+
+---
+
+### Task 9: Tag the `v1.0.0` Release [COMPLETED]
 - **Objective:** Tag and certify the official `v1.0.0` production release of LAII.
-- **Status:** **Completed & Tagged.** Annotated Git tag `v1.0.0` created after certifying all 7 release prerequisites.
+- **Status:** **Completed & Tagged.** Annotated Git tag `v1.0.0` created after certifying all release prerequisites.
 - **Prerequisites (All Verified & Passing):**
   - [x] All 30 automated C test binaries passing 100% (`make test-c-bins`).
   - [x] Memory safety verified with zero leaks, overflows, or undefined behavior (`make test-asan`).
@@ -75,6 +86,8 @@ This checklist outlines the four actionable tasks identified from the system har
   - [x] Numerical parity contract verified and certified (`make test-parity`).
   - [x] Non-blocking epoll HTTP/SSE server and Web Studio integration verified (`make test-http`).
   - [x] 18 standalone statically linked ELF executables verified (`make static-test`).
-- **Action:**
-  - Create annotated Git release tag: `git tag -a v1.0.0 -m "Release v1.0.0: Production-grade C11 inference engine for LFM2 & LFM2.5"`.
+  - [x] Speculative Decoding 8-token FIFO integrated in C ABI & Python bindings.
+  - [x] Turnkey Python packaging wheel verified (`pip install dist/lfm2-*.whl`).
+
+
 

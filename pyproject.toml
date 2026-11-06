@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lfm2"
+version = "1.0.0"
+description = "Production C11 and Python Engine for Liquid AI's LFM2 Hybrid Models"
+readme = "README.md"
+authors = [
+    { name = "Avishek Sharma", email = "avisheksharmacoder@gmail.com" }
+]
+license = "MIT"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Android",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/avisheksharmacoder/laii"
+Repository = "https://github.com/avisheks/laii"
+
+[tool.setuptools]
+packages = ["lfm2"]
+package-dir = {"lfm2" = "python"}
+include-package-data = true
+
+[tool.setuptools.package-data]
+lfm2 = ["*.so", "liblfm2.so"]

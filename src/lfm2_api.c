@@ -16,7 +16,15 @@
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
 
 #define LFM2_LOADER_NO_MAIN 1
 #define LFM2_FORWARD_NO_MAIN 1
@@ -26,6 +34,7 @@
 #define LFM2_RUNTIME_FEATURES_NO_MAIN 1
 #define LFM2_MOE_CHECKPOINT_NO_MAIN 1
 #define LFM2_SERVER_NO_MAIN 1
+#define LFM2_SPECULATIVE_PLD_NO_MAIN 1
 
 #include "../tools/lfm2_prefill_batch.c"
 #include "../tools/lfm2_bpe.c"
@@ -33,6 +42,7 @@
 #include "../tools/lfm2_cli_stream.c"
 #include "../tools/lfm2_moe_checkpoint.c"
 #include "../tools/lfm2_sys_cache.c"
+#include "../tools/lfm2_speculative_pld.c"
 
 /* ============================================================================
  * 1. Sampler & Token Candidate Buffer (Matches LFM2 Official Spec)
@@ -75,9 +85,19 @@ static int compare_cands_desc(const void *a, const void *b) {
     return (va < vb) - (va > vb);
 }
 
+static void lfm2_sampler_free(LFM2Sampler *s) {
+    if (!s) return;
+    free(s->history_ring);
+    free(s->cands);
+    s->history_ring = NULL;
+    s->cands        = NULL;
+    memset(s, 0, sizeof(*s));
+}
+
 static bool lfm2_sampler_init(LFM2Sampler *s, uint32_t n_vocab, float temp, float min_p,
                              uint32_t top_k, float rep_penalty, uint32_t rep_window, uint64_t seed) {
-    memset(s, 0, sizeof(*s));
+    if (!s) return false;
+    lfm2_sampler_free(s);
     s->temperature = temp;
     s->min_p       = min_p;
     s->top_k       = (top_k == 0 || top_k > n_vocab) ? n_vocab : top_k;
@@ -93,12 +113,6 @@ static bool lfm2_sampler_init(LFM2Sampler *s, uint32_t n_vocab, float temp, floa
 
 static void lfm2_sampler_reset(LFM2Sampler *s) {
     s->history_count = 0;
-}
-
-static void lfm2_sampler_free(LFM2Sampler *s) {
-    free(s->history_ring);
-    free(s->cands);
-    memset(s, 0, sizeof(*s));
 }
 
 static void lfm2_sampler_accept(LFM2Sampler *s, uint32_t token_id) {
@@ -253,6 +267,8 @@ struct lfm2_model {
     LFM2Vocab vocab;
     LFM2DecodedVocab decoded_vocab;
     lfm2_model_info_t info;
+    uint32_t close_think_ids[8];
+    uint32_t n_close_think_ids;
     char filepath[512];
 };
 
@@ -261,22 +277,37 @@ struct lfm2_checkpoint {
     const lfm2_model_t *model;
 };
 
+typedef struct {
+    uint32_t token_id;
+    uint32_t batch_slot;    /* Slot b (0..B-1) in ss->conv_trace[b][l] */
+    int32_t  think_phase;   /* <think> controller phase after this token */
+} LFM2SpecFifoItem;
+
 struct lfm2_context {
     const lfm2_model_t *model;
     lfm2_context_params_t params;
-    LFM2BatchState state;
-    LFM2Sampler sampler;
-    LFM2Grammar grammar;
+    LFM2SpecState       spec_state;     /* Holds LFM2BatchState base + conv_trace[8][L] + logits_batch */
+    LFM2RoPELUT         rope_lut;
+    LFM2Sampler         sampler;
+    LFM2Grammar         grammar;
     LFM2ThinkController think_ctrl;
-    LFM2StreamFilter stream_filter;
-    LFM2RoPELUT rope_lut;
-    LFM2ChatFormatter chat_fmt;
-    uint32_t pos;
-    uint32_t n_sink_tokens;
-    uint32_t *history_tokens;
-    size_t history_cap;
-    uint32_t n_history;
-    lfm2_perf_stats_t stats;
+    LFM2StreamFilter    stream_filter;
+    LFM2NgramIndex      ngram_idx;
+    LFM2ChatFormatter   chat_fmt;
+
+    uint32_t            pos;            /* GQA KV-cache position of committed state */
+    uint32_t            pending_token;  /* Last sampled token waiting to enter graph */
+    bool                has_pending;
+    uint32_t            n_sink_tokens;
+    uint32_t           *history_tokens;
+    size_t              history_cap;
+    uint32_t            n_history;
+    lfm2_perf_stats_t   stats;
+
+    /* 8-Token Speculative Verification FIFO */
+    LFM2SpecFifoItem    spec_fifo[LFM2_MAX_BATCH];
+    uint32_t            fifo_head;
+    uint32_t            fifo_tail;
 };
 
 /* Internal accumulator used by LFM2StreamFilter inside lfm2_context_next_utf8 */
@@ -354,6 +385,9 @@ LFM2_API lfm2_model_t *lfm2_model_load_from_fd(int fd, uint64_t file_size, int32
         free(m);
         return NULL;
     }
+
+    int32_t n_close = lfm2_tokenize(&m->vocab, "\n</think>\n", m->close_think_ids, 8);
+    m->n_close_think_ids = (n_close > 0) ? (uint32_t)n_close : 0;
 
     /* Populate model info */
     const LFM2Config *c = &m->core.cfg;
@@ -465,8 +499,11 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
     lfm2_set_denormals_zero_mode();
     if (!model) return NULL;
 
-    lfm2_context_t *ctx = (lfm2_context_t *)calloc(1, sizeof(lfm2_context_t));
-    if (!ctx) return NULL;
+    lfm2_context_t *ctx = NULL;
+    if (posix_memalign((void **)&ctx, 64, sizeof(lfm2_context_t)) != 0 || !ctx) {
+        return NULL;
+    }
+    memset(ctx, 0, sizeof(lfm2_context_t));
 
     ctx->model  = model;
     ctx->params = params ? *params : lfm2_context_default_params();
@@ -479,13 +516,20 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
         }
     }
 
-    if (!lfm2_batch_state_init(&ctx->state, &model->core, ctx->params.max_seq_len, ctx->params.n_threads)) {
+    if (!lfm2_spec_state_init(&ctx->spec_state, &model->core, ctx->params.max_seq_len, ctx->params.n_threads)) {
+        free(ctx);
+        return NULL;
+    }
+
+    if (!lfm2_ngram_index_init(&ctx->ngram_idx, ctx->params.max_seq_len, 6, model->vocab.id_im_end)) {
+        lfm2_spec_state_free(&ctx->spec_state);
         free(ctx);
         return NULL;
     }
 
     if (!lfm2_sampler_init(&ctx->sampler, model->core.cfg.n_vocab, 0.30f, 0.15f, 50, 1.05f, 64, 0)) {
-        lfm2_batch_state_free(&ctx->state);
+        lfm2_ngram_index_free(&ctx->ngram_idx);
+        lfm2_spec_state_free(&ctx->spec_state);
         free(ctx);
         return NULL;
     }
@@ -504,13 +548,18 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
     if (!ctx->history_tokens) {
         lfm2_rope_lut_free(&ctx->rope_lut);
         lfm2_sampler_free(&ctx->sampler);
-        lfm2_batch_state_free(&ctx->state);
+        lfm2_ngram_index_free(&ctx->ngram_idx);
+        lfm2_spec_state_free(&ctx->spec_state);
         free(ctx);
         return NULL;
     }
 
     ctx->pos = 0;
     ctx->n_history = 0;
+    ctx->fifo_head = 0;
+    ctx->fifo_tail = 0;
+    ctx->has_pending = false;
+    ctx->pending_token = 0;
     return ctx;
 }
 
@@ -519,7 +568,8 @@ LFM2_API void lfm2_context_free(lfm2_context_t *ctx) {
     free(ctx->history_tokens);
     lfm2_rope_lut_free(&ctx->rope_lut);
     lfm2_sampler_free(&ctx->sampler);
-    lfm2_batch_state_free(&ctx->state);
+    lfm2_ngram_index_free(&ctx->ngram_idx);
+    lfm2_spec_state_free(&ctx->spec_state);
     free(ctx);
 }
 
@@ -527,6 +577,11 @@ LFM2_API void lfm2_context_reset(lfm2_context_t *ctx) {
     if (!ctx) return;
     ctx->pos = 0;
     ctx->n_history = 0;
+    ctx->fifo_head = 0;
+    ctx->fifo_tail = 0;
+    ctx->has_pending = false;
+    ctx->pending_token = 0;
+    lfm2_ngram_index_reset(&ctx->ngram_idx);
     lfm2_sampler_reset(&ctx->sampler);
     lfm2_stream_filter_reset(&ctx->stream_filter);
     lfm2_grammar_init(&ctx->grammar, LFM2_GRAMMAR_NONE);
@@ -535,8 +590,8 @@ LFM2_API void lfm2_context_reset(lfm2_context_t *ctx) {
     const LFM2Model *m = &ctx->model->core;
     const uint32_t hist_len = (m->cfg.shortconv_l_cache > 1) ? (m->cfg.shortconv_l_cache - 1) : 2;
     for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
-        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && ctx->state.conv_state[l]) {
-            memset(ctx->state.conv_state[l], 0, hist_len * m->cfg.n_embd * sizeof(float));
+        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && ctx->spec_state.base.conv_state[l]) {
+            memset(ctx->spec_state.base.conv_state[l], 0, hist_len * m->cfg.n_embd * sizeof(float));
         }
     }
     memset(&ctx->stats, 0, sizeof(ctx->stats));
@@ -585,7 +640,7 @@ LFM2_API lfm2_status_t lfm2_prefill_tokens(lfm2_context_t *ctx,
                                            uint32_t n_tokens,
                                            bool compute_last_logits) {
     if (!ctx || !tokens || n_tokens == 0) return LFM2_ERR_INVALID_ARG;
-    if (ctx->pos + n_tokens > ctx->state.max_seq_len) return LFM2_ERR_CTX_FULL;
+    if (ctx->pos + n_tokens > ctx->spec_state.base.max_seq_len) return LFM2_ERR_CTX_FULL;
 
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -597,10 +652,11 @@ LFM2_API lfm2_status_t lfm2_prefill_tokens(lfm2_context_t *ctx,
         if (chunk > LFM2_MAX_BATCH) chunk = LFM2_MAX_BATCH;
         bool is_last = (i + chunk == n_tokens) && compute_last_logits;
 
-        lfm2_forward_batch(m, &ctx->state, tokens + i, chunk, ctx->pos, is_last);
+        lfm2_forward_batch(m, &ctx->spec_state.base, tokens + i, chunk, ctx->pos, is_last);
 
         for (uint32_t t = 0; t < chunk; ++t) {
             lfm2_sampler_accept(&ctx->sampler, tokens[i + t]);
+            lfm2_ngram_index_ingest(&ctx->ngram_idx, tokens[i + t]);
             if (ctx->n_history < ctx->history_cap) {
                 ctx->history_tokens[ctx->n_history++] = tokens[i + t];
             }
@@ -621,64 +677,94 @@ LFM2_API lfm2_status_t lfm2_prefill_tokens(lfm2_context_t *ctx,
 }
 
 LFM2_API const float *lfm2_context_get_logits_ptr(const lfm2_context_t *ctx) {
-    return ctx ? ctx->state.logits : NULL;
+    return ctx ? ctx->spec_state.base.logits : NULL;
 }
 
-LFM2_API lfm2_status_t lfm2_begin_chat_turn(lfm2_context_t *ctx,
-                                            const char *user_message,
-                                            const lfm2_sample_params_t *sample_params) {
-    if (!ctx || !user_message) return LFM2_ERR_INVALID_ARG;
+/* ============================================================================
+ * Causal Verification Sampler Callback (Grammar PDA + <think> Budget)
+ * ============================================================================
+ * Invoked for each slot b = 0 .. K inside `lfm2_speculative_decode_step()`.
+ * Because `lfm2_speculative_decode_step` halts immediately on the first draft
+ * mismatch, every token returned by this callback is guaranteed to be emitted
+ * in causal order, so committing to `think_ctrl` and `grammar` here keeps
+ * slot `b + 1`'s PDA state 100% synchronized with slot `b`! */
+static uint32_t api_spec_verify_sample_cb(float *slot_logits,
+                                          uint32_t n_vocab,
+                                          void *user_data) {
+    lfm2_context_t *ctx = (lfm2_context_t *)user_data;
 
-    if (sample_params) {
-        ctx->sampler.temperature  = sample_params->temperature;
-        ctx->sampler.min_p        = sample_params->min_p;
-        ctx->sampler.top_k        = sample_params->top_k;
-        ctx->sampler.rep_penalty  = sample_params->rep_penalty;
-        if (sample_params->rep_window > 0 && sample_params->rep_window != ctx->sampler.rep_window) {
-            free(ctx->sampler.history_ring);
-            ctx->sampler.rep_window    = sample_params->rep_window;
-            ctx->sampler.history_ring  = (uint32_t *)calloc(ctx->sampler.rep_window, sizeof(uint32_t));
-            ctx->sampler.history_count = 0;
-        }
-        if (sample_params->seed != 0) {
-            ctx->sampler.rng_state = sample_params->seed;
-        }
-        lfm2_grammar_init(&ctx->grammar, (lfm2_grammar_mode_t)sample_params->grammar_type);
+    /* 1. Apply <think> token budget mask & Grammar PDA logit mask for slot `b` */
+    lfm2_think_apply_budget_mask(&ctx->think_ctrl, slot_logits, n_vocab);
+    lfm2_grammar_mask_logits(&ctx->grammar, &ctx->model->decoded_vocab, slot_logits);
 
-        uint32_t close_think_ids[8];
-        int32_t n_close = lfm2_tokenize_text(ctx->model, "\n</think>\n", close_think_ids, 8);
-        lfm2_think_controller_init(&ctx->think_ctrl, sample_params->max_think_tokens,
-                                   (n_close > 0) ? close_think_ids : NULL,
-                                   (n_close > 0) ? (uint32_t)n_close : 0);
-    }
+    /* 2. Sample token from masked distribution */
+    const uint32_t sampled_id = lfm2_sample_token(&ctx->sampler, slot_logits);
 
+    /* 3. Advance <think> controller & Grammar PDA state for the next slot `b + 1` */
+    lfm2_think_commit_token(&ctx->think_ctrl, &ctx->model->decoded_vocab, sampled_id);
+    lfm2_grammar_commit_token(&ctx->grammar, &ctx->model->decoded_vocab, sampled_id);
+
+    return sampled_id;
+}
+
+static uint32_t lfm2_format_and_tokenize_turn(lfm2_context_t *ctx,
+                                              const char *user_message,
+                                              uint32_t *out_ids,
+                                              size_t max_ids) {
     char turn_buf[16384];
     bool is_first = (ctx->pos == 0);
     int written = lfm2_format_chatml_turn(&ctx->chat_fmt, user_message, is_first,
                                           turn_buf, sizeof(turn_buf));
     if (written <= 0 || (size_t)written >= sizeof(turn_buf)) {
-        return LFM2_ERR_INVALID_ARG;
+        return 0;
     }
+    int32_t n = lfm2_tokenize_text(ctx->model, turn_buf, out_ids, (uint32_t)max_ids);
+    if (n <= 0) {
+        n = lfm2_tokenize_text(ctx->model, user_message, out_ids, (uint32_t)max_ids);
+    }
+    if (n <= 0) {
+        out_ids[0] = (ctx->model->vocab.id_bos != 0) ? ctx->model->vocab.id_bos : 1;
+        n = 1;
+    }
+    return (uint32_t)n;
+}
 
-    uint32_t turn_tokens[8192];
-    int32_t n_tokens = lfm2_tokenize_text(ctx->model, turn_buf, turn_tokens, 8192);
-    if (n_tokens <= 0) {
-        n_tokens = lfm2_tokenize_text(ctx->model, user_message, turn_tokens, 8192);
-    }
-    if (n_tokens <= 0) {
-        turn_tokens[0] = (ctx->model->vocab.id_bos != 0) ? ctx->model->vocab.id_bos : 1;
-        n_tokens = 1;
-    }
+LFM2_API lfm2_status_t lfm2_begin_chat_turn(lfm2_context_t *ctx,
+                                            const char *user_message,
+                                            const lfm2_sample_params_t *sp) {
+    if (!ctx || !user_message || !sp) return LFM2_ERR_INVALID_ARG;
 
-    /* Prefill turn tokens and compute logits for the final prefill token */
-    lfm2_status_t st = lfm2_prefill_tokens(ctx, turn_tokens, (uint32_t)n_tokens, true);
+    /* Clear speculative FIFO & stream holdback filter for the new turn */
+    ctx->fifo_head = 0;
+    ctx->fifo_tail = 0;
+    lfm2_stream_filter_reset(&ctx->stream_filter);
+
+    /* Configure sampler, grammar PDA, and <think> budget */
+    lfm2_sampler_init(&ctx->sampler, ctx->model->core.cfg.n_vocab,
+                      sp->temperature, sp->min_p, sp->top_k,
+                      sp->rep_penalty, sp->rep_window, sp->seed);
+    lfm2_grammar_init(&ctx->grammar, (lfm2_grammar_mode_t)sp->grammar_type);
+    lfm2_think_controller_init(&ctx->think_ctrl, sp->max_think_tokens,
+                               (ctx->model->n_close_think_ids > 0) ? ctx->model->close_think_ids : NULL,
+                               ctx->model->n_close_think_ids);
+
+    /* Format ChatML turn & tokenize into `turn_ids[]` */
+    uint32_t turn_ids[8192];
+    uint32_t n_turn = lfm2_format_and_tokenize_turn(ctx, user_message, turn_ids, 8192);
+    if (n_turn == 0) return LFM2_ERR_INVALID_ARG;
+
+    const double t0 = now_ms();
+    lfm2_status_t st = lfm2_prefill_tokens(ctx, turn_ids, n_turn, true);
     if (st != LFM2_OK) return st;
 
-    lfm2_stream_filter_reset(&ctx->stream_filter);
+    ctx->stats.prefill_ms    = now_ms() - t0;
+    ctx->stats.prompt_tokens = n_turn;
+    ctx->stats.generated_tokens = 0;
+    ctx->has_pending         = false;
     return LFM2_OK;
 }
 
-/* Pull-based streaming step:
+/* Pull-based streaming step with 8-Token Speculative Verification FIFO:
  * Loops internally if a token is held back by an incomplete 4-byte UTF-8 sequence
  * or a partial stop-string prefix, guaranteeing every LFM2_OK return delivers
  * complete, valid UTF-8 bytes to Python or C callers! */
@@ -695,88 +781,146 @@ LFM2_API lfm2_status_t lfm2_context_next_utf8(lfm2_context_t *ctx,
     ctx->stream_filter.emit_cb   = api_chunk_emit_cb;
     ctx->stream_filter.user_data = &chunk;
 
-    struct timespec ts0, ts1;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
-
     while (chunk.written == 0) {
-        /* 1. Auto-shift GQA KV-cache with Attention Sinks if context is full */
-        if (ctx->pos >= ctx->state.max_seq_len) {
-            const uint32_t head_dim = ctx->model->core.cfg.n_head_q
-                                      ? (ctx->model->core.cfg.n_embd / ctx->model->core.cfg.n_head_q)
-                                      : 64;
-            if (head_dim == 64) {
-                lfm2_kv_cache_shift_sinks_avx2(
-                    ctx->state.k_cache_f16, ctx->state.v_cache_f16,
-                    &ctx->model->core, &ctx->rope_lut, &ctx->pos,
-                    ctx->n_sink_tokens, ctx->state.max_seq_len / 2);
-            }
-            if (ctx->pos >= ctx->state.max_seq_len) {
-                lfm2_stream_filter_flush(&ctx->stream_filter);
-                *out_bytes_written = chunk.written;
-                return LFM2_DONE;
+        /* 1. If the 8-token speculative FIFO is empty, run one B <= 8 speculative batch */
+        if (ctx->fifo_head >= ctx->fifo_tail) {
+            if (!ctx->has_pending) {
+                if (ctx->pos > 0 && ctx->spec_state.base.logits) {
+                    lfm2_think_apply_budget_mask(&ctx->think_ctrl, ctx->spec_state.base.logits, ctx->model->core.cfg.n_vocab);
+                    lfm2_grammar_mask_logits(&ctx->grammar, &ctx->model->decoded_vocab, ctx->spec_state.base.logits);
+                    const uint32_t sampled_first = lfm2_sample_token(&ctx->sampler, ctx->spec_state.base.logits);
+                    lfm2_think_commit_token(&ctx->think_ctrl, &ctx->model->decoded_vocab, sampled_first);
+                    lfm2_grammar_commit_token(&ctx->grammar, &ctx->model->decoded_vocab, sampled_first);
+
+                    ctx->pending_token = sampled_first;
+                    ctx->has_pending   = true;
+
+                    /* Put first generated token into the FIFO */
+                    ctx->spec_fifo[0].token_id    = sampled_first;
+                    ctx->spec_fifo[0].batch_slot  = 0;
+                    ctx->spec_fifo[0].think_phase = (int32_t)ctx->think_ctrl.phase;
+                    ctx->fifo_head = 0;
+                    ctx->fifo_tail = 1;
+                } else {
+                    lfm2_stream_filter_flush(&ctx->stream_filter);
+                    *out_bytes_written = chunk.written;
+                    ctx->stream_filter.user_data = NULL;
+                    return LFM2_DONE;
+                }
+            } else {
+                /* Auto-shift GQA KV-cache with Attention Sinks if within 8 tokens of max_seq_len */
+                if (ctx->pos + LFM2_MAX_BATCH >= ctx->spec_state.base.max_seq_len) {
+                    const uint32_t head_dim = ctx->model->core.cfg.n_head_q
+                                              ? (ctx->model->core.cfg.n_embd / ctx->model->core.cfg.n_head_q)
+                                              : 64;
+                    if (head_dim == 64) {
+                        lfm2_kv_cache_shift_sinks(
+                            ctx->spec_state.base.k_cache_f16,
+                            ctx->spec_state.base.v_cache_f16,
+                            &ctx->model->core, &ctx->rope_lut, &ctx->pos,
+                            ctx->n_sink_tokens, ctx->spec_state.base.max_seq_len / 2);
+                    }
+                }
+                if (ctx->pos + LFM2_MAX_BATCH >= ctx->spec_state.base.max_seq_len) {
+                    lfm2_stream_filter_flush(&ctx->stream_filter);
+                    *out_bytes_written = chunk.written;
+                    ctx->stream_filter.user_data = NULL;
+                    return LFM2_DONE;
+                }
+
+                uint32_t emitted_ids[LFM2_MAX_BATCH];
+                const double t_step0 = now_ms();
+
+                /* Disable N-gram drafting while forcing `\n</think>\n` budget closure */
+                const uint32_t saved_k = ctx->ngram_idx.cur_draft_k;
+                if (ctx->think_ctrl.phase == LFM2_THINK_FORCING_CLOSE) {
+                    ctx->ngram_idx.cur_draft_k = 0;
+                }
+
+                const uint32_t n_emitted = lfm2_speculative_decode_step(
+                    &ctx->model->core,
+                    &ctx->spec_state,
+                    &ctx->ngram_idx,
+                    &ctx->pending_token,
+                    &ctx->pos,
+                    api_spec_verify_sample_cb,
+                    ctx,
+                    emitted_ids);
+
+                if (ctx->think_ctrl.phase == LFM2_THINK_FORCING_CLOSE) {
+                    ctx->ngram_idx.cur_draft_k = saved_k;
+                }
+
+                ctx->stats.decode_ms += (now_ms() - t_step0);
+                if (n_emitted == 0) {
+                    ctx->stream_filter.user_data = NULL;
+                    return LFM2_ERR_CTX_FULL;
+                }
+
+                /* Populate the 8-token FIFO with all verified tokens from this sweep */
+                ctx->fifo_head = 0;
+                ctx->fifo_tail = n_emitted;
+                for (uint32_t b = 0; b < n_emitted; ++b) {
+                    ctx->spec_fifo[b].token_id    = emitted_ids[b];
+                    ctx->spec_fifo[b].batch_slot  = b;
+                    ctx->spec_fifo[b].think_phase = (int32_t)ctx->think_ctrl.phase;
+                }
             }
         }
 
-        /* 2. Apply <think> token budget mask & Grammar PDA logit mask */
-        lfm2_think_apply_budget_mask(&ctx->think_ctrl, ctx->state.logits,
-                                     ctx->model->core.cfg.n_vocab);
-        lfm2_grammar_mask_logits(&ctx->grammar, &ctx->model->decoded_vocab,
-                                 ctx->state.logits);
-
-        /* 3. Sample next token ID */
-        const uint32_t next_id = lfm2_sample_token(&ctx->sampler, ctx->state.logits);
+        /* 2. Pop the next verified token from the FIFO in O(1) (0.001 ms, zero compute!) */
+        const LFM2SpecFifoItem item = ctx->spec_fifo[ctx->fifo_head++];
         ctx->stats.generated_tokens++;
         if (ctx->n_history < ctx->history_cap) {
-            ctx->history_tokens[ctx->n_history++] = next_id;
+            ctx->history_tokens[ctx->n_history++] = item.token_id;
         }
+        if (ctx->stats.decode_ms > 0.0) {
+            ctx->stats.decode_tok_per_sec =
+                (ctx->stats.generated_tokens * 1000.0) / ctx->stats.decode_ms;
+        }
+        if (out_think_phase) *out_think_phase = item.think_phase;
 
-        lfm2_think_commit_token(&ctx->think_ctrl, &ctx->model->decoded_vocab, next_id);
-        lfm2_grammar_commit_token(&ctx->grammar, &ctx->model->decoded_vocab, next_id);
-        if (out_think_phase) *out_think_phase = (int32_t)ctx->think_ctrl.phase;
-
-        /* 4. Check for native ChatML <|im_end|> token */
-        if (next_id == ctx->model->vocab.id_im_end) {
+        /* 3. Check for ChatML <|im_end|> termination */
+        if (item.token_id == ctx->model->vocab.id_im_end) {
+            ctx->fifo_head   = ctx->fifo_tail;
+            ctx->has_pending = false;
             lfm2_stream_filter_flush(&ctx->stream_filter);
             *out_bytes_written = chunk.written;
-            clock_gettime(CLOCK_MONOTONIC, &ts1);
-            double step_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
-            ctx->stats.decode_ms += step_ms;
-            if (ctx->stats.decode_ms > 0.0) {
-                ctx->stats.decode_tok_per_sec = (ctx->stats.generated_tokens * 1000.0) / ctx->stats.decode_ms;
-            }
+            ctx->stream_filter.user_data = NULL;
             return LFM2_DONE;
         }
 
-        /* 5. Decode token bytes through UTF-8 boundary + Stop-String holdback filter */
-        const char  *tok_str = ctx->model->decoded_vocab.bytes[next_id];
-        const size_t tok_len = ctx->model->decoded_vocab.lens[next_id];
+        /* 4. Feed token bytes into the UTF-8 boundary + Multi-Token Stop-String filter */
+        const char  *tok_str = ctx->model->decoded_vocab.bytes[item.token_id];
+        const size_t tok_len = ctx->model->decoded_vocab.lens[item.token_id];
 
         lfm2_stream_status_t st = lfm2_stream_filter_feed(&ctx->stream_filter, tok_str, tok_len);
         if (st == LFM2_STREAM_STOPPED) {
-            /* Close the assistant turn cleanly in the hybrid state with <|im_end|> */
-            const uint32_t im_end = ctx->model->vocab.id_im_end;
-            lfm2_forward_batch(&ctx->model->core, &ctx->state, &im_end, 1, ctx->pos++, false);
-            *out_bytes_written = chunk.written;
-            clock_gettime(CLOCK_MONOTONIC, &ts1);
-            double step_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
-            ctx->stats.decode_ms += step_ms;
-            if (ctx->stats.decode_ms > 0.0) {
-                ctx->stats.decode_tok_per_sec = (ctx->stats.generated_tokens * 1000.0) / ctx->stats.decode_ms;
+            /* Mid-batch stop string matched!
+             * If unpopped draft tokens remain in `spec_fifo`, rewind `ShortConv`
+             * state to `item.batch_slot` and rewind `ctx->pos` to match! */
+            const uint32_t unpopped = ctx->fifo_tail - ctx->fifo_head;
+            if (unpopped > 0) {
+                lfm2_restore_shortconv_trace_slot(&ctx->spec_state,
+                                                  &ctx->model->core,
+                                                  item.batch_slot);
+                ctx->pos -= unpopped;
             }
+            ctx->fifo_head   = ctx->fifo_tail;
+            ctx->has_pending = false;
+
+            /* Append <|im_end|> to close the assistant turn cleanly in state */
+            const uint32_t im_end = ctx->model->vocab.id_im_end;
+            lfm2_forward_batch(&ctx->model->core, &ctx->spec_state.base,
+                               &im_end, 1, ctx->pos++, false);
+            *out_bytes_written = chunk.written;
+            ctx->stream_filter.user_data = NULL;
             return LFM2_DONE;
         }
-
-        /* 6. Advance the hybrid ShortConv + GQA forward pass for `next_id` */
-        lfm2_forward_batch(&ctx->model->core, &ctx->state, &next_id, 1, ctx->pos++, true);
     }
 
     *out_bytes_written = chunk.written;
-    clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double step_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
-    ctx->stats.decode_ms += step_ms;
-    if (ctx->stats.decode_ms > 0.0) {
-        ctx->stats.decode_tok_per_sec = (ctx->stats.generated_tokens * 1000.0) / ctx->stats.decode_ms;
-    }
+    ctx->stream_filter.user_data = NULL;
     return LFM2_OK;
 }
 
@@ -805,13 +949,13 @@ LFM2_API lfm2_status_t lfm2_embed_text(lfm2_context_t *ctx,
         uint32_t i = 0;
         while (i < (uint32_t)n_tok) {
             uint32_t B = ((uint32_t)n_tok - i > LFM2_MAX_BATCH) ? LFM2_MAX_BATCH : ((uint32_t)n_tok - i);
-            lfm2_forward_batch(m, &ctx->state, token_ids + i, B, ctx->pos, false);
+            lfm2_forward_batch(m, &ctx->spec_state.base, token_ids + i, B, ctx->pos, false);
             ctx->pos += B;
 
             /* Normalize each token state in the batch and accumulate into out_embd */
-            lfm2_rmsnorm_batch(ctx->state.xb, ctx->state.x, m->output_norm, B, D, m->cfg.rms_norm_eps);
+            lfm2_rmsnorm_batch(ctx->spec_state.base.xb, ctx->spec_state.base.x, m->output_norm, B, D, m->cfg.rms_norm_eps);
             for (uint32_t b = 0; b < B; ++b) {
-                const float *vec = ctx->state.xb + (size_t)b * D;
+                const float *vec = ctx->spec_state.base.xb + (size_t)b * D;
                 for (uint32_t d = 0; d < D; ++d) out_embd[d] += vec[d];
             }
             i += B;
@@ -822,11 +966,11 @@ LFM2_API lfm2_status_t lfm2_embed_text(lfm2_context_t *ctx,
         uint32_t last_B = 1;
         while (i < (uint32_t)n_tok) {
             last_B = ((uint32_t)n_tok - i > LFM2_MAX_BATCH) ? LFM2_MAX_BATCH : ((uint32_t)n_tok - i);
-            lfm2_forward_batch(m, &ctx->state, token_ids + i, last_B, ctx->pos, false);
+            lfm2_forward_batch(m, &ctx->spec_state.base, token_ids + i, last_B, ctx->pos, false);
             ctx->pos += last_B;
             i += last_B;
         }
-        const float *last_x = ctx->state.x + (size_t)(last_B - 1) * D;
+        const float *last_x = ctx->spec_state.base.x + (size_t)(last_B - 1) * D;
         lfm2_rmsnorm(out_embd, last_x, m->output_norm, D, m->cfg.rms_norm_eps);
     }
 
@@ -869,7 +1013,7 @@ LFM2_API lfm2_status_t lfm2_forward_embeddings(lfm2_context_t *ctx,
                                                uint32_t n_tokens,
                                                bool compute_last_logits) {
     if (!ctx || !embd_batch || n_tokens == 0) return LFM2_ERR_INVALID_ARG;
-    if (ctx->pos + n_tokens > ctx->state.max_seq_len) return LFM2_ERR_CTX_FULL;
+    if (ctx->pos + n_tokens > ctx->spec_state.base.max_seq_len) return LFM2_ERR_CTX_FULL;
 
     const uint32_t D = ctx->model->core.cfg.n_embd;
     uint32_t i = 0;
@@ -877,7 +1021,7 @@ LFM2_API lfm2_status_t lfm2_forward_embeddings(lfm2_context_t *ctx,
         uint32_t chunk = n_tokens - i;
         if (chunk > LFM2_MAX_BATCH) chunk = LFM2_MAX_BATCH;
         bool is_last = (i + chunk == n_tokens) && compute_last_logits;
-        lfm2_forward_embd_chunk(&ctx->model->core, &ctx->state,
+        lfm2_forward_embd_chunk(&ctx->model->core, &ctx->spec_state.base,
                                 embd_batch + (size_t)i * D,
                                 chunk, ctx->pos, is_last);
         ctx->pos += chunk;
@@ -911,7 +1055,7 @@ LFM2_API lfm2_status_t lfm2_context_save_checkpoint(const lfm2_context_t *ctx,
                                                     lfm2_checkpoint_t *ckpt) {
     if (!ctx || !ckpt) return LFM2_ERR_INVALID_ARG;
     lfm2_checkpoint_save(&ckpt->ckpt, &ctx->model->core,
-                         (float * const *)ctx->state.conv_state,
+                         (float * const *)ctx->spec_state.base.conv_state,
                          ctx->pos,
                          ctx->sampler.rng_state,
                          ctx->sampler.history_ring,
@@ -923,7 +1067,7 @@ LFM2_API lfm2_status_t lfm2_context_restore_checkpoint(lfm2_context_t *ctx,
                                                        const lfm2_checkpoint_t *ckpt) {
     if (!ctx || !ckpt) return LFM2_ERR_INVALID_ARG;
     if (!lfm2_checkpoint_restore(&ckpt->ckpt, &ctx->model->core,
-                                 ctx->state.conv_state,
+                                 ctx->spec_state.base.conv_state,
                                  &ctx->pos,
                                  &ctx->sampler.rng_state,
                                  ctx->sampler.history_ring,
@@ -931,6 +1075,10 @@ LFM2_API lfm2_status_t lfm2_context_restore_checkpoint(lfm2_context_t *ctx,
         return LFM2_ERR_CHECKPOINT;
     }
     ctx->n_history = ctx->pos;
+    ctx->fifo_head = 0;
+    ctx->fifo_tail = 0;
+    ctx->has_pending = false;
+    lfm2_stream_filter_reset(&ctx->stream_filter);
     return LFM2_OK;
 }
 
@@ -943,9 +1091,9 @@ LFM2_API lfm2_status_t lfm2_context_save_prompt_cache(const lfm2_context_t *ctx,
                                      &ctx->model->core,
                                      ctx->history_tokens,
                                      ctx->pos,
-                                     (float * const *)ctx->state.conv_state,
-                                     ctx->state.k_cache_f16,
-                                     ctx->state.v_cache_f16);
+                                     (float * const *)ctx->spec_state.base.conv_state,
+                                     ctx->spec_state.base.k_cache_f16,
+                                     ctx->spec_state.base.v_cache_f16);
     return ok ? LFM2_OK : LFM2_ERR_IO;
 }
 
@@ -961,10 +1109,10 @@ LFM2_API lfm2_status_t lfm2_context_load_prompt_cache(lfm2_context_t *ctx,
                                                 &ctx->model->core,
                                                 prompt_tokens,
                                                 n_prompt,
-                                                ctx->state.max_seq_len,
-                                                ctx->state.conv_state,
-                                                ctx->state.k_cache_f16,
-                                                ctx->state.v_cache_f16,
+                                                ctx->spec_state.base.max_seq_len,
+                                                ctx->spec_state.base.conv_state,
+                                                ctx->spec_state.base.k_cache_f16,
+                                                ctx->spec_state.base.v_cache_f16,
                                                 &matched);
     if (!ok) {
         if (out_matched_len) *out_matched_len = 0;
