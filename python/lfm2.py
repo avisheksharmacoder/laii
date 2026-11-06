@@ -167,6 +167,14 @@ def _bind_liblfm2(lib_path: str | Path | None = None) -> ctypes.CDLL:
     # Model lifecycle
     lib.lfm2_model_load.argtypes     = [ctypes.c_char_p, ctypes.c_int32]
     lib.lfm2_model_load.restype      = ctypes.c_void_p
+    lib.lfm2_model_load_from_fd.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_int32]
+    lib.lfm2_model_load_from_fd.restype  = ctypes.c_void_p
+    lib.lfm2_model_release_page_cache.argtypes = [ctypes.c_void_p]
+    lib.lfm2_model_release_page_cache.restype  = None
+    lib.lfm2_model_warmup_page_cache.argtypes  = [ctypes.c_void_p]
+    lib.lfm2_model_warmup_page_cache.restype   = None
+    lib.lfm2_get_process_rss_bytes.argtypes    = []
+    lib.lfm2_get_process_rss_bytes.restype     = ctypes.c_uint64
     lib.lfm2_model_free.argtypes     = [ctypes.c_void_p]
     lib.lfm2_model_free.restype      = None
     lib.lfm2_model_get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CModelInfo)]
@@ -312,6 +320,66 @@ class LFM2Model:
             n_experts_used=c_info.n_experts_used,
             file_size_mb=c_info.file_size_bytes / (1024.0 * 1024.0),
         )
+
+    @classmethod
+    def from_fd(
+        cls,
+        fd: int,
+        file_size: int = 0,
+        warmup_pages: bool = False,
+        lib_path: str | Path | None = None,
+    ) -> LFM2Model:
+        """Loads a model directly from an open UNIX file descriptor.
+
+        Ideal for Android Scoped Storage / Content URIs.
+        The C engine creates a duplicated descriptor internally via dup(fd).
+        """
+        instance = cls.__new__(cls)
+        instance._lib = _bind_liblfm2(lib_path)
+        instance._ptr = instance._lib.lfm2_model_load_from_fd(fd, file_size, int(warmup_pages))
+        if not instance._ptr:
+            raise RuntimeError(f"Failed to load GGUF model from file descriptor: {fd}")
+
+        c_info = _CModelInfo()
+        instance._lib.lfm2_model_get_info(instance._ptr, ctypes.byref(c_info))
+        instance.info = ModelInfo(
+            arch=c_info.arch.decode("utf-8", errors="replace"),
+            active_isa=c_info.active_isa.decode("utf-8", errors="replace"),
+            n_layers=c_info.n_layers,
+            n_shortconv_layers=c_info.n_shortconv_layers,
+            n_gqa_layers=c_info.n_gqa_layers,
+            n_embd=c_info.n_embd,
+            n_ff=c_info.n_ff,
+            n_vocab=c_info.n_vocab,
+            n_ctx_train=c_info.n_ctx_train,
+            n_experts=c_info.n_experts,
+            n_experts_used=c_info.n_experts_used,
+            file_size_mb=c_info.file_size_bytes / (1024.0 * 1024.0),
+        )
+        return instance
+
+    def release_page_cache(self) -> None:
+        """Releases mmap page cache via madvise(MADV_DONTNEED) and posix_fadvise.
+
+        Designed for mobile lifecycle events (e.g. Android on_pause / Low Memory Killer survival).
+        Pages fault back in automatically on subsequent decode steps.
+        """
+        if self._ptr:
+            self._lib.lfm2_model_release_page_cache(self._ptr)
+
+    def warmup_page_cache(self) -> None:
+        """Actively warms GGUF weight pages sequentially into physical RAM.
+
+        Designed for background execution during mobile on_resume() to eliminate first-token latency spikes.
+        """
+        if self._ptr:
+            self._lib.lfm2_model_warmup_page_cache(self._ptr)
+
+    @classmethod
+    def get_process_rss_bytes(cls, lib_path: str | Path | None = None) -> int:
+        """Returns current resident set size (RSS) of the calling process in bytes."""
+        lib = _bind_liblfm2(lib_path)
+        return int(lib.lfm2_get_process_rss_bytes())
 
     def create_context(
         self,

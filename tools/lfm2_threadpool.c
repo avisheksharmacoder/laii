@@ -36,9 +36,19 @@
 #ifndef LFM2_THREADPOOL_INCLUDED
 #define LFM2_THREADPOOL_INCLUDED 1
 
-/* Number of user-space pause iterations (~8-12 microseconds) before a worker
- * assumes token generation is paused and sleeps in the kernel via futex. */
-#define LFM2_SPIN_ITERS 25000
+/* Mobile ARM64 uses a shorter user-space spin window before dropping into
+ * kernel futex sleep to prevent battery drain and thermal throttling. */
+#if defined(__aarch64__) || defined(__arm__)
+    #define LFM2_SPIN_ITERS 4000
+    #define lfm2_cpu_pause() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__x86_64__) || defined(_M_X64)
+    #define LFM2_SPIN_ITERS 25000
+    #define lfm2_cpu_pause() _mm_pause()
+#else
+    #define LFM2_SPIN_ITERS 10000
+    #define lfm2_cpu_pause() do {} while (0)
+#endif
+
 #define LFM2_MAX_THREADS 64
 
 static inline double now_ms(void) {
@@ -48,7 +58,7 @@ static inline double now_ms(void) {
 }
 
 /* ============================================================================
- * 1. Linux Futex Wrapper & Physical CPU Topology Detector
+ * 1. Linux Futex Wrapper & Cross-Platform CPU Core Topology Detector
  * ============================================================================ */
 static inline int futex_wait(_Atomic uint32_t *addr, uint32_t expected) {
     return (int)syscall(SYS_futex, (void *)addr, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
@@ -58,65 +68,216 @@ static inline int futex_wake(_Atomic uint32_t *addr, int count) {
     return (int)syscall(SYS_futex, (void *)addr, FUTEX_WAKE_PRIVATE, count, NULL, NULL, 0);
 }
 
-/* Queries /sys/devices/system/cpu/cpuN/topology/ to find unique physical
- * cores across sockets so AVX2 worker threads never collide on SMT siblings. */
-static uint32_t lfm2_detect_physical_cores(int out_cpu_ids[LFM2_MAX_THREADS]) {
-    long n_logical = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_logical <= 0) n_logical = 1;
-    if (n_logical > LFM2_MAX_THREADS) n_logical = LFM2_MAX_THREADS;
+typedef enum {
+    LFM2_CORE_PRIME  = 0, /* Highest-clock Prime core (e.g. Cortex-X4 / X3)    */
+    LFM2_CORE_PERF   = 1, /* Performance big core (e.g. Cortex-A720 / A715)    */
+    LFM2_CORE_LITTLE = 2  /* Efficiency in-order core (e.g. Cortex-A520 / A510)*/
+} lfm2_core_tier_t;
 
-    int seen_core_ids[LFM2_MAX_THREADS];
-    uint32_t n_phys = 0;
+typedef struct {
+    int              cpu_id;       /* Logical CPU index in Linux (0..N-1)      */
+    int              phys_pkg_id;  /* Socket / cluster package ID              */
+    int              core_id;      /* Hardware core ID (for x86 SMT dedup)     */
+    uint32_t         max_freq_khz; /* cpufreq/cpuinfo_max_freq in kHz          */
+    uint32_t         capacity;     /* Linux EAS cpu_capacity (1..1024)         */
+    lfm2_core_tier_t tier;         /* PRIME, PERF, or LITTLE                   */
+} LFM2CoreInfo;
 
-    for (int cpu = 0; cpu < (int)n_logical; ++cpu) {
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
-        FILE *f = fopen(path, "r");
+typedef struct {
+    uint32_t     n_total_physical;                  /* All unique physical cores  */
+    uint32_t     n_big_cores;                       /* PRIME + PERF cores count   */
+    uint32_t     n_little_cores;                    /* LITTLE cores count         */
+    bool         is_heterogeneous;                  /* true if asymmetric clusters*/
+    LFM2CoreInfo cores[LFM2_MAX_THREADS];           /* Sorted fastest -> slowest  */
+    int          recommended_cpus[LFM2_MAX_THREADS];/* Selected compute core IDs  */
+    uint32_t     n_recommended;                     /* Default auto core count    */
+    uint32_t     max_safe_threads;                  /* Hard cap preventing freeze */
+} LFM2CpuTopology;
+
+static bool read_sysfs_int(const char *path, int *out_val) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    int v = 0;
+    bool ok = (fscanf(f, "%d", &v) == 1);
+    fclose(f);
+    if (ok) *out_val = v;
+    return ok;
+}
+
+static bool read_sysfs_u32(const char *path, uint32_t *out_val) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    uint32_t v = 0;
+    bool ok = (fscanf(f, "%u", &v) == 1);
+    fclose(f);
+    if (ok) *out_val = v;
+    return ok;
+}
+
+static int compare_cores_fastest_first(const void *a, const void *b) {
+    const LFM2CoreInfo *ca = (const LFM2CoreInfo *)a;
+    const LFM2CoreInfo *cb = (const LFM2CoreInfo *)b;
+    if (ca->max_freq_khz != cb->max_freq_khz) {
+        return (cb->max_freq_khz > ca->max_freq_khz) ? 1 : -1;
+    }
+    if (ca->capacity != cb->capacity) {
+        return (cb->capacity > ca->capacity) ? 1 : -1;
+    }
+    return (ca->cpu_id - cb->cpu_id);
+}
+
+void lfm2_classify_and_select_cores(LFM2CpuTopology *topo) {
+    if (topo->n_total_physical == 0) return;
+
+    /* 1. Sort all discovered physical cores from fastest to slowest */
+    qsort(topo->cores, topo->n_total_physical, sizeof(LFM2CoreInfo), compare_cores_fastest_first);
+
+    const uint32_t peak_freq = topo->cores[0].max_freq_khz;
+    const uint32_t min_freq  = topo->cores[topo->n_total_physical - 1].max_freq_khz;
+    const uint32_t peak_cap  = topo->cores[0].capacity;
+    const uint32_t min_cap   = topo->cores[topo->n_total_physical - 1].capacity;
+
+    /* Detect if CPU has asymmetric big.LITTLE clusters:
+     * True if slowest core is < 78% of peak frequency OR < 65% of peak EAS capacity */
+    const bool freq_asymmetric = (peak_freq > 0) && (min_freq * 100U < peak_freq * 78U);
+    const bool cap_asymmetric  = (peak_cap  > 0) && (min_cap  * 100U < peak_cap  * 65U);
+    topo->is_heterogeneous     = freq_asymmetric || cap_asymmetric;
+
+    topo->n_big_cores    = 0;
+    topo->n_little_cores = 0;
+
+    for (uint32_t i = 0; i < topo->n_total_physical; ++i) {
+        LFM2CoreInfo *c = &topo->cores[i];
+        if (!topo->is_heterogeneous) {
+            c->tier = LFM2_CORE_PERF;
+            topo->n_big_cores++;
+        } else {
+            const bool is_little_freq = (peak_freq > 0) && (c->max_freq_khz * 100U < peak_freq * 75U);
+            const bool is_little_cap  = (peak_cap  > 0) && (c->capacity     * 100U < peak_cap  * 60U);
+            if (is_little_freq || is_little_cap) {
+                c->tier = LFM2_CORE_LITTLE;
+                topo->n_little_cores++;
+            } else {
+                const bool is_prime = (c->max_freq_khz * 100U >= peak_freq * 97U) &&
+                                      (c->capacity     * 100U >= peak_cap  * 95U) &&
+                                      (i == 0);
+                c->tier = is_prime ? LFM2_CORE_PRIME : LFM2_CORE_PERF;
+                topo->n_big_cores++;
+            }
+        }
+    }
+
+    if (!topo->is_heterogeneous) {
+        /* Homogeneous PC / Server (Uniform Cores):
+         * Hard-coded safety invariant: Always leave at least 1 core for OS / background daemons.
+         * Auto = N_phys - 1; Max safe = N_phys - 1. */
+        topo->max_safe_threads = (topo->n_total_physical > 1) ? (topo->n_total_physical - 1) : 1;
+        topo->n_recommended   = topo->max_safe_threads;
+        for (uint32_t i = 0; i < topo->n_total_physical; ++i) {
+            topo->recommended_cpus[i] = topo->cores[i].cpu_id;
+        }
+    } else {
+        /* Heterogeneous Mobile SoC (e.g. 4 Big + 4 Little = 8 cores):
+         * 1. Auto-default: Use N_big - 1 cores (e.g., 3 Big cores: 1 Prime + 2 Perf).
+         *    Leaves 1 Big core for Kivy/UI AND all 4 Little cores for OS/audio/sensors!
+         *    Saturates LPDDR5 bandwidth with 0 straggler delay and cool thermals.
+         * 2. Max Safe Ceiling: Leave at least 1 Big core AND 1 Little core free
+         *    (e.g., 8 - 2 = 6 cores max), preventing CPU blackout / Vdroop brownouts. */
+        topo->n_recommended   = (topo->n_big_cores > 1) ? (topo->n_big_cores - 1) : 1;
+        topo->max_safe_threads = (topo->n_total_physical > 2) ? (topo->n_total_physical - 2) : 1;
+
+        /* Order: Big cores first (Prime first, then Perf), then Little cores */
+        for (uint32_t i = 0; i < topo->n_total_physical; ++i) {
+            topo->recommended_cpus[i] = topo->cores[i].cpu_id;
+        }
+    }
+}
+
+void lfm2_discover_cpu_topology(LFM2CpuTopology *topo) {
+    memset(topo, 0, sizeof(*topo));
+
+    long n_online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n_online <= 0) n_online = 1;
+    if (n_online > LFM2_MAX_THREADS) n_online = LFM2_MAX_THREADS;
+
+    for (int cpu = 0; cpu < (int)n_online; ++cpu) {
+        char path[160];
+
+        /* Check if core is online */
+        if (cpu > 0) {
+            int online = 1;
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+            if (read_sysfs_int(path, &online) && online == 0) continue;
+        }
+
+        int pkg_id  = 0;
         int core_id = cpu;
-        if (f) {
-            if (fscanf(f, "%d", &core_id) != 1) core_id = cpu;
-            fclose(f);
-        }
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        read_sysfs_int(path, &pkg_id);
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+        read_sysfs_int(path, &core_id);
 
-        int pkg_id = 0;
-        char pkg_path[128];
-        snprintf(pkg_path, sizeof(pkg_path),
-                 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
-        FILE *fpkg = fopen(pkg_path, "r");
-        if (fpkg) {
-            if (fscanf(fpkg, "%d", &pkg_id) != 1) pkg_id = 0;
-            fclose(fpkg);
-        }
-
-        int unique_id = (pkg_id << 16) | (core_id & 0xFFFF);
-
-        bool duplicate = false;
-        for (uint32_t i = 0; i < n_phys; ++i) {
-            if (seen_core_ids[i] == unique_id) {
-                duplicate = true;
+#if defined(__x86_64__) || defined(_M_X64)
+        /* On x86_64, deduplicate SMT/Hyperthreading siblings sharing (pkg_id, core_id) */
+        bool is_smt_sibling = false;
+        for (uint32_t i = 0; i < topo->n_total_physical; ++i) {
+            if (topo->cores[i].phys_pkg_id == pkg_id && topo->cores[i].core_id == core_id) {
+                is_smt_sibling = true;
                 break;
             }
         }
-        if (!duplicate && n_phys < LFM2_MAX_THREADS) {
-            seen_core_ids[n_phys] = unique_id;
-            out_cpu_ids[n_phys]   = cpu;
-            n_phys++;
+        if (is_smt_sibling) continue;
+#endif
+
+        uint32_t max_freq = 0;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+        if (!read_sysfs_u32(path, &max_freq) || max_freq == 0) {
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
+            read_sysfs_u32(path, &max_freq);
         }
+
+        uint32_t capacity = 1024;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
+        read_sysfs_u32(path, &capacity);
+
+        LFM2CoreInfo *ci  = &topo->cores[topo->n_total_physical++];
+        ci->cpu_id        = cpu;
+        ci->phys_pkg_id   = pkg_id;
+        ci->core_id       = core_id;
+        ci->max_freq_khz  = max_freq;
+        ci->capacity      = capacity;
+        ci->tier          = LFM2_CORE_PERF;
     }
 
-    if (n_phys == 0) {
-        out_cpu_ids[0] = 0;
-        return 1;
+    if (topo->n_total_physical == 0) {
+        topo->n_total_physical    = 1;
+        topo->n_big_cores         = 1;
+        topo->n_recommended       = 1;
+        topo->max_safe_threads    = 1;
+        topo->cores[0].cpu_id     = 0;
+        topo->cores[0].capacity   = 1024;
+        topo->recommended_cpus[0] = 0;
+        return;
     }
-    return n_phys;
+
+    lfm2_classify_and_select_cores(topo);
 }
 
-static void lfm2_pin_current_thread_to_cpu(int cpu_id) {
+/* Backward compatibility helper for legacy call sites */
+static uint32_t lfm2_detect_physical_cores(int out_cpu_ids[LFM2_MAX_THREADS]) {
+    LFM2CpuTopology topo;
+    lfm2_discover_cpu_topology(&topo);
+    for (uint32_t i = 0; i < topo.n_total_physical; ++i) {
+        out_cpu_ids[i] = topo.cores[i].cpu_id;
+    }
+    return topo.n_total_physical;
+}
+
+static bool lfm2_pin_current_thread_to_cpu(int cpu_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    return (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0);
 }
 
 /* ============================================================================
@@ -139,8 +300,9 @@ typedef struct {
 } LFM2Worker;
 
 typedef struct LFM2ThreadPool {
-    uint32_t n_threads;
-    int      cpu_ids[LFM2_MAX_THREADS];
+    uint32_t        n_threads;
+    LFM2CpuTopology topology;
+    int             cpu_ids[LFM2_MAX_THREADS];
 
     /* Cache-line 1: Producer dispatch state (written by main thread) */
     _Alignas(64) _Atomic uint32_t generation; /* Incremented per parallel dispatch */
@@ -164,7 +326,7 @@ typedef struct LFM2ThreadPool {
  * 3. Worker Thread Loop & Zero-Allocation Parallel Dispatch
  * ============================================================================ */
 static void *lfm2_worker_entry(void *ptr) {
-    /* Flush denormals to zero (FTZ) & Denormals-are-zero (DAZ) on worker thread */
+    /* Flush denormals to zero (FTZ) & Denormals-are-zero (DAZ) on worker thread (x86 + ARM64 FPCR) */
     lfm2_set_denormals_zero_mode();
 
     LFM2Worker     *w    = (LFM2Worker *)ptr;
@@ -222,7 +384,7 @@ bool lfm2_threadpool_init(LFM2ThreadPool *pool, uint32_t requested_threads) {
 
     memset(pool, 0, sizeof(*pool));
 
-    uint32_t phys_cores = lfm2_detect_physical_cores(pool->cpu_ids);
+    lfm2_discover_cpu_topology(&pool->topology);
 
     /* Allow environment override if requested_threads == 0 */
     if (requested_threads == 0) {
@@ -233,16 +395,24 @@ bool lfm2_threadpool_init(LFM2ThreadPool *pool, uint32_t requested_threads) {
         }
     }
 
-    /* Hardcoded Safety Invariant:
-     * Never allow the engine to use all CPU cores under any circumstances.
-     * At least 1 physical core must ALWAYS be left free for the OS and background tasks
-     * to prevent emergency thermal trips (PROCHOT), battery voltage sags, or PC shutdown. */
-    uint32_t max_allowed_threads = (phys_cores > 1) ? (phys_cores - 1) : 1;
-
-    if (requested_threads == 0 || requested_threads > max_allowed_threads) {
-        pool->n_threads = max_allowed_threads;
+    /* Unified Core Selection & Safety Clamping Policy:
+     * - If requested_threads == 0: Use auto-recommended thread count:
+     *     * PC / Server: N_phys - 1 (leaves 1 physical core for OS/UI)
+     *     * Mobile SoC : N_big - 1  (leaves 1 Big core for UI + Little cluster for OS)
+     * - If requested_threads > 0: Clamp strictly to max_safe_threads:
+     *     * PC / Server: N_phys - 1
+     *     * Mobile SoC : N_total - 2 (leaves at least 1 Big core and 1 Little core free)
+     * Never allow 100% of all cores to prevent thermal tripping, battery blackouts, or freezing. */
+    if (requested_threads == 0) {
+        pool->n_threads = pool->topology.n_recommended;
+    } else if (requested_threads > pool->topology.max_safe_threads) {
+        pool->n_threads = pool->topology.max_safe_threads;
     } else {
         pool->n_threads = requested_threads;
+    }
+
+    for (uint32_t i = 0; i < pool->n_threads; ++i) {
+        pool->cpu_ids[i] = pool->topology.recommended_cpus[i];
     }
 
     atomic_init(&pool->generation, 0);
@@ -251,7 +421,7 @@ bool lfm2_threadpool_init(LFM2ThreadPool *pool, uint32_t requested_threads) {
     atomic_init(&pool->n_pending, 0);
     atomic_init(&pool->n_sleeping, 0);
 
-    /* Pin main thread (Worker 0) to physical core 0 */
+    /* Pin main thread (Worker 0) to fastest core (Prime core on mobile, or primary physical core on PC) */
     pool->workers[0].tid    = 0;
     pool->workers[0].cpu_id = pool->cpu_ids[0];
     pool->workers[0].pool   = pool;

@@ -253,7 +253,7 @@ Running high-parameter hybrid models on Linux systems requires operating-system 
 
 ## 13. Verification & Quality Assurance
 
-All Phase 4 components are validated across automated unit and integration tests:
+All Phase 4 and Phase 5 components are validated across automated unit, integration, and concurrency tests:
 - `bin/test_optimizations`: Fused LIV ShortConv and SIMD parity.
 - `bin/test_prefill_batch`: Batched GEMM vs single-token parity.
 - `bin/test_decode_1x4`: 1x4 row unrolling & fused SwiGLU FFN speedup.
@@ -264,8 +264,11 @@ All Phase 4 components are validated across automated unit and integration tests
 - `bin/test_cli_stream`: UTF-8 2/3/4-byte split assembly, multi-token stop string holdback, false-positive prefix divergence, end-of-stream flush, two-stage SIGINT state transitions, and large buffer safety.
 - `bin/test_sys_cache`: `/proc/meminfo` parser, OOM memory planner, 2 MB HugePage alignment, 4 KB stride page warmup, model fingerprint sensitivity, round-trip `.lfmcache` save/load, exact-prefix rejection, and checksum corruption detection.
 - `bin/test_lfm2_server`: Zero-dependency Linux `epoll` HTTP and SSE server test validating `GET /health`, `GET /`, `GET /v1/models`, `OPTIONS` preflight, streaming and non-streaming chat completions, embeddings, and instant client disconnect cancellation (`EPOLLRDHUP`).
-- **Sanitizers:** 100% clean under AddressSanitizer and UndefinedBehaviorSanitizer across all 26 C binaries and 14 standalone tools.
-- **Static Binaries:** Verified 16 standalone static ELF binaries with zero dynamic dependencies (`statically linked`).
+- `bin/test_lfm2_api`: Full public C11 ABI test including Test 8 for Android Scoped Storage FD loading (`dup(fd)`) and `madvise(MADV_DONTNEED)` cache release.
+- `bin/test_lfm2_threadpool`: Physical CPU topology discovery, simulated 8-core mobile SoC test (3 auto big cores, cpu7 Prime on Worker 0, 6-core max safe ceiling), futex idle transitions, and dynamic work-stealing.
+- **Sanitizers:** 100% clean under AddressSanitizer and UndefinedBehaviorSanitizer across all 27 C binaries and 14 standalone tools (`make test-asan`).
+- **ThreadSanitizer:** Zero data races certified across threadpool and parallel MatVec kernels under ThreadSanitizer (`make test-tsan`).
+- **Static Binaries:** Verified 16 standalone static ELF binaries with zero dynamic dependencies (`statically linked`), plus `make static-musl` target.
 
 ---
 
@@ -303,6 +306,40 @@ All Phase 4 components are validated across automated unit and integration tests
 * Embedding vectors serialize directly into server scratch buffers, guaranteeing zero dynamic heap allocations (`malloc`/`free`) in request hot paths.
 * Incorporates 10.0-second anti-Slowloris monotonic header deadlines.
 * Serves embedded zero-dependency HTML/JS chat studio at `GET /`, plus `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, and `OPTIONS`.
+
+---
+
+## 16. Mobile Edge & Android Scoped Storage Integration (`tools/lfm2_loader.c`, `src/lfm2_api.c`, `python/lfm2.py`)
+
+### 16.1 Scoped Storage FD Mapping (`lfm2_model_load_from_fd`)
+* Solves Android 10+ filesystem path isolation where apps obtain user-selected GGUF files via content URIs (`content://...`).
+* Accepts an open integer file descriptor, duplicates it via POSIX `dup(fd)` to decouple ownership from the host runtime, and maps it directly via `mmap(MAP_SHARED)`.
+* Exposed in Python SDK as `LFM2Model.from_fd(fd)`.
+
+### 16.2 Android `lmkd` Memory Reclamation (`lfm2_model_release_page_cache`)
+* Calls `madvise(mmap_addr, mmap_size, MADV_DONTNEED)`.
+* Discards physical RAM pages occupied by weights when the application enters the background (`onPause`), reducing process Resident Set Size (RSS) to near zero and preventing termination by Android's Low Memory Killer daemon.
+* Pages fault back in on demand when execution resumes (`onResume`).
+
+### 16.3 Dynamic 16 KB Page Stride Support (Android 15+)
+* Uses `sysconf(_SC_PAGESIZE)` instead of hardcoded 4096-byte constants during memory sweeps and page warmup loops, preventing SIGBUS and page-boundary alignment violations on Android 15+ devices with 16 KB kernel pages.
+
+---
+
+## 17. Unified Cross-Platform Asymmetric `big.LITTLE` Thread Pool (`tools/lfm2_threadpool.c`)
+
+### 17.1 Linux EAS Capacity & Clock Frequency Scanner
+* Scans `/sys/devices/system/cpu/cpuN/cpu_capacity` and `/sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq`.
+* Classifies cores into `PRIME` ($\ge 900$ capacity / $\ge 90\%$ frequency), `PERF` ($\ge 600$ capacity / $\ge 65\%$ frequency), and `LITTLE` (in-order efficiency cores).
+
+### 17.2 Cluster-Aware Resource Reservation
+* **PC Rule ($N_{\text{phys}} - 1$):** Reserves $N_{\text{phys}} - 1$ cores on homogeneous machines, guaranteeing 1 physical core for OS and desktop responsiveness.
+* **Mobile Rule ($N_{\text{big}} - 1$):** Automatically allocates $N_{\text{big}} - 1$ cores on heterogeneous SoCs (e.g. 3 Big cores: 1 Prime + 2 Perf), dedicating 1 Big core to Kivy/OpenGL rendering and all Little cores to Android OS services.
+* **Thermal Ceiling ($N_{\text{total}} - 2$):** Clamps maximum worker count to $N_{\text{total}} - 2$ (e.g. 6 cores max on an 8-core phone) to prevent thermal throttling, Vdroop voltage drops, and sudden CPU blackouts.
+* **Worker 0 on Prime Core:** Main thread pins Worker 0 to `recommended_cpus[0]` (highest compute capacity), accelerating single-threaded non-GEMM kernels (`RMSNorm`, ShortConv 3-tap shift, RoPE, sampling).
+* **ARM64 Microcode Trapping Prevention (`FPCR.FZ`):** Configures Floating-Point Control Register bit 24 (`FZ`) and bit 19 (`FZ16`) on all worker threads to flush denormal floating-point numbers to zero, eliminating 100-cycle microcode traps.
+* **Cross-Platform Pause & Adaptive Spin:** Replaces `_mm_pause()` with `lfm2_cpu_pause()` (evaluating `yield` on ARM64) and throttles busy-spinning from 25,000 iterations (x86_64) to 4,000 iterations (ARM64) to save battery before kernel futex sleep.
+
 
 
 

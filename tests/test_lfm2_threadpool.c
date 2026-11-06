@@ -70,6 +70,39 @@ static void test_topology_detection(void) {
         printf("  Hard cap verified: requesting %u or 128 cores strictly clamped to %u.\n",
                n_phys, expected_auto);
     }
+
+    /* Verify Simulated 8-Core Mobile SoC (4x LITTLE, 3x PERF, 1x PRIME) */
+    printf("  Verifying simulated 8-core Android SoC (1x Prime, 3x Perf, 4x Little)...\n");
+    LFM2CpuTopology mock_soc;
+    memset(&mock_soc, 0, sizeof(mock_soc));
+    mock_soc.n_total_physical = 8;
+    const uint32_t mock_freqs[8] = {
+        1804800, 1804800, 1804800, 1804800, /* cpu0..3 : 4x Cortex-A520 LITTLE @ 1.80 GHz */
+        2803200, 2803200, 2803200,          /* cpu4..6 : 3x Cortex-A720 PERF   @ 2.80 GHz */
+        3302400                             /* cpu7    : 1x Cortex-X4   PRIME  @ 3.30 GHz */
+    };
+    const uint32_t mock_caps[8] = {
+        320, 320, 320, 320,                 /* LITTLE capacity = 320  */
+        808, 808, 808,                      /* PERF   capacity = 808  */
+        1024                                /* PRIME  capacity = 1024 */
+    };
+    for (int i = 0; i < 8; ++i) {
+        mock_soc.cores[i].cpu_id       = i;
+        mock_soc.cores[i].core_id      = i;
+        mock_soc.cores[i].max_freq_khz = mock_freqs[i];
+        mock_soc.cores[i].capacity     = mock_caps[i];
+    }
+    lfm2_classify_and_select_cores(&mock_soc);
+
+    assert(mock_soc.is_heterogeneous == true);
+    assert(mock_soc.n_big_cores == 4);
+    assert(mock_soc.n_little_cores == 4);
+    assert(mock_soc.n_recommended == 3); /* N_big - 1: leaves 1 Big for UI, 4 Little for OS */
+    assert(mock_soc.recommended_cpus[0] == 7); /* Prime core is Worker 0! */
+    assert(mock_soc.max_safe_threads == 6); /* Strict 6-core ceiling: leaves 1 Big + 1 Little free */
+    printf("  Simulated SoC verified: Auto-recommended=3 big cores, Worker 0=cpu%d (Prime), Max safe ceiling=6 cores.\n",
+           mock_soc.recommended_cpus[0]);
+
     printf("PASSED: Topology detection and hard-coded N-1 physical core ceiling verified.\n");
 }
 

@@ -67,6 +67,8 @@ static inline void *lfm2_aligned_alloc_64(size_t size) {
  * Reduces 4 independent 8-lane int32 accumulators (r0, r1, r2, r3) into a
  * single 4-lane __m128i vector [sum(r0), sum(r1), sum(r2), sum(r3)] in 4 ops.
  * ============================================================================ */
+#ifndef hsum4_epi32_avx2_defined
+#define hsum4_epi32_avx2_defined
 static inline __m128i hsum4_epi32_avx2(__m256i r0, __m256i r1, __m256i r2, __m256i r3) {
     __m256i h01   = _mm256_hadd_epi32(r0, r1);
     __m256i h23   = _mm256_hadd_epi32(r2, r3);
@@ -74,6 +76,7 @@ static inline __m128i hsum4_epi32_avx2(__m256i r0, __m256i r1, __m256i r2, __m25
     return _mm_add_epi32(_mm256_castsi256_si128(h0123),
                          _mm256_extracti128_si256(h0123, 1));
 }
+#endif
 
 /* ============================================================================
  * 2. Fused AVX2 RMSNorm + Q8_K Quantizer (Single Pass over L1 Cache)
@@ -207,13 +210,8 @@ static inline void lfm2_vec_dot_q4_K_q8_K_1x4_avx2(const block_q4_K_t * restrict
         const float d8 = x_q8[b].d;
         if (d8 == 0.0f) continue;
 
-        /* Software prefetch next super-block across all 4 rows into L1 cache */
-        if (b + 1 < row_blocks) {
-            _mm_prefetch((const char *)&w0[b + 1], _MM_HINT_T0);
-            _mm_prefetch((const char *)&w1[b + 1], _MM_HINT_T0);
-            _mm_prefetch((const char *)&w2[b + 1], _MM_HINT_T0);
-            _mm_prefetch((const char *)&w3[b + 1], _MM_HINT_T0);
-        }
+        /* Software prefetch next super-block across all 4 rows into L1 cache with NTA hint */
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
 
         const int8_t  * restrict q8 = x_q8[b].qs;
         const int16_t * restrict bs = x_q8[b].bsums;
@@ -297,12 +295,7 @@ static inline void lfm2_vec_dot_q6_K_q8_K_1x4_avx2(const block_q6_K_t * restrict
         const float d8 = x_q8[b].d;
         if (d8 == 0.0f) continue;
 
-        if (b + 1 < row_blocks) {
-            _mm_prefetch((const char *)&w0[b + 1], _MM_HINT_T0);
-            _mm_prefetch((const char *)&w1[b + 1], _MM_HINT_T0);
-            _mm_prefetch((const char *)&w2[b + 1], _MM_HINT_T0);
-            _mm_prefetch((const char *)&w3[b + 1], _MM_HINT_T0);
-        }
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
 
         const int8_t  * restrict q8 = x_q8[b].qs;
         const int16_t * restrict bs = x_q8[b].bsums;
@@ -391,33 +384,64 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
                                            const float * restrict x_f32,
                                            const block_q8_K_t * restrict x_q8,
                                            float out4[4]) {
+    const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
     const uint32_t n_cols = (uint32_t)W->ne[0];
     if (W->type == GGML_TYPE_Q4_K) {
         const size_t rb = n_cols / 256;
-        lfm2_vec_dot_q4_K_q8_K_1x4_avx2((const block_q4_K_t *)W->data + (size_t)r * rb,
-                                        rb, x_q8, n_cols, out4);
+        if (kt->vec_dot_1x4[GGML_TYPE_Q4_K]) {
+            kt->vec_dot_1x4[GGML_TYPE_Q4_K]((const block_q4_K_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        } else {
+            lfm2_vec_dot_q4_K_q8_K_1x4_avx2((const block_q4_K_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        }
     } else if (W->type == GGML_TYPE_Q6_K) {
         const size_t rb = n_cols / 256;
-        lfm2_vec_dot_q6_K_q8_K_1x4_avx2((const block_q6_K_t *)W->data + (size_t)r * rb,
-                                        rb, x_q8, n_cols, out4);
+        if (kt->vec_dot_1x4[GGML_TYPE_Q6_K]) {
+            kt->vec_dot_1x4[GGML_TYPE_Q6_K]((const block_q6_K_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        } else {
+            lfm2_vec_dot_q6_K_q8_K_1x4_avx2((const block_q6_K_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        }
     } else if (W->type == GGML_TYPE_Q8_0) {
         const size_t rb = n_cols / 32;
-        const block_q8_0_t *base = (const block_q8_0_t *)W->data + (size_t)r * rb;
-        for (int k = 0; k < 4; ++k) {
-            out4[k] = lfm2_vec_dot_q8_0_q8_K_avx2(base + (size_t)k * rb, x_q8, n_cols);
+        if (kt->vec_dot_1x4[GGML_TYPE_Q8_0]) {
+            kt->vec_dot_1x4[GGML_TYPE_Q8_0]((const block_q8_0_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        } else {
+            const block_q8_0_t *base = (const block_q8_0_t *)W->data + (size_t)r * rb;
+            for (int k = 0; k < 4; ++k) {
+                out4[k] = lfm2_vec_dot_q8_0_q8_K_avx2(base + (size_t)k * rb, x_q8, n_cols);
+            }
         }
     } else if (W->type == GGML_TYPE_Q4_0) {
         const size_t rb = n_cols / 32;
-        lfm2_vec_dot_q4_0_q8_K_1x4_avx2((const block_q4_0_t *)W->data + (size_t)r * rb,
-                                        rb, x_q8, n_cols, out4);
+        if (kt->vec_dot_1x4[GGML_TYPE_Q4_0]) {
+            kt->vec_dot_1x4[GGML_TYPE_Q4_0]((const block_q4_0_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        } else {
+            lfm2_vec_dot_q4_0_q8_K_1x4_avx2((const block_q4_0_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        }
     } else if (W->type == GGML_TYPE_Q5_K) {
         const size_t rb = n_cols / 256;
-        lfm2_vec_dot_q5_K_q8_K_1x4_avx2((const block_q5_K_t *)W->data + (size_t)r * rb,
-                                        rb, x_q8, n_cols, out4);
+        if (kt->vec_dot_1x4[GGML_TYPE_Q5_K]) {
+            kt->vec_dot_1x4[GGML_TYPE_Q5_K]((const block_q5_K_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        } else {
+            lfm2_vec_dot_q5_K_q8_K_1x4_avx2((const block_q5_K_t *)W->data + (size_t)r * rb,
+                                            rb, x_q8, n_cols, out4);
+        }
     } else if (W->type == GGML_TYPE_IQ4_XS) {
         const size_t rb = n_cols / 256;
-        lfm2_vec_dot_iq4_xs_q8_K_1x4_avx2((const block_iq4_xs_t *)W->data + (size_t)r * rb,
-                                          rb, x_q8, n_cols, out4);
+        if (kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]) {
+            kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]((const block_iq4_xs_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+        } else {
+            lfm2_vec_dot_iq4_xs_q8_K_1x4_avx2((const block_iq4_xs_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+        }
     } else {
         const float *base = (const float *)W->data + (size_t)r * n_cols;
         for (int k = 0; k < 4; ++k) {
@@ -430,24 +454,43 @@ static inline float lfm2_compute_1row_avx2(const GGUFTensor * restrict W,
                                            uint32_t r,
                                            const float * restrict x_f32,
                                            const block_q8_K_t * restrict x_q8) {
+    const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
     const uint32_t n_cols = (uint32_t)W->ne[0];
     if (W->type == GGML_TYPE_Q4_K) {
         const size_t rb = n_cols / 256;
+        if (kt->vec_dot_1x1[GGML_TYPE_Q4_K]) {
+            return kt->vec_dot_1x1[GGML_TYPE_Q4_K]((const block_q4_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+        }
         return lfm2_vec_dot_q4_K_q8_K_avx2((const block_q4_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
     } else if (W->type == GGML_TYPE_Q6_K) {
         const size_t rb = n_cols / 256;
+        if (kt->vec_dot_1x1[GGML_TYPE_Q6_K]) {
+            return kt->vec_dot_1x1[GGML_TYPE_Q6_K]((const block_q6_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+        }
         return lfm2_vec_dot_q6_K_q8_K_avx2((const block_q6_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
     } else if (W->type == GGML_TYPE_Q8_0) {
         const size_t rb = n_cols / 32;
+        if (kt->vec_dot_1x1[GGML_TYPE_Q8_0]) {
+            return kt->vec_dot_1x1[GGML_TYPE_Q8_0]((const block_q8_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+        }
         return lfm2_vec_dot_q8_0_q8_K_avx2((const block_q8_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
     } else if (W->type == GGML_TYPE_Q4_0) {
         const size_t rb = n_cols / 32;
+        if (kt->vec_dot_1x1[GGML_TYPE_Q4_0]) {
+            return kt->vec_dot_1x1[GGML_TYPE_Q4_0]((const block_q4_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+        }
         return lfm2_vec_dot_q4_0_q8_K_avx2((const block_q4_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
     } else if (W->type == GGML_TYPE_Q5_K) {
         const size_t rb = n_cols / 256;
+        if (kt->vec_dot_1x1[GGML_TYPE_Q5_K]) {
+            return kt->vec_dot_1x1[GGML_TYPE_Q5_K]((const block_q5_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+        }
         return lfm2_vec_dot_q5_K_q8_K_avx2((const block_q5_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
     } else if (W->type == GGML_TYPE_IQ4_XS) {
         const size_t rb = n_cols / 256;
+        if (kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]) {
+            return kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]((const block_iq4_xs_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+        }
         return lfm2_vec_dot_iq4_xs_q8_K_avx2((const block_iq4_xs_t *)W->data + (size_t)r * rb, x_q8, n_cols);
     } else {
         return lfm2_vec_dot_f32_avx2((const float *)W->data + (size_t)r * n_cols, x_f32, n_cols);

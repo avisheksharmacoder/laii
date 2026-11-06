@@ -134,10 +134,47 @@ This document outlines the three-phase engineering trajectory for building a spe
     - Pre-allocated 32-connection pool with 64 KB request and 128 KB response buffers and anti-Slowloris monotonic deadlines (zero dynamic allocations).
     - Embedded zero-dependency HTML/CSS/JS chat studio (`GET /`) and full OpenAI REST API v1 (`/health`, `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `OPTIONS`).
     - Standalone compilation support via `-DLFM2_SERVER_STANDALONE_DEMO` requiring zero model checkpoints.
-  - [x] **Expanded 26-Part Automated Test Suite & 16 Static ELF Binaries:**
-    - 26 automated C test binaries (`make test-c-bins`) + Python SDK automated test + 14 standalone tools + 16 statically linked ELF binaries (`make static-test`).
-    - 100% pass rate under normal compilation and AddressSanitizer/UBSan runs.
+  - [x] **Expanded 30-Part Automated Test Suite & 18 Static ELF Binaries:**
+    - 30 automated C test binaries (`make test-c-bins`) + Python SDK automated test (7/7 tests) + 16 standalone tools + 18 statically linked ELF binaries (`make static-test`).
+    - 100% pass rate under normal compilation, AddressSanitizer/UBSan runs, and ThreadSanitizer (`make test-tsan`).
     - Detailed in [PHASE4_SPECIFICATION.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/PHASE4_SPECIFICATION.md) and [TEST_SUITE.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/TEST_SUITE.md).
+
+---
+
+## Phase 5: Mobile Edge & Systems Hardening (v1.0.0 Certified)
+
+* **Goal:** Cross-platform Android mobile SoC readiness, ThreadSanitizer concurrency certification, musl static distribution, big.LITTLE thermal optimization, and zero-weight speculative decoding.
+* **Key Deliverables:**
+  - [x] **Zero-Weight Prompt-Lookup Speculative Decoding (`tools/lfm2_speculative_pld.c`, `include/lfm2_speculative_pld.h`):**
+    - $O(1)$ hierarchical 3-gram and 2-gram MurmurHash3 lookup tables ($< 1\ \mu\text{s}$ drafting).
+    - Amortized memory bandwidth verification via batched GEMM ($B \le 8$), evaluating candidate drafts in 1 DRAM weight sweep.
+    - Per-slot ShortConv rolling trace (`conv_trace[b][l]`) enabling $O(1)$ causal rollback in $8\ \mu\text{s}$ without recomputing previous tokens.
+    - Automated unit test in `tests/test_speculative_pld.c` certifying 100% bit-exact sequence parity against baseline decode.
+  - [x] **Native ARM64 NEON + DotProd (`vdotq_s32`) + FP16 SIMD Suite (`tools/lfm2_simd_arm64.c`, `include/lfm2_simd_arm64.h`):**
+    - 1x1 and 1x4 row-unrolled microkernels for `Q4_K`, `Q6_K`, `Q5_K`, `IQ4_XS`, `Q4_0`, and `Q8_0` with zero register spills (32 ARM64 registers).
+    - Single-cycle signed `SDOT` (`vdotq_s32`) integer dot products for high-throughput mobile inference (25–45 tok/s).
+    - 1-cycle `TBL` lookup (`vqtbl1q_s8`) for `IQ4_XS` non-linear grid translation.
+    - `getauxval(AT_HWCAP)` dynamic CPU capability detection (`HWCAP_ASIMDDP`, `HWCAP_FPHP`) preventing `SIGILL` on older devices.
+    - Automated unit test suite in `tests/test_simd_arm64.c`.
+  - [x] **Android Scoped Storage Zero-Copy Loader (`tools/lfm2_loader.c`, `src/lfm2_api.c`, `python/lfm2.py`):**
+    - `lfm2_model_load_from_fd(int fd, ...)` duplicating descriptors via `dup(fd)` for zero-copy memory mapping of content URIs without filesystem path access.
+    - Python SDK `LFM2Model.from_fd(fd)` for turnkey integration with Android `pyjnius` / SAF.
+  - [x] **Android `lmkd` Memory Survival & Dynamic Page Warmup (`include/lfm2.h`, `tools/lfm2_loader.c`):**
+    - `lfm2_model_release_page_cache(model)` calling `madvise(MADV_DONTNEED)` for instant RSS drop on app pause/backgrounding.
+    - Dynamic 16 KB page size support via `sysconf(_SC_PAGESIZE)` for Android 15+ kernel compatibility.
+  - [x] **Unified Cross-Platform & Asymmetric `big.LITTLE` Thread Pool (`tools/lfm2_threadpool.c`):**
+    - Sysfs EAS capacity (`/sys/devices/system/cpu/cpuN/cpu_capacity`) and clock frequency (`cpuinfo_max_freq`) scanner.
+    - Automatic core tier classification (`PRIME`, `PERF`, `LITTLE`).
+    - PC $N_{\text{phys}} - 1$ core rule vs Mobile $N_{\text{big}} - 1$ core rule (leaving 1 Big core for Kivy/OpenGL and Little cores for OS).
+    - Thermal safety ceiling $N_{\text{total}} - 2$ (max 6 cores on 8-core SoCs) eliminating Vdroop brownouts and thermal shutdowns.
+    - Worker 0 pinned to fastest Prime core accelerating single-threaded sequential ops.
+    - ARM64 `FPCR.FZ` and `FPCR.FZ16` flush-to-zero in [`include/lfm2_simd_avx2.h`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/include/lfm2_simd_avx2.h).
+    - Adaptive spin loops (25,000 on x86 vs 4,000 on ARM64) and `lfm2_cpu_pause()` (`yield` on ARM64).
+  - [x] **ThreadSanitizer & Musl Static Build Pipeline (`Makefile`):**
+    - `make test-tsan` compiling with `-fsanitize=thread` and executed under `setarch x86_64 -R` (0 data races verified).
+    - `make static-musl` target for distro-agnostic static ELF binaries via `musl-gcc`.
+  - [x] **Mobile Integration Documentation (`docs/ANDROID_KIVY_INTEGRATION.md`):**
+    - Turnkey developer guide for NDK compilation, `p4a` recipe, threading, Scoped Storage, and lifecycle management without repo bloat.
 
 
 

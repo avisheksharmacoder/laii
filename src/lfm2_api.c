@@ -14,6 +14,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <immintrin.h>
 
 #define LFM2_LOADER_NO_MAIN 1
@@ -322,14 +324,20 @@ LFM2_API lfm2_sample_params_t lfm2_sample_default_params(void) {
 /* ============================================================================
  * 5. Model Lifecycle & Introspection API
  * ============================================================================ */
-LFM2_API lfm2_model_t *lfm2_model_load(const char *gguf_path, int32_t warmup_pages) {
+LFM2_API lfm2_model_t *lfm2_model_load_from_fd(int fd, uint64_t file_size, int32_t warmup_pages) {
     lfm2_set_denormals_zero_mode();
-    if (!gguf_path) return NULL;
+    if (fd < 0) return NULL;
+
+    int dup_fd = dup(fd);
+    if (dup_fd < 0) return NULL;
 
     lfm2_model_t *m = (lfm2_model_t *)calloc(1, sizeof(lfm2_model_t));
-    if (!m) return NULL;
+    if (!m) {
+        close(dup_fd);
+        return NULL;
+    }
 
-    if (!lfm2_load_gguf(gguf_path, &m->core)) {
+    if (!lfm2_load_gguf_from_fd(dup_fd, (size_t)file_size, &m->core)) {
         free(m);
         return NULL;
     }
@@ -352,6 +360,8 @@ LFM2_API lfm2_model_t *lfm2_model_load(const char *gguf_path, int32_t warmup_pag
     snprintf(m->info.arch, sizeof(m->info.arch), "%s", (c->n_experts > 0) ? "lfm2moe" : "lfm2");
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
     snprintf(m->info.active_isa, sizeof(m->info.active_isa), "AVX2 + FMA + F16C");
+#elif defined(__aarch64__)
+    snprintf(m->info.active_isa, sizeof(m->info.active_isa), "ARM64 NEON");
 #else
     snprintf(m->info.active_isa, sizeof(m->info.active_isa), "SCALAR");
 #endif
@@ -372,13 +382,65 @@ LFM2_API lfm2_model_t *lfm2_model_load(const char *gguf_path, int32_t warmup_pag
     m->info.n_experts_used     = c->n_experts_used;
     m->info.file_size_bytes    = (uint64_t)m->core.file_size;
 
-    snprintf(m->filepath, sizeof(m->filepath), "%s", gguf_path);
+    snprintf(m->filepath, sizeof(m->filepath), "<fd:%d>", fd);
 
     if (warmup_pages && m->core.mmap_base && m->core.file_size > 0) {
         lfm2_warmup_mmap_pages(&m->core, NULL, false);
     }
 
     return m;
+}
+
+LFM2_API lfm2_model_t *lfm2_model_load(const char *gguf_path, int32_t warmup_pages) {
+    if (!gguf_path) return NULL;
+    int fd = open(gguf_path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 24) {
+        close(fd);
+        return NULL;
+    }
+    lfm2_model_t *m = lfm2_model_load_from_fd(fd, (uint64_t)st.st_size, warmup_pages);
+    close(fd);
+    if (m) {
+        snprintf(m->filepath, sizeof(m->filepath), "%s", gguf_path);
+    }
+    return m;
+}
+
+LFM2_API void lfm2_model_release_page_cache(lfm2_model_t *model) {
+    if (!model || !model->core.mmap_base || model->core.file_size == 0) return;
+    madvise((void *)model->core.mmap_base, model->core.file_size, MADV_DONTNEED);
+#if defined(__linux__) || defined(__ANDROID__)
+    if (model->core.fd >= 0) {
+        posix_fadvise(model->core.fd, 0, (off_t)model->core.file_size, POSIX_FADV_DONTNEED);
+    }
+#endif
+}
+
+LFM2_API void lfm2_model_warmup_page_cache(lfm2_model_t *model) {
+    if (!model || !model->core.mmap_base || model->core.file_size == 0) return;
+    madvise((void *)model->core.mmap_base, model->core.file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t stride = (ps > 0) ? (size_t)ps : 4096;
+    volatile uint64_t acc = 0;
+    const uint8_t *ptr = (const uint8_t *)model->core.mmap_base;
+    for (size_t off = 0; off < model->core.file_size; off += stride) {
+        acc += ptr[off];
+    }
+    (void)acc;
+}
+
+LFM2_API uint64_t lfm2_get_process_rss_bytes(void) {
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    unsigned long vm_pages = 0, rss_pages = 0;
+    if (fscanf(f, "%lu %lu", &vm_pages, &rss_pages) != 2) {
+        rss_pages = 0;
+    }
+    fclose(f);
+    long ps = sysconf(_SC_PAGESIZE);
+    return (uint64_t)rss_pages * (uint64_t)((ps > 0) ? ps : 4096);
 }
 
 LFM2_API void lfm2_model_free(lfm2_model_t *model) {

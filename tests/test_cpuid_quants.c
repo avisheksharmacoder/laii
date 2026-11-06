@@ -36,20 +36,28 @@ static void test_cpuid_detection_and_table(void) {
     assert(kt.quantize_q8_K != NULL);
     assert(kt.vec_dot_1x1[GGML_TYPE_Q4_0] != NULL);
     assert(kt.vec_dot_1x4[GGML_TYPE_Q4_0] != NULL);
+    assert(kt.vec_dot_1x1[GGML_TYPE_Q8_0] != NULL);
+    assert(kt.vec_dot_1x4[GGML_TYPE_Q8_0] != NULL);
+    assert(kt.vec_dot_1x1[GGML_TYPE_Q4_K] != NULL);
+    assert(kt.vec_dot_1x4[GGML_TYPE_Q4_K] != NULL);
     assert(kt.vec_dot_1x1[GGML_TYPE_Q5_K] != NULL);
     assert(kt.vec_dot_1x4[GGML_TYPE_Q5_K] != NULL);
+    assert(kt.vec_dot_1x1[GGML_TYPE_Q6_K] != NULL);
+    assert(kt.vec_dot_1x4[GGML_TYPE_Q6_K] != NULL);
     assert(kt.vec_dot_1x1[GGML_TYPE_IQ4_XS] != NULL);
     assert(kt.vec_dot_1x4[GGML_TYPE_IQ4_XS] != NULL);
 
     if (kt.has_avx2 && kt.has_fma && kt.has_f16c) {
-        assert(strcmp(kt.isa_name, "AVX2 + FMA + F16C") == 0);
+        if (kt.has_avx_vnni) {
+            assert(strcmp(kt.isa_name, "AVX-VNNI (vpdpbusd) + FMA + F16C + NTA") == 0);
+            assert(kt.vec_dot_1x1[GGML_TYPE_Q4_K] == lfm2_vec_dot_q4_K_q8_K_avx_vnni);
+            assert(kt.vec_dot_1x4[GGML_TYPE_Q4_K] == lfm2_vec_dot_q4_K_q8_K_1x4_avx_vnni);
+        } else {
+            assert(strcmp(kt.isa_name, "AVX2 + FMA + F16C + NTA") == 0);
+            assert(kt.vec_dot_1x1[GGML_TYPE_Q4_K] == (lfm2_vec_dot_1x1_fn)lfm2_vec_dot_q4_K_q8_K_avx2);
+            assert(kt.vec_dot_1x4[GGML_TYPE_Q4_K] == lfm2_vec_dot_q4_K_q8_K_1x4_avx2_nta);
+        }
         assert(kt.quantize_q8_K == lfm2_quantize_row_q8_K_avx2_cpuid);
-        assert(kt.vec_dot_1x1[GGML_TYPE_Q4_0] == lfm2_vec_dot_q4_0_q8_K_avx2);
-        assert(kt.vec_dot_1x4[GGML_TYPE_Q4_0] == lfm2_vec_dot_q4_0_q8_K_1x4_avx2);
-        assert(kt.vec_dot_1x1[GGML_TYPE_Q5_K] == lfm2_vec_dot_q5_K_q8_K_avx2);
-        assert(kt.vec_dot_1x4[GGML_TYPE_Q5_K] == lfm2_vec_dot_q5_K_q8_K_1x4_avx2);
-        assert(kt.vec_dot_1x1[GGML_TYPE_IQ4_XS] == lfm2_vec_dot_iq4_xs_q8_K_avx2);
-        assert(kt.vec_dot_1x4[GGML_TYPE_IQ4_XS] == lfm2_vec_dot_iq4_xs_q8_K_1x4_avx2);
     }
 
     printf("PASSED: CPUID features and function-pointer table verified.\n");
@@ -284,8 +292,14 @@ static void test_forced_scalar_dispatch(void) {
     assert(kt_scalar.quantize_q8_K == lfm2_quantize_row_q8_K_scalar);
     assert(kt_scalar.vec_dot_1x1[GGML_TYPE_Q4_0] == lfm2_vec_dot_q4_0_q8_K_scalar);
     assert(kt_scalar.vec_dot_1x4[GGML_TYPE_Q4_0] == lfm2_vec_dot_q4_0_q8_K_1x4_scalar);
+    assert(kt_scalar.vec_dot_1x1[GGML_TYPE_Q8_0] == lfm2_vec_dot_q8_0_q8_K_scalar);
+    assert(kt_scalar.vec_dot_1x4[GGML_TYPE_Q8_0] == lfm2_vec_dot_q8_0_q8_K_1x4_scalar);
+    assert(kt_scalar.vec_dot_1x1[GGML_TYPE_Q4_K] == lfm2_vec_dot_q4_K_q8_K_scalar);
+    assert(kt_scalar.vec_dot_1x4[GGML_TYPE_Q4_K] == lfm2_vec_dot_q4_K_q8_K_1x4_scalar);
     assert(kt_scalar.vec_dot_1x1[GGML_TYPE_Q5_K] == lfm2_vec_dot_q5_K_q8_K_scalar);
     assert(kt_scalar.vec_dot_1x4[GGML_TYPE_Q5_K] == lfm2_vec_dot_q5_K_q8_K_1x4_scalar);
+    assert(kt_scalar.vec_dot_1x1[GGML_TYPE_Q6_K] == lfm2_vec_dot_q6_K_q8_K_scalar);
+    assert(kt_scalar.vec_dot_1x4[GGML_TYPE_Q6_K] == lfm2_vec_dot_q6_K_q8_K_1x4_scalar);
     assert(kt_scalar.vec_dot_1x1[GGML_TYPE_IQ4_XS] == lfm2_vec_dot_iq4_xs_q8_K_scalar);
     assert(kt_scalar.vec_dot_1x4[GGML_TYPE_IQ4_XS] == lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar);
 

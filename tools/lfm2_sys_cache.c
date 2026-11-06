@@ -274,7 +274,8 @@ static inline uint64_t lfm2_warmup_mmap_pages(const LFM2Model *m, FILE *log_stre
     }
     madvise((void *)m->mmap_base, m->file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
 
-    const size_t page_step  = 4096;
+    long ps = sysconf(_SC_PAGESIZE);
+    const size_t page_step  = (ps > 0) ? (size_t)ps : 4096;
     const size_t chunk_step = 16ULL * 1024ULL * 1024ULL; /* Update UI every 16 MB */
     const uint8_t *base     = m->mmap_base;
     const size_t total      = m->file_size;

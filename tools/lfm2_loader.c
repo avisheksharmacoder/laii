@@ -466,32 +466,28 @@ static bool bind_lfm2_tensors(LFM2Model *m) {
 /* ============================================================================
  * 7. Main GGUF v3 mmap Loader & Unloader
  * ============================================================================ */
-bool lfm2_load_gguf(const char *filepath, LFM2Model *m) {
+bool lfm2_load_gguf_from_fd(int fd, size_t file_size, LFM2Model *m) {
+    if (fd < 0) return false;
     memset(m, 0, sizeof(*m));
-    m->fd = -1;
+    m->fd = fd;
     m->cfg.alignment         = GGUF_DEFAULT_ALIGNMENT;
     m->cfg.shortconv_l_cache = 3;
     m->cfg.rms_norm_eps      = 1e-5f;
     m->cfg.rope_freq_base    = 1e6f;
 
-    m->fd = open(filepath, O_RDONLY);
-    if (m->fd < 0) {
-        perror("open");
-        return false;
+    if (file_size < 24) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < 24) {
+            perror("fstat");
+            return false;
+        }
+        file_size = (size_t)st.st_size;
     }
-
-    struct stat st;
-    if (fstat(m->fd, &st) != 0 || st.st_size < 24) {
-        perror("fstat");
-        close(m->fd);
-        return false;
-    }
-    m->file_size = (size_t)st.st_size;
+    m->file_size = file_size;
 
     void *mapped = mmap(NULL, m->file_size, PROT_READ, MAP_SHARED, m->fd, 0);
     if (mapped == MAP_FAILED) {
         perror("mmap");
-        close(m->fd);
         return false;
     }
     m->mmap_base = (const uint8_t *)mapped;
@@ -576,10 +572,12 @@ bool lfm2_load_gguf(const char *filepath, LFM2Model *m) {
         t->data = m->mmap_base + abs_off;
     }
 
-    /* Sequential page touch warmup to eliminate cold-start OS minor page faults */
+    /* Sequential page touch warmup with dynamic page size (supporting 4 KB & Android 15+ 16 KB pages) */
     volatile uint64_t warmup_sink = 0;
     const uint8_t *warmup_ptr = m->mmap_base;
-    for (size_t off = 0; off < m->file_size; off += 4096) {
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page_step = (ps > 0) ? (size_t)ps : 4096;
+    for (size_t off = 0; off < m->file_size; off += page_step) {
         warmup_sink += warmup_ptr[off];
     }
     (void)warmup_sink;
@@ -593,7 +591,31 @@ fail:
         munmap((void *)m->mmap_base, m->file_size);
     }
     if (m->fd >= 0) close(m->fd);
+    m->fd = -1;
+    m->mmap_base = NULL;
+    m->tensors = NULL;
     return false;
+}
+
+bool lfm2_load_gguf(const char *filepath, LFM2Model *m) {
+    if (!filepath) return false;
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 24) {
+        perror("fstat");
+        close(fd);
+        return false;
+    }
+
+    if (!lfm2_load_gguf_from_fd(fd, (size_t)st.st_size, m)) {
+        return false;
+    }
+    return true;
 }
 
 void lfm2_free_model(LFM2Model *m) {

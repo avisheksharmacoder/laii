@@ -291,6 +291,61 @@ static void test_end_to_end_fast_model(void) {
     printf("PASSED: End-to-end fused fast token forward pass verified on GGUF checkpoint!\n");
 }
 
+static void test_cross_platform_dispatch_parity(void) {
+    printf("[Test 6/6] Verifying Cross-Platform SIMD vs Portable Scalar Kernel Parity...\n");
+    const uint32_t D = 256;
+    float *bcx = (float *)lfm2_aligned_alloc_64(3 * D * sizeof(float));
+    float *conv_weights = (float *)lfm2_aligned_alloc_64(3 * D * sizeof(float));
+    float *state_simd = (float *)lfm2_aligned_alloc_64(2 * D * sizeof(float));
+    float *state_scalar = (float *)lfm2_aligned_alloc_64(2 * D * sizeof(float));
+    float *out_simd = (float *)lfm2_aligned_alloc_64(D * sizeof(float));
+    float *out_scalar = (float *)lfm2_aligned_alloc_64(D * sizeof(float));
+    block_q8_K_t *q8_simd = (block_q8_K_t *)lfm2_aligned_alloc_64((D / 256) * sizeof(block_q8_K_t));
+    block_q8_K_t *q8_scalar = (block_q8_K_t *)lfm2_aligned_alloc_64((D / 256) * sizeof(block_q8_K_t));
+
+    for (uint32_t i = 0; i < 3 * D; ++i) {
+        bcx[i] = sinf((float)i * 0.05f);
+        conv_weights[i] = cosf((float)i * 0.03f);
+    }
+    for (uint32_t i = 0; i < 2 * D; ++i) {
+        state_simd[i] = state_scalar[i] = 0.2f * sinf((float)i * 0.1f);
+    }
+
+    GGUFTensor t_conv = { .n_dims = 2, .ne = {3, D, 1, 1}, .type = GGML_TYPE_F32, .data = conv_weights };
+    LFM2PlanarConvWeights pw;
+    lfm2_planar_conv_init(&pw, &t_conv, D);
+
+    /* 1. Compare ShortConv SIMD vs Scalar */
+    lfm2_shortconv_gate_conv_quant_simd(out_simd, q8_simd, bcx, state_simd, &pw, D);
+    lfm2_shortconv_gate_conv_quant_scalar(out_scalar, q8_scalar, bcx, state_scalar, &pw, D);
+
+    for (uint32_t i = 0; i < D; ++i) {
+        assert(fabsf(out_simd[i] - out_scalar[i]) < 1e-5f);
+    }
+    for (uint32_t i = 0; i < 2 * D; ++i) {
+        assert(fabsf(state_simd[i] - state_scalar[i]) < 1e-5f);
+    }
+    assert(fabsf(q8_simd[0].d - q8_scalar[0].d) < 1e-5f);
+    for (int i = 0; i < 256; ++i) {
+        assert(q8_simd[0].qs[i] == q8_scalar[0].qs[i]);
+    }
+
+    /* 2. Compare FP32 -> FP16 store */
+    uint16_t f16_simd[256], f16_scalar[256];
+    lfm2_store_fp32_to_fp16_simd(f16_simd, out_simd, 256);
+    lfm2_store_fp32_to_fp16_scalar(f16_scalar, out_simd, 256);
+    for (int i = 0; i < 256; ++i) {
+        assert(f16_simd[i] == f16_scalar[i]);
+    }
+
+    lfm2_planar_conv_free(&pw);
+    free(bcx); free(conv_weights);
+    free(state_simd); free(state_scalar);
+    free(out_simd); free(out_scalar);
+    free(q8_simd); free(q8_scalar);
+    printf("PASSED: Cross-platform SIMD vs scalar parity verified.\n");
+}
+
 int main(void) {
     printf("=======================================================\n");
     printf("Running Liquid AI LFM2 Fused Fast Kernels Test Suite   \n");
@@ -301,9 +356,10 @@ int main(void) {
     test_rope_lut_parity();
     test_online_gqa_f16_parity();
     test_end_to_end_fast_model();
+    test_cross_platform_dispatch_parity();
 
     printf("=======================================================\n");
-    printf("ALL 5 FAST KERNEL UNIT TESTS PASSED WITH 100%% SUCCESS! \n");
+    printf("ALL 6 FAST KERNEL UNIT TESTS PASSED WITH 100%% SUCCESS! \n");
     printf("=======================================================\n");
     return EXIT_SUCCESS;
 }

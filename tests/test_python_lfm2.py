@@ -102,8 +102,36 @@ def test_python_sdk() -> None:
                 assert ptr[len(logits) - 1] == logits[-1]
                 print(f"  Zero-copy logits extracted successfully (len={len(logits)}, head={logits[:3]})")
 
+    # 7. Android Scoped Storage FD Loading, RSS Profiling & Page Cache Lifecycle
+    print("[Test 7/7] Verifying Android Scoped Storage FD Loading, RSS Profiling & Page Cache Lifecycle...")
+    rss_bytes = LFM2Model.get_process_rss_bytes(lib_path=LIB_PATH)
+    assert rss_bytes > 0, "Expected non-zero process RSS"
+    print(f"  Current process RSS: {rss_bytes / (1024 * 1024):.2f} MB")
+
+    raw_fd = os.open(TOY_MODEL_PATH, os.O_RDONLY)
+    try:
+        with LFM2Model.from_fd(raw_fd, lib_path=LIB_PATH) as fd_model:
+            assert fd_model.info.n_layers == 2
+            assert fd_model.info.n_embd == 64
+            assert fd_model.info.n_vocab == 32
+
+            # Test active page cache warmup (for mobile on_resume background task)
+            fd_model.warmup_page_cache()
+            print("  Page cache warmed via warmup_page_cache()")
+
+            # Test dual-layer page cache release (madvise MADV_DONTNEED + posix_fadvise for mobile on_pause)
+            fd_model.release_page_cache()
+            print("  Page cache released via release_page_cache()")
+
+            with fd_model.create_context(max_seq_len=64) as fd_ctx:
+                reply = fd_ctx.chat("Testing from FD", temperature=0.0)
+                assert isinstance(reply, str)
+                print(f"  Inference executed successfully on FD model: {repr(reply[:15])}")
+    finally:
+        os.close(raw_fd)
+
     print("=======================================================")
-    print("ALL 6 PYTHON SDK TESTS PASSED WITH 100% SUCCESS!       ")
+    print("ALL 7 PYTHON SDK TESTS PASSED WITH 100% SUCCESS!       ")
     print("=======================================================")
 
 

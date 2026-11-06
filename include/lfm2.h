@@ -114,6 +114,26 @@ LFM2_API lfm2_sample_params_t  lfm2_sample_default_params(void);
  * 4. Model Lifecycle & Introspection API
  * ============================================================================ */
 LFM2_API lfm2_model_t *lfm2_model_load(const char *gguf_path, int32_t warmup_pages);
+
+/* Android Scoped Storage / Content URI file descriptor loader.
+ * Uses dup(fd) internally; caller retains ownership of their own descriptor.
+ * If file_size is 0, fstat is invoked on fd to resolve length automatically. */
+LFM2_API lfm2_model_t *lfm2_model_load_from_fd(int fd, uint64_t file_size, int32_t warmup_pages);
+
+/* Releases GGUF mmap page cache back to OS via dual-layer madvise(MADV_DONTNEED)
+ * and posix_fadvise(POSIX_FADV_DONTNEED) for Android Low Memory Killer (lmkd) survival.
+ * Pages fault back into RAM seamlessly on subsequent token generation steps. */
+LFM2_API void          lfm2_model_release_page_cache(lfm2_model_t *model);
+
+/* Actively warms GGUF weight pages sequentially into physical RAM via MADV_WILLNEED
+ * and dynamic hardware page-strided pre-faulting (supporting 4 KB, 16 KB & 64 KB pages).
+ * Ideal for invocation on a background worker thread during mobile on_resume(). */
+LFM2_API void          lfm2_model_warmup_page_cache(lfm2_model_t *model);
+
+/* Returns current resident set size (RSS) of the calling process in bytes by reading
+ * /proc/self/statm on Linux and Android. Pure C11, zero dynamic allocations. */
+LFM2_API uint64_t      lfm2_get_process_rss_bytes(void);
+
 LFM2_API void          lfm2_model_free(lfm2_model_t *model);
 LFM2_API lfm2_status_t lfm2_model_get_info(const lfm2_model_t *model, lfm2_model_info_t *out_info);
 

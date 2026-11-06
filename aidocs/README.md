@@ -52,7 +52,7 @@ flowchart TD
 ## 🛠️ Essential Commands Cheat Sheet
 
 ```bash
-# 1. Compile and run all 27 automated unit, hardening, and numerical parity test binaries
+# 1. Compile and run all 30 automated unit, hardening, and numerical parity test binaries
 make test-c-bins
 
 # 2. Run the complete test suite including standalone tools, Python bindings, and HTTP server
@@ -61,7 +61,7 @@ make test
 # 3. CRITICAL: Run memory safety verification under AddressSanitizer & UndefinedBehaviorSanitizer
 make test-asan
 
-# 4. Build and verify all 16 standalone statically linked ELF executables
+# 4. Build and verify all 18 standalone statically linked ELF executables
 make static-test
 
 # 5. Run the high-level CLI executable with prompt cache and sequential page warmup
@@ -75,6 +75,9 @@ make test-parity
 
 # 8. Run zero-dependency non-blocking epoll OpenAI HTTP/SSE server test
 ./bin/test_lfm2_server
+
+# 9. Run batched prefill GEMM benchmark (proves 1.4x–1.7x matrix & 18x–26x prefill speedup)
+./bin/lfm2_prefill_bench
 ```
 
 > [!IMPORTANT]

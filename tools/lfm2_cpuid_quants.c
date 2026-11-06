@@ -32,6 +32,16 @@
 #endif
 #endif
 
+#ifndef LFM2_SIMD_AVX2_H
+#if __has_include("include/lfm2_simd_avx2.h")
+#include "include/lfm2_simd_avx2.h"
+#elif __has_include("lfm2_simd_avx2.h")
+#include "lfm2_simd_avx2.h"
+#else
+#include "../include/lfm2_simd_avx2.h"
+#endif
+#endif
+
 /* ============================================================================
  * 1. Complete GGUF / GGML Quantization Block Definitions
  * ============================================================================ */
@@ -355,10 +365,164 @@ static inline void lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar(const void * restrict w_r
     for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_iq4_xs_q8_K_scalar(w + k * rb, x_q8, n_cols);
 }
 
+static inline float lfm2_vec_dot_q8_0_q8_K_scalar(const void * restrict w_raw,
+                                                  const block_q8_K_t * restrict x_q8,
+                                                  uint32_t n_cols) {
+    const block_q8_0_t *w_row = (const block_q8_0_t *)w_raw;
+    const uint32_t nb_k = (n_cols + 255) / 256;
+    float sumf = 0.0f;
+    for (uint32_t b = 0; b < nb_k; ++b) {
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+        const block_q8_0_t *w_sub = w_row + (size_t)b * 8;
+        const int8_t *q8 = x_q8[b].qs;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 8; ++j) {
+            const float dw = fp16_to_fp32_scalar(w_sub[j].d);
+            int32_t dot = 0;
+            for (int l = 0; l < 32; ++l) dot += (int32_t)w_sub[j].qs[l] * (int32_t)q8[j * 32 + l];
+            block_sum += dw * (float)dot;
+        }
+        sumf += d8 * block_sum;
+    }
+    return sumf;
+}
+
+static inline void lfm2_vec_dot_q8_0_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
+                                                     const block_q8_K_t * restrict x_q8,
+                                                     uint32_t n_cols, float out4[4]) {
+    const block_q8_0_t *w = (const block_q8_0_t *)w_raw0;
+    for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q8_0_q8_K_scalar(w + k * rb, x_q8, n_cols);
+}
+
+static inline float lfm2_vec_dot_q4_K_q8_K_scalar(const void * restrict w_raw,
+                                                  const block_q8_K_t * restrict x_q8,
+                                                  uint32_t n_cols) {
+    const block_q4_K_t *w_row = (const block_q4_K_t *)w_raw;
+    const uint32_t nb = n_cols / 256;
+    float sumf = 0.0f;
+    for (uint32_t b = 0; b < nb; ++b) {
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+        const float d = fp16_to_fp32_scalar(w_row[b].d) * d8;
+        const float dmin = fp16_to_fp32_scalar(w_row[b].dmin) * d8;
+        const uint8_t *q4 = w_row[b].qs;
+        const int8_t *q8 = x_q8[b].qs;
+        const int16_t *bs = x_q8[b].bsums;
+        int32_t acc_i32 = 0;
+        int32_t sum_mins = 0;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, w_row[b].scales, &sc1, &m1);
+            get_scale_min_k4(is + 1, w_row[b].scales, &sc2, &m2);
+            sum_mins += (int32_t)m1 * ((int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1])
+                      + (int32_t)m2 * ((int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3]);
+            int32_t dot1 = 0, dot2 = 0;
+            for (int l = 0; l < 32; ++l) {
+                dot1 += (int32_t)(q4[l] & 0x0F) * (int32_t)q8[j + l];
+                dot2 += (int32_t)(q4[l] >> 4)   * (int32_t)q8[j + 32 + l];
+            }
+            acc_i32 += dot1 * (int32_t)sc1 + dot2 * (int32_t)sc2;
+            q4 += 32;
+            is += 2;
+        }
+        sumf += d * (float)acc_i32 - dmin * (float)sum_mins;
+    }
+    return sumf;
+}
+
+static inline void lfm2_vec_dot_q4_K_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
+                                                     const block_q8_K_t * restrict x_q8,
+                                                     uint32_t n_cols, float out4[4]) {
+    const block_q4_K_t *w = (const block_q4_K_t *)w_raw0;
+    for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q4_K_q8_K_scalar(w + k * rb, x_q8, n_cols);
+}
+
+static inline float lfm2_vec_dot_q6_K_q8_K_scalar(const void * restrict w_raw,
+                                                  const block_q8_K_t * restrict x_q8,
+                                                  uint32_t n_cols) {
+    const block_q6_K_t *w_row = (const block_q6_K_t *)w_raw;
+    const uint32_t nb = n_cols / 256;
+    float sumf = 0.0f;
+    for (uint32_t b = 0; b < nb; ++b) {
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+        const float d = fp16_to_fp32_scalar(w_row[b].d) * d8;
+        const uint8_t *ql = w_row[b].ql;
+        const uint8_t *qh = w_row[b].qh;
+        const int8_t *sc = w_row[b].scales;
+        const int8_t *q8 = x_q8[b].qs;
+        const int16_t *bs = x_q8[b].bsums;
+        int32_t sum_off = 0;
+        for (int is = 0; is < 16; ++is) sum_off += (int32_t)sc[is] * (int32_t)bs[is];
+        int32_t acc_i32 = 0;
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t *ql_h = ql + half * 64;
+            const uint8_t *qh_h = qh + half * 32;
+            const int8_t *sc_h = sc + half * 8;
+            const int8_t *q8_h = q8 + half * 128;
+            for (int l = 0; l < 32; ++l) {
+                int8_t u1 = (int8_t)((ql_h[l] & 0x0F) | ((qh_h[l] & 0x03) << 4));
+                int8_t u2 = (int8_t)((ql_h[l + 32] & 0x0F) | ((qh_h[l] & 0x0C) << 2));
+                int8_t u3 = (int8_t)((ql_h[l] >> 4) | ((qh_h[l] & 0x30) << 0));
+                int8_t u4 = (int8_t)((ql_h[l + 32] >> 4) | ((qh_h[l] & 0xC0) >> 2));
+                int32_t s01 = (l < 16) ? sc_h[0] : sc_h[1];
+                int32_t s23 = (l < 16) ? sc_h[2] : sc_h[3];
+                int32_t s45 = (l < 16) ? sc_h[4] : sc_h[5];
+                int32_t s67 = (l < 16) ? sc_h[6] : sc_h[7];
+                acc_i32 += (int32_t)u1 * (int32_t)q8_h[l + 0]  * s01
+                         + (int32_t)u2 * (int32_t)q8_h[l + 32] * s23
+                         + (int32_t)u3 * (int32_t)q8_h[l + 64] * s45
+                         + (int32_t)u4 * (int32_t)q8_h[l + 96] * s67;
+            }
+        }
+        sumf += d * (float)(acc_i32 - 32 * sum_off);
+    }
+    return sumf;
+}
+
+static inline void lfm2_vec_dot_q6_K_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
+                                                     const block_q8_K_t * restrict x_q8,
+                                                     uint32_t n_cols, float out4[4]) {
+    const block_q6_K_t *w = (const block_q6_K_t *)w_raw0;
+    for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q6_K_q8_K_scalar(w + k * rb, x_q8, n_cols);
+}
+
 /* ============================================================================
  * 4. Target-Attributed AVX2 + FMA + F16C Kernels (Safe Multi-ISA Target)
  * ============================================================================ */
 #define LFM2_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#ifndef LFM2_TARGET_AVXVNNI
+#define LFM2_TARGET_AVXVNNI __attribute__((target("avx2,fma,f16c,avxvnni")))
+#endif
+
+#ifndef LFM2_PREFETCH_1X4_NTA
+#define LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks) do {       \
+    if ((b) + 1 < (row_blocks)) {                                             \
+        _mm_prefetch((const char *)&(x_q8)[(b) + 1], _MM_HINT_T0);            \
+        _mm_prefetch((const char *)&(w0)[(b) + 1],   _MM_HINT_NTA);           \
+        _mm_prefetch((const char *)&(w1)[(b) + 1],   _MM_HINT_NTA);           \
+        _mm_prefetch((const char *)&(w2)[(b) + 1],   _MM_HINT_NTA);           \
+        _mm_prefetch((const char *)&(w3)[(b) + 1],   _MM_HINT_NTA);           \
+    }                                                                         \
+} while (0)
+#endif
+
+#ifndef kvalues_iq4nl_u8_defined
+#define kvalues_iq4nl_u8_defined
+static const _Alignas(16) uint8_t kvalues_iq4nl_u8[16] = {
+      1,  24,  45,  63,  79,  93, 106, 118,
+    129, 141, 153, 166, 181, 197, 217, 241
+};
+#endif
+
+#ifndef mm256_set_m128i_avx2
+#define mm256_set_m128i_avx2 mm256_set_m128i_cpuid
+#endif
+#ifndef hsum_epi32_avx2
+#define hsum_epi32_avx2 hsum_epi32_cpuid
+#endif
 
 static LFM2_TARGET_AVX2 inline __m256i mm256_set_m128i_cpuid(__m128i hi, __m128i lo) {
     return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
@@ -373,7 +537,9 @@ static LFM2_TARGET_AVX2 inline int32_t hsum_epi32_cpuid(__m256i v) {
     return _mm_cvtsi128_si32(s);
 }
 
-static LFM2_TARGET_AVX2 inline __m128i hsum4_epi32_cpuid(__m256i r0, __m256i r1,
+#ifndef hsum4_epi32_avx2_defined
+#define hsum4_epi32_avx2_defined
+static LFM2_TARGET_AVX2 inline __m128i hsum4_epi32_avx2(__m256i r0, __m256i r1,
                                                          __m256i r2, __m256i r3) {
     __m256i h01   = _mm256_hadd_epi32(r0, r1);
     __m256i h23   = _mm256_hadd_epi32(r2, r3);
@@ -381,6 +547,12 @@ static LFM2_TARGET_AVX2 inline __m128i hsum4_epi32_cpuid(__m256i r0, __m256i r1,
     return _mm_add_epi32(_mm256_castsi256_si128(h0123),
                          _mm256_extracti128_si256(h0123, 1));
 }
+#define hsum4_epi32_cpuid hsum4_epi32_avx2
+#endif
+
+#ifndef lfm2_quantize_row_q8_K_avx2
+#define lfm2_quantize_row_q8_K_avx2 lfm2_quantize_row_q8_K_avx2_cpuid
+#endif
 
 LFM2_TARGET_AVX2
 void lfm2_quantize_row_q8_K_avx2_cpuid(const float * restrict x,
@@ -743,6 +915,804 @@ void lfm2_vec_dot_iq4_xs_q8_K_1x4_avx2(const void * restrict w_raw0,
     _mm_storeu_ps(out4, v_sumf);
 }
 
+
+/* ----------------------------------------------------------------------------
+ * AVX2 1x1 & 1x4 Baseline Kernels with NTA Prefetching for Q4_K, Q6_K, Q8_0
+ * ---------------------------------------------------------------------------- */
+LFM2_TARGET_AVX2
+void lfm2_vec_dot_q4_K_q8_K_1x4_avx2_nta(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]);
+
+LFM2_TARGET_AVX2
+void lfm2_vec_dot_q6_K_q8_K_1x4_avx2_nta(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]);
+
+#ifndef LFM2_Q8_0_1X4_AVX2_DEFINED
+#define LFM2_Q8_0_1X4_AVX2_DEFINED
+LFM2_TARGET_AVX2
+void lfm2_vec_dot_q8_0_q8_K_1x4_avx2(const void * restrict w_raw0, size_t rb,
+                                     const block_q8_K_t * restrict x_q8,
+                                     uint32_t n_cols, float out4[4]) {
+    const block_q8_0_t *w = (const block_q8_0_t *)w_raw0;
+    for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q8_0_q8_K_avx2(w + k * rb, x_q8, n_cols);
+}
+#endif
+
+/* ============================================================================
+ * 2. Upgraded AVX2 1x4 Kernels with _MM_HINT_NTA Weight Prefetching
+ * ============================================================================ */
+LFM2_TARGET_AVX2
+void lfm2_vec_dot_q4_K_q8_K_1x4_avx2_nta(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]) {
+    const block_q4_K_t * restrict w0 = (const block_q4_K_t *)w_raw0;
+    const block_q4_K_t * restrict w1 = w0 + 1 * row_blocks;
+    const block_q4_K_t * restrict w2 = w0 + 2 * row_blocks;
+    const block_q4_K_t * restrict w3 = w0 + 3 * row_blocks;
+
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    __m128 v_sumf = _mm_setzero_ps();
+
+    for (size_t b = 0; b < row_blocks; ++b) {
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
+
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+        __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+        int32_t mins0 = 0, mins1 = 0, mins2 = 0, mins3 = 0;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i q8_lo = _mm256_loadu_si256((const __m256i *)(q8 + j +  0));
+            const __m256i q8_hi = _mm256_loadu_si256((const __m256i *)(q8 + j + 32));
+            const int32_t bsum0 = (int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1];
+            const int32_t bsum1 = (int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3];
+
+            #define LFM2_Q4K_NTA_ROW(w_ptr, acc_reg, mins_acc) do {                     \
+                uint8_t sc_lo, m_lo, sc_hi, m_hi;                                       \
+                get_scale_min_k4(is + 0, (w_ptr)[b].scales, &sc_lo, &m_lo);             \
+                get_scale_min_k4(is + 1, (w_ptr)[b].scales, &sc_hi, &m_hi);             \
+                (mins_acc) += (int32_t)m_lo * bsum0 + (int32_t)m_hi * bsum1;            \
+                const __m256i q4b  = _mm256_loadu_si256((const __m256i *)((w_ptr)[b].qs + (j >> 1))); \
+                const __m256i q4lo = _mm256_and_si256(q4b, mask_0f);                    \
+                const __m256i q4hi = _mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f); \
+                const __m256i d_lo = _mm256_maddubs_epi16(q4lo, q8_lo);                 \
+                const __m256i d_hi = _mm256_maddubs_epi16(q4hi, q8_hi);                 \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_madd_epi16(d_lo, _mm256_set1_epi16((int16_t)sc_lo))); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_madd_epi16(d_hi, _mm256_set1_epi16((int16_t)sc_hi))); \
+            } while (0)
+
+            LFM2_Q4K_NTA_ROW(w0, acc0, mins0);
+            LFM2_Q4K_NTA_ROW(w1, acc1, mins1);
+            LFM2_Q4K_NTA_ROW(w2, acc2, mins2);
+            LFM2_Q4K_NTA_ROW(w3, acc3, mins3);
+
+            #undef LFM2_Q4K_NTA_ROW
+            is += 2;
+        }
+
+        const __m128 v_dots = _mm_cvtepi32_ps(hsum4_epi32_avx2(acc0, acc1, acc2, acc3));
+        const __m128 v_mins = _mm_cvtepi32_ps(_mm_set_epi32(mins3, mins2, mins1, mins0));
+        const __m128 v_d    = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].d), _cvtsh_ss(w2[b].d), _cvtsh_ss(w1[b].d), _cvtsh_ss(w0[b].d)));
+        const __m128 v_dmin = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].dmin), _cvtsh_ss(w2[b].dmin), _cvtsh_ss(w1[b].dmin), _cvtsh_ss(w0[b].dmin)));
+
+        v_sumf = _mm_add_ps(v_sumf, _mm_sub_ps(_mm_mul_ps(v_d, v_dots), _mm_mul_ps(v_dmin, v_mins)));
+    }
+    (void)n_cols;
+    _mm_storeu_ps(out4, v_sumf);
+}
+
+LFM2_TARGET_AVX2
+void lfm2_vec_dot_q6_K_q8_K_1x4_avx2_nta(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]) {
+    const block_q6_K_t * restrict w0 = (const block_q6_K_t *)w_raw0;
+    const block_q6_K_t * restrict w1 = w0 + 1 * row_blocks;
+    const block_q6_K_t * restrict w2 = w0 + 2 * row_blocks;
+    const block_q6_K_t * restrict w3 = w0 + 3 * row_blocks;
+
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i mask_30 = _mm256_set1_epi8(0x30);
+    __m128 v_sumf = _mm_setzero_ps();
+
+    for (size_t b = 0; b < row_blocks; ++b) {
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
+
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const int8_t * restrict q8 = x_q8[b].qs;
+        const __m256i v_bs = _mm256_loadu_si256((const __m256i *)x_q8[b].bsums);
+
+        #define LFM2_Q6K_BSUM(w_ptr) \
+            _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w_ptr)[b].scales)), v_bs)
+
+        __m128i v_off4 = _mm_slli_epi32(hsum4_epi32_avx2(
+            LFM2_Q6K_BSUM(w0), LFM2_Q6K_BSUM(w1), LFM2_Q6K_BSUM(w2), LFM2_Q6K_BSUM(w3)), 5);
+        #undef LFM2_Q6K_BSUM
+
+        __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+        __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+
+        for (int half = 0; half < 2; ++half) {
+            const size_t ql_off = (size_t)half * 64;
+            const size_t qh_off = (size_t)half * 32;
+            const size_t sc_off = (size_t)half * 8;
+            const int8_t *q8_h  = q8 + (size_t)half * 128;
+
+            const __m256i x0 = _mm256_loadu_si256((const __m256i *)(q8_h +  0));
+            const __m256i x1 = _mm256_loadu_si256((const __m256i *)(q8_h + 32));
+            const __m256i x2 = _mm256_loadu_si256((const __m256i *)(q8_h + 64));
+            const __m256i x3 = _mm256_loadu_si256((const __m256i *)(q8_h + 96));
+
+            #define LFM2_Q6K_NTA_HALF(w_ptr, acc_reg) do {                              \
+                const uint8_t *ql = (w_ptr)[b].ql + ql_off;                             \
+                const uint8_t *qh = (w_ptr)[b].qh + qh_off;                             \
+                const int8_t  *sc = (w_ptr)[b].scales + sc_off;                         \
+                const __m256i v_ql0 = _mm256_loadu_si256((const __m256i *)(ql +  0));   \
+                const __m256i v_ql1 = _mm256_loadu_si256((const __m256i *)(ql + 32));   \
+                const __m256i v_qh  = _mm256_loadu_si256((const __m256i *)qh);          \
+                const __m256i u1 = _mm256_or_si256(_mm256_and_si256(v_ql0, mask_0f), _mm256_and_si256(_mm256_slli_epi16(v_qh, 4), mask_30)); \
+                const __m256i u2 = _mm256_or_si256(_mm256_and_si256(v_ql1, mask_0f), _mm256_and_si256(_mm256_slli_epi16(v_qh, 2), mask_30)); \
+                const __m256i u3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v_ql0, 4), mask_0f), _mm256_and_si256(v_qh, mask_30)); \
+                const __m256i u4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v_ql1, 4), mask_0f), _mm256_and_si256(_mm256_srli_epi16(v_qh, 2), mask_30)); \
+                const __m256i s01 = mm256_set_m128i_avx2(_mm_set1_epi16((int16_t)sc[1]), _mm_set1_epi16((int16_t)sc[0])); \
+                const __m256i s23 = mm256_set_m128i_avx2(_mm_set1_epi16((int16_t)sc[3]), _mm_set1_epi16((int16_t)sc[2])); \
+                const __m256i s45 = mm256_set_m128i_avx2(_mm_set1_epi16((int16_t)sc[5]), _mm_set1_epi16((int16_t)sc[4])); \
+                const __m256i s67 = mm256_set_m128i_avx2(_mm_set1_epi16((int16_t)sc[7]), _mm_set1_epi16((int16_t)sc[6])); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_madd_epi16(_mm256_maddubs_epi16(u1, x0), s01)); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_madd_epi16(_mm256_maddubs_epi16(u2, x1), s23)); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_madd_epi16(_mm256_maddubs_epi16(u3, x2), s45)); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_madd_epi16(_mm256_maddubs_epi16(u4, x3), s67)); \
+            } while (0)
+
+            LFM2_Q6K_NTA_HALF(w0, acc0);
+            LFM2_Q6K_NTA_HALF(w1, acc1);
+            LFM2_Q6K_NTA_HALF(w2, acc2);
+            LFM2_Q6K_NTA_HALF(w3, acc3);
+
+            #undef LFM2_Q6K_NTA_HALF
+        }
+
+        const __m128i v_tot  = _mm_sub_epi32(hsum4_epi32_avx2(acc0, acc1, acc2, acc3), v_off4);
+        const __m128  v_d    = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].d), _cvtsh_ss(w2[b].d), _cvtsh_ss(w1[b].d), _cvtsh_ss(w0[b].d)));
+        v_sumf = _mm_add_ps(v_sumf, _mm_mul_ps(v_d, _mm_cvtepi32_ps(v_tot)));
+    }
+    (void)n_cols;
+    _mm_storeu_ps(out4, v_sumf);
+}
+
+/* ============================================================================
+ * 3. Hardware AVX-VNNI (`_mm256_dpbusd_epi32` / `vpdpbusd`) Kernels
+ * ============================================================================ */
+
+/* 3.1 AVX-VNNI Q4_K x Q8_K (1x1 and 1x4 with NTA Prefetching) */
+LFM2_TARGET_AVXVNNI
+float lfm2_vec_dot_q4_K_q8_K_avx_vnni(const void * restrict w_raw,
+                                      const block_q8_K_t * restrict x_q8,
+                                      uint32_t n_cols) {
+    const block_q4_K_t * restrict w_row = (const block_q4_K_t *)w_raw;
+    const uint32_t nb     = n_cols / 256;
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i vzero   = _mm256_setzero_si256();
+    float sumf = 0.0f;
+
+    for (uint32_t b = 0; b < nb; ++b) {
+        if (b + 1 < nb) _mm_prefetch((const char *)&w_row[b + 1], _MM_HINT_NTA);
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const float d    = _cvtsh_ss(w_row[b].d)    * d8;
+        const float dmin = _cvtsh_ss(w_row[b].dmin) * d8;
+        const uint8_t * restrict q4 = w_row[b].qs;
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i acc_i32 = vzero;
+        int32_t sum_mins = 0;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, w_row[b].scales, &sc1, &m1);
+            get_scale_min_k4(is + 1, w_row[b].scales, &sc2, &m2);
+            sum_mins += (int32_t)m1 * ((int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1])
+                      + (int32_t)m2 * ((int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3]);
+
+            const __m256i q4b   = _mm256_loadu_si256((const __m256i *)q4);
+            const __m256i u_lo  = _mm256_and_si256(q4b, mask_0f);
+            const __m256i u_hi  = _mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f);
+            const __m256i q8_lo = _mm256_loadu_si256((const __m256i *)(q8 + j +  0));
+            const __m256i q8_hi = _mm256_loadu_si256((const __m256i *)(q8 + j + 32));
+
+            /* Single-instruction u8 * s8 -> i32 dot product via vpdpbusd */
+            const __m256i dot_lo = _mm256_dpbusd_epi32(vzero, u_lo, q8_lo);
+            const __m256i dot_hi = _mm256_dpbusd_epi32(vzero, u_hi, q8_hi);
+
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(dot_lo, _mm256_set1_epi32((int32_t)sc1)));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(dot_hi, _mm256_set1_epi32((int32_t)sc2)));
+
+            q4 += 32;
+            is += 2;
+        }
+        sumf += d * (float)hsum_epi32_avx2(acc_i32) - dmin * (float)sum_mins;
+    }
+    return sumf;
+}
+
+LFM2_TARGET_AVXVNNI
+void lfm2_vec_dot_q4_K_q8_K_1x4_avx_vnni(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]) {
+    const block_q4_K_t * restrict w0 = (const block_q4_K_t *)w_raw0;
+    const block_q4_K_t * restrict w1 = w0 + 1 * row_blocks;
+    const block_q4_K_t * restrict w2 = w0 + 2 * row_blocks;
+    const block_q4_K_t * restrict w3 = w0 + 3 * row_blocks;
+
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i vzero   = _mm256_setzero_si256();
+    __m128 v_sumf = _mm_setzero_ps();
+
+    for (size_t b = 0; b < row_blocks; ++b) {
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
+
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i acc0 = vzero, acc1 = vzero, acc2 = vzero, acc3 = vzero;
+        int32_t mins0 = 0, mins1 = 0, mins2 = 0, mins3 = 0;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i q8_lo = _mm256_loadu_si256((const __m256i *)(q8 + j +  0));
+            const __m256i q8_hi = _mm256_loadu_si256((const __m256i *)(q8 + j + 32));
+            const int32_t bsum0 = (int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1];
+            const int32_t bsum1 = (int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3];
+
+            #define LFM2_Q4K_VNNI_ROW(w_ptr, acc_reg, mins_acc) do {                    \
+                uint8_t sc_lo, m_lo, sc_hi, m_hi;                                       \
+                get_scale_min_k4(is + 0, (w_ptr)[b].scales, &sc_lo, &m_lo);             \
+                get_scale_min_k4(is + 1, (w_ptr)[b].scales, &sc_hi, &m_hi);             \
+                (mins_acc) += (int32_t)m_lo * bsum0 + (int32_t)m_hi * bsum1;            \
+                const __m256i q4b  = _mm256_loadu_si256((const __m256i *)((w_ptr)[b].qs + (j >> 1))); \
+                const __m256i u_lo = _mm256_and_si256(q4b, mask_0f);                    \
+                const __m256i u_hi = _mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f); \
+                const __m256i d_lo = _mm256_dpbusd_epi32(vzero, u_lo, q8_lo);           \
+                const __m256i d_hi = _mm256_dpbusd_epi32(vzero, u_hi, q8_hi);           \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(d_lo, _mm256_set1_epi32((int32_t)sc_lo))); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(d_hi, _mm256_set1_epi32((int32_t)sc_hi))); \
+            } while (0)
+
+            LFM2_Q4K_VNNI_ROW(w0, acc0, mins0);
+            LFM2_Q4K_VNNI_ROW(w1, acc1, mins1);
+            LFM2_Q4K_VNNI_ROW(w2, acc2, mins2);
+            LFM2_Q4K_VNNI_ROW(w3, acc3, mins3);
+
+            #undef LFM2_Q4K_VNNI_ROW
+            is += 2;
+        }
+
+        const __m128 v_dots = _mm_cvtepi32_ps(hsum4_epi32_avx2(acc0, acc1, acc2, acc3));
+        const __m128 v_mins = _mm_cvtepi32_ps(_mm_set_epi32(mins3, mins2, mins1, mins0));
+        const __m128 v_d    = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].d), _cvtsh_ss(w2[b].d), _cvtsh_ss(w1[b].d), _cvtsh_ss(w0[b].d)));
+        const __m128 v_dmin = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].dmin), _cvtsh_ss(w2[b].dmin), _cvtsh_ss(w1[b].dmin), _cvtsh_ss(w0[b].dmin)));
+
+        v_sumf = _mm_fmadd_ps(v_d, v_dots, _mm_fnmadd_ps(v_dmin, v_mins, v_sumf));
+    }
+    (void)n_cols;
+    _mm_storeu_ps(out4, v_sumf);
+}
+
+/* 3.2 AVX-VNNI Q5_K x Q8_K (1x1 and 1x4 with NTA Prefetching) */
+LFM2_TARGET_AVXVNNI
+float lfm2_vec_dot_q5_K_q8_K_avx_vnni(const void * restrict w_raw,
+                                      const block_q8_K_t * restrict x_q8,
+                                      uint32_t n_cols) {
+    const block_q5_K_t * restrict w_row = (const block_q5_K_t *)w_raw;
+    const uint32_t nb     = n_cols / 256;
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i mask_01 = _mm256_set1_epi8(0x01);
+    const __m256i vzero   = _mm256_setzero_si256();
+    float sumf = 0.0f;
+
+    for (uint32_t b = 0; b < nb; ++b) {
+        if (b + 1 < nb) _mm_prefetch((const char *)&w_row[b + 1], _MM_HINT_NTA);
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const float d    = _cvtsh_ss(w_row[b].d)    * d8;
+        const float dmin = _cvtsh_ss(w_row[b].dmin) * d8;
+        const uint8_t * restrict ql = w_row[b].qs;
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i v_qh    = _mm256_loadu_si256((const __m256i *)w_row[b].qh);
+        __m256i acc_i32 = vzero;
+        int32_t sum_mins = 0;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, w_row[b].scales, &sc1, &m1);
+            get_scale_min_k4(is + 1, w_row[b].scales, &sc2, &m2);
+            sum_mins += (int32_t)m1 * ((int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1])
+                      + (int32_t)m2 * ((int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3]);
+
+            const __m256i q4b   = _mm256_loadu_si256((const __m256i *)ql);
+            const __m256i qh_lo = _mm256_slli_epi16(_mm256_and_si256(v_qh, mask_01), 4);
+            v_qh = _mm256_srli_epi16(v_qh, 1);
+            const __m256i qh_hi = _mm256_slli_epi16(_mm256_and_si256(v_qh, mask_01), 4);
+            v_qh = _mm256_srli_epi16(v_qh, 1);
+
+            const __m256i u5_lo = _mm256_or_si256(_mm256_and_si256(q4b, mask_0f), qh_lo);
+            const __m256i u5_hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f), qh_hi);
+
+            const __m256i dot_lo = _mm256_dpbusd_epi32(vzero, u5_lo, _mm256_loadu_si256((const __m256i *)(q8 + j +  0)));
+            const __m256i dot_hi = _mm256_dpbusd_epi32(vzero, u5_hi, _mm256_loadu_si256((const __m256i *)(q8 + j + 32)));
+
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(dot_lo, _mm256_set1_epi32((int32_t)sc1)));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(dot_hi, _mm256_set1_epi32((int32_t)sc2)));
+
+            ql += 32;
+            is += 2;
+        }
+        sumf += d * (float)hsum_epi32_avx2(acc_i32) - dmin * (float)sum_mins;
+    }
+    return sumf;
+}
+
+LFM2_TARGET_AVXVNNI
+void lfm2_vec_dot_q5_K_q8_K_1x4_avx_vnni(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]) {
+    const block_q5_K_t * restrict w0 = (const block_q5_K_t *)w_raw0;
+    const block_q5_K_t * restrict w1 = w0 + 1 * row_blocks;
+    const block_q5_K_t * restrict w2 = w0 + 2 * row_blocks;
+    const block_q5_K_t * restrict w3 = w0 + 3 * row_blocks;
+
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i mask_01 = _mm256_set1_epi8(0x01);
+    const __m256i vzero   = _mm256_setzero_si256();
+    __m128 v_sumf = _mm_setzero_ps();
+
+    for (size_t b = 0; b < row_blocks; ++b) {
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
+
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i vqh0 = _mm256_loadu_si256((const __m256i *)w0[b].qh);
+        __m256i vqh1 = _mm256_loadu_si256((const __m256i *)w1[b].qh);
+        __m256i vqh2 = _mm256_loadu_si256((const __m256i *)w2[b].qh);
+        __m256i vqh3 = _mm256_loadu_si256((const __m256i *)w3[b].qh);
+
+        __m256i acc0 = vzero, acc1 = vzero, acc2 = vzero, acc3 = vzero;
+        int32_t mins0 = 0, mins1 = 0, mins2 = 0, mins3 = 0;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i q8_lo = _mm256_loadu_si256((const __m256i *)(q8 + j +  0));
+            const __m256i q8_hi = _mm256_loadu_si256((const __m256i *)(q8 + j + 32));
+            const int32_t bsum0 = (int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1];
+            const int32_t bsum1 = (int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3];
+
+            #define LFM2_Q5K_VNNI_ROW(w_ptr, vqh_reg, acc_reg, mins_acc) do {                  \
+                uint8_t sc_lo, m_lo, sc_hi, m_hi;                                              \
+                get_scale_min_k4(is + 0, (w_ptr)[b].scales, &sc_lo, &m_lo);                    \
+                get_scale_min_k4(is + 1, (w_ptr)[b].scales, &sc_hi, &m_hi);                    \
+                (mins_acc) += (int32_t)m_lo * bsum0 + (int32_t)m_hi * bsum1;                   \
+                const __m256i q4b   = _mm256_loadu_si256((const __m256i *)((w_ptr)[b].qs + (j >> 1))); \
+                const __m256i qh_lo = _mm256_slli_epi16(_mm256_and_si256((vqh_reg), mask_01), 4);      \
+                (vqh_reg) = _mm256_srli_epi16((vqh_reg), 1);                                   \
+                const __m256i qh_hi = _mm256_slli_epi16(_mm256_and_si256((vqh_reg), mask_01), 4);      \
+                (vqh_reg) = _mm256_srli_epi16((vqh_reg), 1);                                   \
+                const __m256i u5_lo = _mm256_or_si256(_mm256_and_si256(q4b, mask_0f), qh_lo);  \
+                const __m256i u5_hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f), qh_hi); \
+                const __m256i d_lo  = _mm256_dpbusd_epi32(vzero, u5_lo, q8_lo);                \
+                const __m256i d_hi  = _mm256_dpbusd_epi32(vzero, u5_hi, q8_hi);                \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(d_lo, _mm256_set1_epi32((int32_t)sc_lo))); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(d_hi, _mm256_set1_epi32((int32_t)sc_hi))); \
+            } while (0)
+
+            LFM2_Q5K_VNNI_ROW(w0, vqh0, acc0, mins0);
+            LFM2_Q5K_VNNI_ROW(w1, vqh1, acc1, mins1);
+            LFM2_Q5K_VNNI_ROW(w2, vqh2, acc2, mins2);
+            LFM2_Q5K_VNNI_ROW(w3, vqh3, acc3, mins3);
+
+            #undef LFM2_Q5K_VNNI_ROW
+            is += 2;
+        }
+
+        const __m128 v_dots = _mm_cvtepi32_ps(hsum4_epi32_avx2(acc0, acc1, acc2, acc3));
+        const __m128 v_mins = _mm_cvtepi32_ps(_mm_set_epi32(mins3, mins2, mins1, mins0));
+        const __m128 v_d    = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].d), _cvtsh_ss(w2[b].d), _cvtsh_ss(w1[b].d), _cvtsh_ss(w0[b].d)));
+        const __m128 v_dmin = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].dmin), _cvtsh_ss(w2[b].dmin), _cvtsh_ss(w1[b].dmin), _cvtsh_ss(w0[b].dmin)));
+
+        v_sumf = _mm_fmadd_ps(v_d, v_dots, _mm_fnmadd_ps(v_dmin, v_mins, v_sumf));
+    }
+    (void)n_cols;
+    _mm_storeu_ps(out4, v_sumf);
+}
+
+/* 3.3 AVX-VNNI Q6_K x Q8_K (1x1 and 1x4 with NTA Prefetching) */
+LFM2_TARGET_AVXVNNI
+float lfm2_vec_dot_q6_K_q8_K_avx_vnni(const void * restrict w_raw,
+                                      const block_q8_K_t * restrict x_q8,
+                                      uint32_t n_cols) {
+    const block_q6_K_t * restrict w_row = (const block_q6_K_t *)w_raw;
+    const uint32_t nb     = n_cols / 256;
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i mask_30 = _mm256_set1_epi8(0x30);
+    const __m256i vzero   = _mm256_setzero_si256();
+    float sumf = 0.0f;
+
+    for (uint32_t b = 0; b < nb; ++b) {
+        if (b + 1 < nb) _mm_prefetch((const char *)&w_row[b + 1], _MM_HINT_NTA);
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const float d = _cvtsh_ss(w_row[b].d) * d8;
+        const uint8_t * restrict ql = w_row[b].ql;
+        const uint8_t * restrict qh = w_row[b].qh;
+        const int8_t  * restrict sc = w_row[b].scales;
+        const int8_t  * restrict q8 = x_q8[b].qs;
+
+        const __m256i v_sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)sc));
+        const __m256i v_bs16 = _mm256_loadu_si256((const __m256i *)x_q8[b].bsums);
+        const int32_t sum_off = hsum_epi32_avx2(_mm256_madd_epi16(v_sc16, v_bs16));
+
+        __m256i acc_i32 = vzero;
+
+        for (int half = 0; half < 2; ++half) {
+            const __m256i v_ql0 = _mm256_loadu_si256((const __m256i *)(ql +  0));
+            const __m256i v_ql1 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            const __m256i v_qh  = _mm256_loadu_si256((const __m256i *)qh);
+
+            const __m256i u1 = _mm256_or_si256(_mm256_and_si256(v_ql0, mask_0f), _mm256_and_si256(_mm256_slli_epi16(v_qh, 4), mask_30));
+            const __m256i u2 = _mm256_or_si256(_mm256_and_si256(v_ql1, mask_0f), _mm256_and_si256(_mm256_slli_epi16(v_qh, 2), mask_30));
+            const __m256i u3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v_ql0, 4), mask_0f), _mm256_and_si256(v_qh, mask_30));
+            const __m256i u4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v_ql1, 4), mask_0f), _mm256_and_si256(_mm256_srli_epi16(v_qh, 2), mask_30));
+
+            const __m256i d1 = _mm256_dpbusd_epi32(vzero, u1, _mm256_loadu_si256((const __m256i *)(q8 +  0)));
+            const __m256i d2 = _mm256_dpbusd_epi32(vzero, u2, _mm256_loadu_si256((const __m256i *)(q8 + 32)));
+            const __m256i d3 = _mm256_dpbusd_epi32(vzero, u3, _mm256_loadu_si256((const __m256i *)(q8 + 64)));
+            const __m256i d4 = _mm256_dpbusd_epi32(vzero, u4, _mm256_loadu_si256((const __m256i *)(q8 + 96)));
+
+            const __m256i s01 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[1]), _mm_set1_epi32((int32_t)sc[0]));
+            const __m256i s23 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[3]), _mm_set1_epi32((int32_t)sc[2]));
+            const __m256i s45 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[5]), _mm_set1_epi32((int32_t)sc[4]));
+            const __m256i s67 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[7]), _mm_set1_epi32((int32_t)sc[6]));
+
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(d1, s01));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(d2, s23));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(d3, s45));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(d4, s67));
+
+            ql += 64; qh += 32; sc += 8; q8 += 128;
+        }
+        sumf += d * (float)(hsum_epi32_avx2(acc_i32) - 32 * sum_off);
+    }
+    return sumf;
+}
+
+LFM2_TARGET_AVXVNNI
+void lfm2_vec_dot_q6_K_q8_K_1x4_avx_vnni(const void * restrict w_raw0,
+                                         size_t row_blocks,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols,
+                                         float out4[4]) {
+    const block_q6_K_t * restrict w0 = (const block_q6_K_t *)w_raw0;
+    const block_q6_K_t * restrict w1 = w0 + 1 * row_blocks;
+    const block_q6_K_t * restrict w2 = w0 + 2 * row_blocks;
+    const block_q6_K_t * restrict w3 = w0 + 3 * row_blocks;
+
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i mask_30 = _mm256_set1_epi8(0x30);
+    const __m256i vzero   = _mm256_setzero_si256();
+    __m128 v_sumf = _mm_setzero_ps();
+
+    for (size_t b = 0; b < row_blocks; ++b) {
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
+
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const int8_t * restrict q8 = x_q8[b].qs;
+        const __m256i v_bs = _mm256_loadu_si256((const __m256i *)x_q8[b].bsums);
+
+        #define LFM2_Q6K_BSUM(w_ptr) \
+            _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w_ptr)[b].scales)), v_bs)
+
+        __m128i v_off4 = _mm_slli_epi32(hsum4_epi32_avx2(
+            LFM2_Q6K_BSUM(w0), LFM2_Q6K_BSUM(w1), LFM2_Q6K_BSUM(w2), LFM2_Q6K_BSUM(w3)), 5);
+        #undef LFM2_Q6K_BSUM
+
+        __m256i acc0 = vzero, acc1 = vzero, acc2 = vzero, acc3 = vzero;
+
+        for (int half = 0; half < 2; ++half) {
+            const size_t ql_off = (size_t)half * 64;
+            const size_t qh_off = (size_t)half * 32;
+            const size_t sc_off = (size_t)half * 8;
+            const int8_t *q8_h  = q8 + (size_t)half * 128;
+
+            const __m256i x0 = _mm256_loadu_si256((const __m256i *)(q8_h +  0));
+            const __m256i x1 = _mm256_loadu_si256((const __m256i *)(q8_h + 32));
+            const __m256i x2 = _mm256_loadu_si256((const __m256i *)(q8_h + 64));
+            const __m256i x3 = _mm256_loadu_si256((const __m256i *)(q8_h + 96));
+
+            #define LFM2_Q6K_VNNI_HALF(w_ptr, acc_reg) do {                             \
+                const uint8_t *ql = (w_ptr)[b].ql + ql_off;                             \
+                const uint8_t *qh = (w_ptr)[b].qh + qh_off;                             \
+                const int8_t  *sc = (w_ptr)[b].scales + sc_off;                         \
+                const __m256i v_ql0 = _mm256_loadu_si256((const __m256i *)(ql +  0));   \
+                const __m256i v_ql1 = _mm256_loadu_si256((const __m256i *)(ql + 32));   \
+                const __m256i v_qh  = _mm256_loadu_si256((const __m256i *)qh);          \
+                const __m256i u1 = _mm256_or_si256(_mm256_and_si256(v_ql0, mask_0f), _mm256_and_si256(_mm256_slli_epi16(v_qh, 4), mask_30)); \
+                const __m256i u2 = _mm256_or_si256(_mm256_and_si256(v_ql1, mask_0f), _mm256_and_si256(_mm256_slli_epi16(v_qh, 2), mask_30)); \
+                const __m256i u3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v_ql0, 4), mask_0f), _mm256_and_si256(v_qh, mask_30)); \
+                const __m256i u4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v_ql1, 4), mask_0f), _mm256_and_si256(_mm256_srli_epi16(v_qh, 2), mask_30)); \
+                const __m256i s01 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[1]), _mm_set1_epi32((int32_t)sc[0])); \
+                const __m256i s23 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[3]), _mm_set1_epi32((int32_t)sc[2])); \
+                const __m256i s45 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[5]), _mm_set1_epi32((int32_t)sc[4])); \
+                const __m256i s67 = mm256_set_m128i_avx2(_mm_set1_epi32((int32_t)sc[7]), _mm_set1_epi32((int32_t)sc[6])); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(_mm256_dpbusd_epi32(vzero, u1, x0), s01)); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(_mm256_dpbusd_epi32(vzero, u2, x1), s23)); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(_mm256_dpbusd_epi32(vzero, u3, x2), s45)); \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(_mm256_dpbusd_epi32(vzero, u4, x3), s67)); \
+            } while (0)
+
+            LFM2_Q6K_VNNI_HALF(w0, acc0);
+            LFM2_Q6K_VNNI_HALF(w1, acc1);
+            LFM2_Q6K_VNNI_HALF(w2, acc2);
+            LFM2_Q6K_VNNI_HALF(w3, acc3);
+
+            #undef LFM2_Q6K_VNNI_HALF
+        }
+
+        const __m128i v_tot = _mm_sub_epi32(hsum4_epi32_avx2(acc0, acc1, acc2, acc3), v_off4);
+        const __m128  v_d   = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].d), _cvtsh_ss(w2[b].d), _cvtsh_ss(w1[b].d), _cvtsh_ss(w0[b].d)));
+        v_sumf = _mm_fmadd_ps(v_d, _mm_cvtepi32_ps(v_tot), v_sumf);
+    }
+    (void)n_cols;
+    _mm_storeu_ps(out4, v_sumf);
+}
+
+/* 3.4 AVX-VNNI IQ4_XS x Q8_K (Uses unsigned-shifted lut_u8 + vpdpbusd -> zero _mm256_sign_epi8!) */
+LFM2_TARGET_AVXVNNI
+float lfm2_vec_dot_iq4_xs_q8_K_avx_vnni(const void * restrict w_raw,
+                                        const block_q8_K_t * restrict x_q8,
+                                        uint32_t n_cols) {
+    const block_iq4_xs_t * restrict w_row = (const block_iq4_xs_t *)w_raw;
+    const uint32_t nb      = n_cols / 256;
+    const __m256i mask_0f  = _mm256_set1_epi8(0x0F);
+    const __m256i lut_u8   = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)kvalues_iq4nl_u8));
+    const __m256i vzero    = _mm256_setzero_si256();
+    float sumf = 0.0f;
+
+    for (uint32_t b = 0; b < nb; ++b) {
+        if (b + 1 < nb) _mm_prefetch((const char *)&w_row[b + 1], _MM_HINT_NTA);
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const float d = _cvtsh_ss(w_row[b].d) * d8;
+        const uint8_t * restrict qs = w_row[b].qs;
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i acc_i32  = vzero;
+        int32_t sum_off  = 0;
+
+        for (int ib = 0; ib < 8; ib += 2) {
+            const int32_t ls0 = get_scale_iq4_xs(ib + 0, w_row[b].scales_l, w_row[b].scales_h);
+            const int32_t ls1 = get_scale_iq4_xs(ib + 1, w_row[b].scales_l, w_row[b].scales_h);
+
+            const int32_t bs0 = (int32_t)bs[2 * (ib + 0) + 0] + (int32_t)bs[2 * (ib + 0) + 1];
+            const int32_t bs1 = (int32_t)bs[2 * (ib + 1) + 0] + (int32_t)bs[2 * (ib + 1) + 1];
+            sum_off += ls0 * bs0 + ls1 * bs1;
+
+            const __m256i q4b   = _mm256_loadu_si256((const __m256i *)(qs + ib * 16));
+            const __m256i vlo   = _mm256_shuffle_epi8(lut_u8, _mm256_and_si256(q4b, mask_0f));
+            const __m256i vhi   = _mm256_shuffle_epi8(lut_u8, _mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f));
+            const __m256i wu0   = _mm256_permute2x128_si256(vlo, vhi, 0x20);
+            const __m256i wu1   = _mm256_permute2x128_si256(vlo, vhi, 0x31);
+
+            const __m256i dot0  = _mm256_dpbusd_epi32(vzero, wu0, _mm256_loadu_si256((const __m256i *)(q8 + (ib + 0) * 32)));
+            const __m256i dot1  = _mm256_dpbusd_epi32(vzero, wu1, _mm256_loadu_si256((const __m256i *)(q8 + (ib + 1) * 32)));
+
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(dot0, _mm256_set1_epi32(ls0)));
+            acc_i32 = _mm256_add_epi32(acc_i32, _mm256_mullo_epi32(dot1, _mm256_set1_epi32(ls1)));
+        }
+        sumf += d * (float)(hsum_epi32_avx2(acc_i32) - 128 * sum_off);
+    }
+    return sumf;
+}
+
+LFM2_TARGET_AVXVNNI
+void lfm2_vec_dot_iq4_xs_q8_K_1x4_avx_vnni(const void * restrict w_raw0,
+                                           size_t row_blocks,
+                                           const block_q8_K_t * restrict x_q8,
+                                           uint32_t n_cols,
+                                           float out4[4]) {
+    const block_iq4_xs_t * restrict w0 = (const block_iq4_xs_t *)w_raw0;
+    const block_iq4_xs_t * restrict w1 = w0 + 1 * row_blocks;
+    const block_iq4_xs_t * restrict w2 = w0 + 2 * row_blocks;
+    const block_iq4_xs_t * restrict w3 = w0 + 3 * row_blocks;
+
+    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+    const __m256i lut_u8  = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)kvalues_iq4nl_u8));
+    const __m256i vzero   = _mm256_setzero_si256();
+    __m128 v_sumf = _mm_setzero_ps();
+
+    for (size_t b = 0; b < row_blocks; ++b) {
+        LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks);
+
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const int8_t  * restrict q8 = x_q8[b].qs;
+        const int16_t * restrict bs = x_q8[b].bsums;
+
+        __m256i acc0 = vzero, acc1 = vzero, acc2 = vzero, acc3 = vzero;
+        int32_t off0 = 0, off1 = 0, off2 = 0, off3 = 0;
+
+        for (int ib = 0; ib < 8; ib += 2) {
+            const __m256i x_sub0 = _mm256_loadu_si256((const __m256i *)(q8 + (ib + 0) * 32));
+            const __m256i x_sub1 = _mm256_loadu_si256((const __m256i *)(q8 + (ib + 1) * 32));
+            const int32_t bsum0  = (int32_t)bs[2 * (ib + 0) + 0] + (int32_t)bs[2 * (ib + 0) + 1];
+            const int32_t bsum1  = (int32_t)bs[2 * (ib + 1) + 0] + (int32_t)bs[2 * (ib + 1) + 1];
+
+            #define LFM2_IQ4XS_VNNI_ROW(w_ptr, acc_reg, off_acc) do {                                   \
+                const int32_t ls0 = get_scale_iq4_xs(ib + 0, (w_ptr)[b].scales_l, (w_ptr)[b].scales_h); \
+                const int32_t ls1 = get_scale_iq4_xs(ib + 1, (w_ptr)[b].scales_l, (w_ptr)[b].scales_h); \
+                (off_acc) += ls0 * bsum0 + ls1 * bsum1;                                                 \
+                const __m256i q4b = _mm256_loadu_si256((const __m256i *)((w_ptr)[b].qs + ib * 16));     \
+                const __m256i vlo = _mm256_shuffle_epi8(lut_u8, _mm256_and_si256(q4b, mask_0f));        \
+                const __m256i vhi = _mm256_shuffle_epi8(lut_u8, _mm256_and_si256(_mm256_srli_epi16(q4b, 4), mask_0f)); \
+                const __m256i wu0 = _mm256_permute2x128_si256(vlo, vhi, 0x20);                          \
+                const __m256i wu1 = _mm256_permute2x128_si256(vlo, vhi, 0x31);                          \
+                const __m256i d0  = _mm256_dpbusd_epi32(vzero, wu0, x_sub0);                            \
+                const __m256i d1  = _mm256_dpbusd_epi32(vzero, wu1, x_sub1);                            \
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(d0, _mm256_set1_epi32(ls0)));\
+                (acc_reg) = _mm256_add_epi32((acc_reg), _mm256_mullo_epi32(d1, _mm256_set1_epi32(ls1)));\
+            } while (0)
+
+            LFM2_IQ4XS_VNNI_ROW(w0, acc0, off0);
+            LFM2_IQ4XS_VNNI_ROW(w1, acc1, off1);
+            LFM2_IQ4XS_VNNI_ROW(w2, acc2, off2);
+            LFM2_IQ4XS_VNNI_ROW(w3, acc3, off3);
+
+            #undef LFM2_IQ4XS_VNNI_ROW
+        }
+
+        const __m128i v_off4 = _mm_slli_epi32(_mm_set_epi32(off3, off2, off1, off0), 7);
+        const __m128i v_tot  = _mm_sub_epi32(hsum4_epi32_avx2(acc0, acc1, acc2, acc3), v_off4);
+        const __m128  v_d    = _mm_mul_ps(_mm_set1_ps(d8), _mm_set_ps(
+            _cvtsh_ss(w3[b].d), _cvtsh_ss(w2[b].d), _cvtsh_ss(w1[b].d), _cvtsh_ss(w0[b].d)));
+        v_sumf = _mm_fmadd_ps(v_d, _mm_cvtepi32_ps(v_tot), v_sumf);
+    }
+    (void)n_cols;
+    _mm_storeu_ps(out4, v_sumf);
+}
+
+/* 3.5 AVX-VNNI Q4_0 and Q8_0 (1x1 and 1x4 with NTA Prefetching) */
+LFM2_TARGET_AVXVNNI
+float lfm2_vec_dot_q4_0_q8_K_avx_vnni(const void * restrict w_raw,
+                                      const block_q8_K_t * restrict x_q8,
+                                      uint32_t n_cols) {
+    const block_q4_0_t * restrict w_row = (const block_q4_0_t *)w_raw;
+    const uint32_t nb_k   = n_cols / 256;
+    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+    const __m256i vzero   = _mm256_setzero_si256();
+    float sumf = 0.0f;
+
+    for (uint32_t b = 0; b < nb_k; ++b) {
+        if (b + 1 < nb_k) _mm_prefetch((const char *)&w_row[(b + 1) * 8], _MM_HINT_NTA);
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const block_q4_0_t *w_sub = w_row + (size_t)b * 8;
+        const int8_t       *q8    = x_q8[b].qs;
+        const int16_t      *bs    = x_q8[b].bsums;
+        float block_sum = 0.0f;
+
+        for (int j = 0; j < 8; ++j) {
+            const float dw      = _cvtsh_ss(w_sub[j].d);
+            const __m128i q16   = _mm_loadu_si128((const __m128i *)w_sub[j].qs);
+            const __m256i u4    = mm256_set_m128i_avx2(
+                _mm_and_si128(_mm_srli_epi16(q16, 4), mask_0f), _mm_and_si128(q16, mask_0f));
+            const __m256i vx    = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
+            const __m256i dot   = _mm256_dpbusd_epi32(vzero, u4, vx);
+            const int32_t sum_q8 = (int32_t)bs[2 * j + 0] + (int32_t)bs[2 * j + 1];
+            block_sum += dw * (float)(hsum_epi32_avx2(dot) - 8 * sum_q8);
+        }
+        sumf += d8 * block_sum;
+    }
+    return sumf;
+}
+
+LFM2_TARGET_AVXVNNI
+void lfm2_vec_dot_q4_0_q8_K_1x4_avx_vnni(const void * restrict w_raw0, size_t rb,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols, float out4[4]) {
+    const block_q4_0_t *w = (const block_q4_0_t *)w_raw0;
+    for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q4_0_q8_K_avx_vnni(w + k * rb, x_q8, n_cols);
+}
+
+LFM2_TARGET_AVXVNNI
+float lfm2_vec_dot_q8_0_q8_K_avx_vnni(const void * restrict w_raw,
+                                      const block_q8_K_t * restrict x_q8,
+                                      uint32_t n_cols) {
+    const block_q8_0_t * restrict w_row = (const block_q8_0_t *)w_raw;
+    const uint32_t nb_k    = n_cols / 256;
+    const __m256i bias_128 = _mm256_set1_epi8((char)0x80);
+    const __m256i vzero    = _mm256_setzero_si256();
+    float sumf = 0.0f;
+
+    for (uint32_t b = 0; b < nb_k; ++b) {
+        if (b + 1 < nb_k) _mm_prefetch((const char *)&w_row[(b + 1) * 8], _MM_HINT_NTA);
+        const float d8 = x_q8[b].d;
+        if (d8 == 0.0f) continue;
+
+        const block_q8_0_t *w_sub = w_row + (size_t)b * 8;
+        const int8_t       *q8    = x_q8[b].qs;
+        const int16_t      *bs    = x_q8[b].bsums;
+        float block_sum = 0.0f;
+
+        for (int j = 0; j < 8; ++j) {
+            const float dw       = _cvtsh_ss(w_sub[j].d);
+            /* Bias signed int8 weight by +128 (XOR 0x80) into unsigned uint8 for vpdpbusd */
+            const __m256i wu8    = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)w_sub[j].qs), bias_128);
+            const __m256i vx     = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
+            const __m256i dot    = _mm256_dpbusd_epi32(vzero, wu8, vx);
+            const int32_t sum_q8 = (int32_t)bs[2 * j + 0] + (int32_t)bs[2 * j + 1];
+            block_sum += dw * (float)(hsum_epi32_avx2(dot) - 128 * sum_q8);
+        }
+        sumf += d8 * block_sum;
+    }
+    return sumf;
+}
+
+LFM2_TARGET_AVXVNNI
+void lfm2_vec_dot_q8_0_q8_K_1x4_avx_vnni(const void * restrict w_raw0, size_t rb,
+                                         const block_q8_K_t * restrict x_q8,
+                                         uint32_t n_cols, float out4[4]) {
+    const block_q8_0_t *w = (const block_q8_0_t *)w_raw0;
+    for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q8_0_q8_K_avx_vnni(w + k * rb, x_q8, n_cols);
+}
+
 /* ============================================================================
  * 5. Runtime CPUID Inspector & Multi-ISA Kernel Dispatch Table
  * ============================================================================ */
@@ -815,23 +1785,56 @@ static inline void lfm2_init_cpu_kernels(LFM2KernelTable *kt) {
         use_avx2 = false;
     }
 
-    if (use_avx2) {
-        kt->isa_name                            = "AVX2 + FMA + F16C";
+    const bool use_vnni = use_avx2 && kt->has_avx_vnni &&
+                          !(force_isa && strcmp(force_isa, "avx2") == 0);
+
+    if (use_vnni) {
+        kt->isa_name                            = "AVX-VNNI (vpdpbusd) + FMA + F16C + NTA";
+        kt->quantize_q8_K                       = lfm2_quantize_row_q8_K_avx2_cpuid;
+        kt->vec_dot_1x1[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_avx_vnni;
+        kt->vec_dot_1x1[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_avx_vnni;
+        kt->vec_dot_1x1[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_avx_vnni;
+        kt->vec_dot_1x1[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_avx_vnni;
+        kt->vec_dot_1x1[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_avx_vnni;
+        kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_avx_vnni;
+
+        kt->vec_dot_1x4[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_1x4_avx_vnni;
+        kt->vec_dot_1x4[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_1x4_avx_vnni;
+        kt->vec_dot_1x4[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_1x4_avx_vnni;
+        kt->vec_dot_1x4[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_1x4_avx_vnni;
+        kt->vec_dot_1x4[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_1x4_avx_vnni;
+        kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_1x4_avx_vnni;
+    } else if (use_avx2) {
+        kt->isa_name                            = "AVX2 + FMA + F16C + NTA";
         kt->quantize_q8_K                       = lfm2_quantize_row_q8_K_avx2_cpuid;
         kt->vec_dot_1x1[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_avx2;
+        kt->vec_dot_1x1[GGML_TYPE_Q8_0]         = (lfm2_vec_dot_1x1_fn)lfm2_vec_dot_q8_0_q8_K_avx2;
+        kt->vec_dot_1x1[GGML_TYPE_Q4_K]         = (lfm2_vec_dot_1x1_fn)lfm2_vec_dot_q4_K_q8_K_avx2;
         kt->vec_dot_1x1[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_avx2;
+        kt->vec_dot_1x1[GGML_TYPE_Q6_K]         = (lfm2_vec_dot_1x1_fn)lfm2_vec_dot_q6_K_q8_K_avx2;
         kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_avx2;
+
         kt->vec_dot_1x4[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_1x4_avx2;
+        kt->vec_dot_1x4[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_1x4_avx2;
+        kt->vec_dot_1x4[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_1x4_avx2_nta;
         kt->vec_dot_1x4[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_1x4_avx2;
+        kt->vec_dot_1x4[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_1x4_avx2_nta;
         kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_1x4_avx2;
     } else {
         kt->isa_name                            = "GENERIC_SCALAR_X86_64";
         kt->quantize_q8_K                       = lfm2_quantize_row_q8_K_scalar;
         kt->vec_dot_1x1[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_scalar;
+        kt->vec_dot_1x1[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_scalar;
+        kt->vec_dot_1x1[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_scalar;
         kt->vec_dot_1x1[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_scalar;
+        kt->vec_dot_1x1[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_scalar;
         kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_scalar;
+
         kt->vec_dot_1x4[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_1x4_scalar;
+        kt->vec_dot_1x4[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_1x4_scalar;
+        kt->vec_dot_1x4[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_1x4_scalar;
         kt->vec_dot_1x4[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_1x4_scalar;
+        kt->vec_dot_1x4[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_1x4_scalar;
         kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar;
     }
 }

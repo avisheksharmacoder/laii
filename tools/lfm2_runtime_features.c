@@ -8,8 +8,15 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -39,7 +46,19 @@
 #endif
 
 #ifndef LFM2_TARGET_AVX2
+#if defined(__x86_64__) || defined(_M_X64)
 #define LFM2_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#else
+#define LFM2_TARGET_AVX2
+#endif
+#endif
+
+#ifndef LFM2_TARGET_ARM_FP16
+#if defined(__aarch64__)
+#define LFM2_TARGET_ARM_FP16 __attribute__((target("arch=armv8.2-a+dotprod+fp16")))
+#else
+#define LFM2_TARGET_ARM_FP16
+#endif
 #endif
 
 #ifndef fp16_to_fp32
@@ -888,6 +907,88 @@ static inline void lfm2_kv_cache_shift_sinks_scalar(uint16_t *k_cache_f16[LFM2_M
     *inout_pos = n_sink + n_keep;
 }
 
+#if defined(__aarch64__)
+/* ARM64 NEON + FP16 GQA Attention-Sink KV-Cache Shifting & RoPE Re-Rotation */
+LFM2_TARGET_ARM_FP16
+void lfm2_kv_cache_shift_sinks_neon(uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
+                                    uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
+                                    const LFM2Model * restrict m,
+                                    const LFM2RoPELUT * restrict rope_lut,
+                                    uint32_t * restrict inout_pos,
+                                    uint32_t n_sink,
+                                    uint32_t n_discard) {
+    const uint32_t cur_pos = *inout_pos;
+    if (n_discard == 0 || cur_pos <= n_sink + n_discard) return;
+
+    const uint32_t head_dim = m->cfg.n_embd / (m->cfg.n_head_q ? m->cfg.n_head_q : 1);
+    if (head_dim != 64) {
+        *inout_pos = cur_pos;
+        return;
+    }
+    const uint32_t n_keep = cur_pos - (n_sink + n_discard);
+
+    const float * restrict cos_d = rope_lut->cos_lut + (size_t)n_discard * 32;
+    const float * restrict sin_d = rope_lut->sin_lut + (size_t)n_discard * 32;
+
+    for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
+        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV) continue;
+
+        const uint32_t n_head_kv = m->cfg.n_head_kv[l];
+        const size_t   kv_dim    = (size_t)n_head_kv * head_dim;
+
+        uint16_t *kc = k_cache_f16[l];
+        uint16_t *vc = v_cache_f16[l];
+        if (!kc || !vc) continue;
+
+        /* 1. Shift Value & Key caches down by n_discard tokens */
+        memmove(vc + (size_t)n_sink * kv_dim,
+                vc + (size_t)(n_sink + n_discard) * kv_dim,
+                (size_t)n_keep * kv_dim * sizeof(uint16_t));
+
+        memmove(kc + (size_t)n_sink * kv_dim,
+                kc + (size_t)(n_sink + n_discard) * kv_dim,
+                (size_t)n_keep * kv_dim * sizeof(uint16_t));
+
+        /* 2. Counter-rotate shifted Keys [n_sink .. n_sink + n_keep - 1] by -n_discard:
+         *    n_lo = (lo * c) + (hi * s)  -> vfmaq_f32(vmulq_f32(lo, c), hi, s)
+         *    n_hi = (hi * c) - (lo * s)  -> vfmsq_f32(vmulq_f32(hi, c), lo, s) */
+        for (uint32_t t = n_sink; t < n_sink + n_keep; ++t) {
+            uint16_t *k_step = kc + (size_t)t * kv_dim;
+            for (uint32_t h = 0; h < n_head_kv; ++h) {
+                uint16_t * restrict kh = k_step + (size_t)h * 64;
+
+                for (uint32_t i = 0; i < 32; i += 8) {
+                    float32x4_t lo0, lo1, hi0, hi1;
+                    neon_load_fp16x8_to_fp32(kh + i +  0, &lo0, &lo1);
+                    neon_load_fp16x8_to_fp32(kh + i + 32, &hi0, &hi1);
+
+                    const float32x4_t c0 = vld1q_f32(cos_d + i + 0), c1 = vld1q_f32(cos_d + i + 4);
+                    const float32x4_t s0 = vld1q_f32(sin_d + i + 0), s1 = vld1q_f32(sin_d + i + 4);
+
+                    const float32x4_t n_lo0 = vfmaq_f32(vmulq_f32(lo0, c0), hi0, s0);
+                    const float32x4_t n_lo1 = vfmaq_f32(vmulq_f32(lo1, c1), hi1, s1);
+                    const float32x4_t n_hi0 = vfmsq_f32(vmulq_f32(hi0, c0), lo0, s0);
+                    const float32x4_t n_hi1 = vfmsq_f32(vmulq_f32(hi1, c1), lo1, s1);
+
+                    neon_store_fp32_to_fp16x8(kh + i +  0, n_lo0, n_lo1);
+                    neon_store_fp32_to_fp16x8(kh + i + 32, n_hi0, n_hi1);
+                }
+            }
+        }
+    }
+
+    *inout_pos = n_sink + n_keep;
+}
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #define lfm2_kv_cache_shift_sinks_simd lfm2_kv_cache_shift_sinks_avx2
+#elif defined(__aarch64__)
+    #define lfm2_kv_cache_shift_sinks_simd lfm2_kv_cache_shift_sinks_neon
+#else
+    #define lfm2_kv_cache_shift_sinks_simd lfm2_kv_cache_shift_sinks_scalar
+#endif
+
 /* Unified Dispatcher */
 static inline void lfm2_kv_cache_shift_sinks(uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
                                              uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
@@ -896,6 +997,7 @@ static inline void lfm2_kv_cache_shift_sinks(uint16_t *k_cache_f16[LFM2_MAX_LAYE
                                              uint32_t * restrict inout_pos,
                                              uint32_t n_sink,
                                              uint32_t n_discard) {
+#if defined(__x86_64__) || defined(_M_X64)
     const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
     if (kt->has_avx2 && kt->has_fma && kt->has_f16c) {
         const char *force_isa = getenv("LFM2_FORCE_ISA");
@@ -904,6 +1006,13 @@ static inline void lfm2_kv_cache_shift_sinks(uint16_t *k_cache_f16[LFM2_MAX_LAYE
             return;
         }
     }
+#elif defined(__aarch64__)
+    const char *force_isa = getenv("LFM2_FORCE_ISA");
+    if (!force_isa || strcmp(force_isa, "scalar") != 0) {
+        lfm2_kv_cache_shift_sinks_neon(k_cache_f16, v_cache_f16, m, rope_lut, inout_pos, n_sink, n_discard);
+        return;
+    }
+#endif
     lfm2_kv_cache_shift_sinks_scalar(k_cache_f16, v_cache_f16, m, rope_lut, inout_pos, n_sink, n_discard);
 }
 

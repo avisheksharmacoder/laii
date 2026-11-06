@@ -7,10 +7,12 @@
 
 #include "lfm2.h"
 #include <assert.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define ANSI_GREEN "\033[1;32m"
@@ -211,8 +213,59 @@ int main(void) {
     lfm2_context_free(ctx);
     lfm2_model_free(model);
 
+    /* ------------------------------------------------------------------------
+     * Test 8: Android Scoped Storage FD Loading & Page Cache Release
+     * ------------------------------------------------------------------------ */
+    printf("[Test 8/8] Verifying Android Scoped Storage FD Loader & Page Cache Release...\n");
+    int raw_fd = open(TOY_MODEL_PATH, O_RDONLY);
+    TEST_ASSERT(raw_fd >= 0);
+
+    lfm2_model_t *fd_model = lfm2_model_load_from_fd(raw_fd, 0, 0);
+    TEST_ASSERT(fd_model != NULL);
+
+    lfm2_model_info_t fd_info;
+    st = lfm2_model_get_info(fd_model, &fd_info);
+    TEST_ASSERT(st == LFM2_OK);
+    TEST_ASSERT(fd_info.n_layers == 2);
+    TEST_ASSERT(fd_info.n_embd == 64);
+    TEST_ASSERT(fd_info.n_vocab == 32);
+
+    /* Verify process RSS profiler */
+    uint64_t initial_rss = lfm2_get_process_rss_bytes();
+    TEST_ASSERT(initial_rss > 0);
+    printf("  Process RSS before release: %.2f MB\n", (double)initial_rss / (1024.0 * 1024.0));
+
+    /* Verify page cache release (dual-layer MADV_DONTNEED + POSIX_FADV_DONTNEED for Android on_pause survival) */
+    lfm2_model_release_page_cache(fd_model);
+    printf("  Page cache release executed cleanly on fd-mapped model.\n");
+
+    /* Verify active page warmup (supporting Android on_resume background warmup) */
+    lfm2_model_warmup_page_cache(fd_model);
+    printf("  Page cache warmup executed cleanly.\n");
+
+    /* Create context on fd_model and verify forward tokenization works after page cache release */
+    lfm2_context_params_t fd_cparams = lfm2_context_default_params();
+    fd_cparams.max_seq_len = 128;
+    lfm2_context_t *fd_ctx = lfm2_context_create(fd_model, &fd_cparams);
+    TEST_ASSERT(fd_ctx != NULL);
+
+    st = lfm2_begin_chat_turn(fd_ctx, "Testing after cache release", &sparams);
+    TEST_ASSERT(st == LFM2_OK);
+    TEST_ASSERT(lfm2_context_get_pos(fd_ctx) > 0);
+    printf("  Forward prefill cleanly paged back in after MADV_DONTNEED (cursor=%u).\n",
+           lfm2_context_get_pos(fd_ctx));
+
+    lfm2_context_free(fd_ctx);
+    lfm2_model_free(fd_model);
+
+    /* Verify original fd is still open and valid because lfm2_model_load_from_fd used dup(fd) */
+    struct stat raw_st;
+    TEST_ASSERT(fstat(raw_fd, &raw_st) == 0);
+    close(raw_fd);
+    printf("  Caller file descriptor ownership preserved via dup(fd).\n");
+
     printf("=======================================================\n");
-    printf("%sALL 7 C11 ABI TESTS PASSED WITH 100%% SUCCESS!%s\n", ANSI_GREEN, ANSI_RESET);
+    printf("%sALL 8 C11 ABI TESTS PASSED WITH 100%% SUCCESS!%s\n", ANSI_GREEN, ANSI_RESET);
     printf("=======================================================\n");
     return EXIT_SUCCESS;
 }

@@ -8,7 +8,15 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,6 +24,51 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(__aarch64__)
+/* ARM64 NEON activation quantizer prototype */
+void lfm2_quantize_row_q8_K_neon(const float * restrict x, block_q8_K_t * restrict y, uint32_t n_cols);
+#endif
+
+#ifndef fp32_to_fp16_scalar
+#define fp32_to_fp16_scalar fp32_to_fp16_scalar
+static inline uint16_t fp32_to_fp16_scalar(float f) {
+#if defined(__F16C__)
+    return (uint16_t)_cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT);
+#else
+    uint32_t x;
+    memcpy(&x, &f, sizeof(float));
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x007FFFFF;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant = (mant | 0x00800000) >> (1 - exp);
+        return (uint16_t)(sign | ((mant + 0x00001000) >> 13));
+    } else if (exp >= 31) {
+        return (uint16_t)(sign | 0x7C00 | (mant ? 0x0200 : 0));
+    }
+    return (uint16_t)(sign | (exp << 10) | ((mant + 0x00001000) >> 13));
+#endif
+}
+#define fp32_to_fp16 fp32_to_fp16_scalar
+#endif
+
+#ifndef LFM2_TARGET_AVX2
+#if defined(__x86_64__) || defined(_M_X64)
+#define LFM2_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#else
+#define LFM2_TARGET_AVX2
+#endif
+#endif
+
+#ifndef LFM2_TARGET_ARM_FP16
+#if defined(__aarch64__)
+#define LFM2_TARGET_ARM_FP16 __attribute__((target("arch=armv8.2-a+dotprod+fp16")))
+#else
+#define LFM2_TARGET_ARM_FP16
+#endif
+#endif
 
 #ifndef LFM2_KERNELS_FAST_INCLUDED
 #define LFM2_KERNELS_FAST_INCLUDED 1
@@ -146,6 +199,133 @@ static inline void lfm2_shortconv_gate_conv_quant_avx2(float * restrict conv_out
     }
 }
 
+/* Portable C11 Scalar Fallback */
+static inline void lfm2_shortconv_gate_conv_quant_scalar(float * restrict conv_out,
+                                                         block_q8_K_t * restrict conv_out_q8,
+                                                         const float * restrict bcx,
+                                                         float * restrict conv_state,
+                                                         const LFM2PlanarConvWeights * restrict pw,
+                                                         uint32_t D) {
+    const float * restrict B       = bcx;
+    const float * restrict C       = bcx + D;
+    const float * restrict x_tilde = bcx + 2 * D;
+
+    float * restrict state_tm2 = conv_state;
+    float * restrict state_tm1 = conv_state + D;
+
+    const float * restrict w0 = pw->w0;
+    const float * restrict w1 = pw->w1;
+    const float * restrict w2 = pw->w2;
+
+    const uint32_t nb = D / 256;
+    for (uint32_t b = 0; b < nb; ++b) {
+        const uint32_t base = b * 256;
+        for (uint32_t i = 0; i < 256; ++i) {
+            const uint32_t d = base + i;
+            float u_t = B[d] * x_tilde[d];
+            float s0 = state_tm2[d];
+            float s1 = state_tm1[d];
+            state_tm2[d] = s1;
+            state_tm1[d] = u_t;
+            float acc = w0[d] * s0 + w1[d] * s1 + w2[d] * u_t;
+            conv_out[d] = C[d] * acc;
+        }
+        if (conv_out_q8 != NULL) {
+            lfm2_quantize_row_q8_K_scalar(conv_out + base, &conv_out_q8[b], 256);
+        }
+    }
+}
+
+#if defined(__aarch64__)
+/* ARM64 NEON Planar ShortConv 3-Tap + Gate + Optional In-Place Q8_K Quantizer */
+LFM2_TARGET_ARM_FP16
+static inline void lfm2_shortconv_gate_conv_quant_neon(float * restrict conv_out,
+                                                       block_q8_K_t * restrict conv_out_q8,
+                                                       const float * restrict bcx,
+                                                       float * restrict conv_state,
+                                                       const LFM2PlanarConvWeights * restrict pw,
+                                                       uint32_t D) {
+    const float * restrict B       = bcx;
+    const float * restrict C       = bcx + D;
+    const float * restrict x_tilde = bcx + 2 * D;
+
+    float * restrict state_tm2 = conv_state;     /* [D] token t - 2 */
+    float * restrict state_tm1 = conv_state + D; /* [D] token t - 1 */
+
+    const float * restrict w0 = pw->w0;
+    const float * restrict w1 = pw->w1;
+    const float * restrict w2 = pw->w2;
+
+    const uint32_t nb = D / 256;
+    for (uint32_t b = 0; b < nb; ++b) {
+        const uint32_t base = b * 256;
+
+        /* 2x4 unrolled (8 channels per iteration) to hide 4-cycle FMA pipeline latency */
+        for (uint32_t i = 0; i < 256; i += 8) {
+            const uint32_t d0 = base + i;
+            const uint32_t d1 = d0 + 4;
+
+            const float32x4_t vB0 = vld1q_f32(B + d0),       vB1 = vld1q_f32(B + d1);
+            const float32x4_t vC0 = vld1q_f32(C + d0),       vC1 = vld1q_f32(C + d1);
+            const float32x4_t vx0 = vld1q_f32(x_tilde + d0), vx1 = vld1q_f32(x_tilde + d1);
+
+            /* 1. First Multiplicative Gate: u_t = B * x_tilde */
+            const float32x4_t u0 = vmulq_f32(vB0, vx0);
+            const float32x4_t u1 = vmulq_f32(vB1, vx1);
+
+            /* 2. Load 2-step rolling state and shift in-place: tm2 <- tm1, tm1 <- u_t */
+            const float32x4_t s0_0 = vld1q_f32(state_tm2 + d0), s0_1 = vld1q_f32(state_tm2 + d1);
+            const float32x4_t s1_0 = vld1q_f32(state_tm1 + d0), s1_1 = vld1q_f32(state_tm1 + d1);
+            vst1q_f32(state_tm2 + d0, s1_0);
+            vst1q_f32(state_tm2 + d1, s1_1);
+            vst1q_f32(state_tm1 + d0, u0);
+            vst1q_f32(state_tm1 + d1, u1);
+
+            /* 3. 3-Tap Depthwise Convolution via NEON FMA: w0*s0 + w1*s1 + w2*u_t */
+            float32x4_t acc0 = vmulq_f32(vld1q_f32(w0 + d0), s0_0);
+            float32x4_t acc1 = vmulq_f32(vld1q_f32(w0 + d1), s0_1);
+            acc0 = vfmaq_f32(acc0, vld1q_f32(w1 + d0), s1_0);
+            acc1 = vfmaq_f32(acc1, vld1q_f32(w1 + d1), s1_1);
+            acc0 = vfmaq_f32(acc0, vld1q_f32(w2 + d0), u0);
+            acc1 = vfmaq_f32(acc1, vld1q_f32(w2 + d1), u1);
+
+            /* 4. Second Multiplicative Gate: conv_out = C * acc */
+            vst1q_f32(conv_out + d0, vmulq_f32(vC0, acc0));
+            vst1q_f32(conv_out + d1, vmulq_f32(vC1, acc1));
+        }
+
+        /* 5. Quantize L1-hot 256-float block directly to Q8_K for out_proj if requested */
+        if (conv_out_q8 != NULL) {
+            lfm2_quantize_row_q8_K_neon(conv_out + base, &conv_out_q8[b], 256);
+        }
+    }
+}
+#endif
+
+/* Cross-Platform Vectorized In-Place Addition */
+static inline void lfm2_vec_add_inplace(float * restrict dst, const float * restrict src, uint32_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    for (uint32_t i = 0; i < n; i += 8) {
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), _mm256_loadu_ps(src + i)));
+    }
+#elif defined(__aarch64__)
+    for (uint32_t i = 0; i < n; i += 8) {
+        vst1q_f32(dst + i + 0, vaddq_f32(vld1q_f32(dst + i + 0), vld1q_f32(src + i + 0)));
+        vst1q_f32(dst + i + 4, vaddq_f32(vld1q_f32(dst + i + 4), vld1q_f32(src + i + 4)));
+    }
+#else
+    for (uint32_t i = 0; i < n; ++i) dst[i] += src[i];
+#endif
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #define lfm2_shortconv_gate_conv_quant_simd lfm2_shortconv_gate_conv_quant_avx2
+#elif defined(__aarch64__)
+    #define lfm2_shortconv_gate_conv_quant_simd lfm2_shortconv_gate_conv_quant_neon
+#else
+    #define lfm2_shortconv_gate_conv_quant_simd lfm2_shortconv_gate_conv_quant_scalar
+#endif
+
 /* Complete Fused Single-Token ShortConv Layer:
  * Executes in only TWO thread-pool barrier dispatches with L1-hot Q8_K quantization. */
 static inline void lfm2_forward_shortconv_fast(LFM2ThreadPool *pool,
@@ -165,16 +345,14 @@ static inline void lfm2_forward_shortconv_fast(LFM2ThreadPool *pool,
     /* 2. 1x4 Unrolled Input Projection: xb [D] -> bcx [3 * D] */
     lfm2_matmul_1x4_prequant_mt(pool, bcx, layer->shortconv.in_proj, xb, xq_scratch);
 
-    /* 3. Fused AVX2 Gate1 + 3-Tap Conv1D + State Shift + Gate2 + Q8_K Quantize */
-    lfm2_shortconv_gate_conv_quant_avx2(conv_out, xq_scratch, bcx, conv_state, pw, D);
+    /* 3. Fused SIMD Gate1 + 3-Tap Conv1D + State Shift + Gate2 + Q8_K Quantize */
+    lfm2_shortconv_gate_conv_quant_simd(conv_out, xq_scratch, bcx, conv_state, pw, D);
 
     /* 4. 1x4 Unrolled Output Projection: conv_out [D] -> xb [D] */
     lfm2_matmul_1x4_prequant_mt(pool, xb, layer->shortconv.out_proj, conv_out, xq_scratch);
 
     /* 5. Vectorized Residual Add */
-    for (uint32_t d = 0; d < D; d += 8) {
-        _mm256_storeu_ps(x + d, _mm256_add_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(xb + d)));
-    }
+    lfm2_vec_add_inplace(x, xb, D);
 }
 
 /* ============================================================================
@@ -325,6 +503,167 @@ static inline void lfm2_store_fp32_to_fp16_avx2(uint16_t * restrict dst_f16,
     }
 }
 
+/* Portable Scalar Fallbacks for QK-Norm & FP16 Cache Write */
+static inline void lfm2_qk_norm_rope_scalar(float * restrict vec_f32,
+                                            uint16_t * restrict dst_f16,
+                                            uint32_t n_heads,
+                                            uint32_t head_dim,
+                                            const GGUFTensor * restrict norm_w,
+                                            float eps,
+                                            const LFM2RoPELUT * restrict lut,
+                                            uint32_t pos) {
+    const float * restrict cos_p = lut->cos_lut + (size_t)pos * 32;
+    const float * restrict sin_p = lut->sin_lut + (size_t)pos * 32;
+    const float * restrict nw    = (norm_w != NULL) ? (const float *)norm_w->data : NULL;
+    (void)head_dim;
+
+    for (uint32_t h = 0; h < n_heads; ++h) {
+        float * restrict hp = vec_f32 + (size_t)h * 64;
+        if (nw != NULL) {
+            double ss = 0.0;
+            for (uint32_t i = 0; i < 64; ++i) ss += (double)hp[i] * (double)hp[i];
+            float irms = 1.0f / sqrtf((float)(ss * (1.0 / 64.0)) + eps);
+            for (uint32_t i = 0; i < 64; ++i) hp[i] = hp[i] * irms * nw[i];
+        }
+        for (uint32_t i = 0; i < 32; ++i) {
+            float x0 = hp[i], x1 = hp[i + 32];
+            float c = cos_p[i], s = sin_p[i];
+            float r_lo = x0 * c - x1 * s;
+            float r_hi = x1 * c + x0 * s;
+            if (dst_f16 != NULL) {
+                uint16_t * restrict kp = dst_f16 + (size_t)h * 64;
+                kp[i]      = fp32_to_fp16(r_lo);
+                kp[i + 32] = fp32_to_fp16(r_hi);
+            } else {
+                hp[i]      = r_lo;
+                hp[i + 32] = r_hi;
+            }
+        }
+    }
+}
+
+static inline void lfm2_store_fp32_to_fp16_scalar(uint16_t * restrict dst_f16,
+                                                  const float * restrict src_f32,
+                                                  uint32_t n_elems) {
+    for (uint32_t i = 0; i < n_elems; ++i) {
+        dst_f16[i] = fp32_to_fp16(src_f32[i]);
+    }
+}
+
+#if defined(__aarch64__)
+/* Helper: Unpacks 8 contiguous IEEE-754 FP16 values into two FP32 NEON registers */
+LFM2_TARGET_ARM_FP16
+static inline void neon_load_fp16x8_to_fp32(const uint16_t * restrict src,
+                                            float32x4_t * restrict out_lo,
+                                            float32x4_t * restrict out_hi) {
+    const float16x8_t h8 = vreinterpretq_f16_u16(vld1q_u16(src));
+    *out_lo = vcvt_f32_f16(vget_low_f16(h8));
+    *out_hi = vcvt_f32_f16(vget_high_f16(h8));
+}
+
+/* Helper: Converts two FP32 NEON registers (8 floats) and stores 8 FP16 values */
+LFM2_TARGET_ARM_FP16
+static inline void neon_store_fp32_to_fp16x8(uint16_t * restrict dst,
+                                             float32x4_t v_lo,
+                                             float32x4_t v_hi) {
+    const float16x8_t h8 = vcombine_f16(vcvt_f16_f32(v_lo), vcvt_f16_f32(v_hi));
+    vst1q_u16(dst, vreinterpretq_u16_f16(h8));
+}
+
+/* ARM64 NEON FP32 -> FP16 conversion vector store */
+LFM2_TARGET_ARM_FP16
+static inline void lfm2_store_fp32_to_fp16_neon(uint16_t * restrict dst_f16,
+                                                const float * restrict src_f32,
+                                                uint32_t n_elems) {
+    for (uint32_t i = 0; i < n_elems; i += 8) {
+        float32x4_t lo = vld1q_f32(src_f32 + i + 0);
+        float32x4_t hi = vld1q_f32(src_f32 + i + 4);
+        neon_store_fp32_to_fp16x8(dst_f16 + i, lo, hi);
+    }
+}
+
+/* ARM64 NEON + FP16 Per-Head QK-Norm & Precomputed RoPE LUT */
+LFM2_TARGET_ARM_FP16
+static inline void lfm2_qk_norm_rope_neon(float * restrict vec_f32,
+                                          uint16_t * restrict dst_f16,
+                                          uint32_t n_heads,
+                                          uint32_t head_dim,
+                                          const GGUFTensor * restrict norm_w,
+                                          float eps,
+                                          const LFM2RoPELUT * restrict lut,
+                                          uint32_t pos) {
+    const float * restrict cos_p = lut->cos_lut + (size_t)pos * 32;
+    const float * restrict sin_p = lut->sin_lut + (size_t)pos * 32;
+    const float * restrict nw    = (norm_w != NULL) ? (const float *)norm_w->data : NULL;
+    (void)head_dim; /* LFM2 head_dim = 64 */
+
+    for (uint32_t h = 0; h < n_heads; ++h) {
+        float * restrict hp    = vec_f32 + (size_t)h * 64;
+        uint16_t * restrict kp = dst_f16 ? (dst_f16 + (size_t)h * 64) : NULL;
+
+        /* 1. Compute Per-Head RMSNorm scale factor across all 64 lanes */
+        float irms = 1.0f;
+        if (nw != NULL) {
+            float32x4_t ss0 = vdupq_n_f32(0.0f);
+            float32x4_t ss1 = vdupq_n_f32(0.0f);
+            for (uint32_t i = 0; i < 64; i += 8) {
+                const float32x4_t v0 = vld1q_f32(hp + i + 0);
+                const float32x4_t v1 = vld1q_f32(hp + i + 4);
+                ss0 = vfmaq_f32(ss0, v0, v0);
+                ss1 = vfmaq_f32(ss1, v1, v1);
+            }
+            const float ss = vaddvq_f32(vaddq_f32(ss0, ss1));
+            irms = 1.0f / sqrtf(ss * (1.0f / 64.0f) + eps);
+        }
+        const float32x4_t virms = vdupq_n_f32(irms);
+
+        /* 2. Fused RMSNorm + NeoX Half-Split RoPE (8 lanes per iteration):
+         *    r_lo = (x_lo * c) - (x_hi * s)  -> vfmsq_f32(vmulq_f32(x_lo, c), x_hi, s)
+         *    r_hi = (x_hi * c) + (x_lo * s)  -> vfmaq_f32(vmulq_f32(x_hi, c), x_lo, s) */
+        for (uint32_t i = 0; i < 32; i += 8) {
+            float32x4_t x_lo0 = vld1q_f32(hp + i +  0), x_lo1 = vld1q_f32(hp + i +  4);
+            float32x4_t x_hi0 = vld1q_f32(hp + i + 32), x_hi1 = vld1q_f32(hp + i + 36);
+
+            if (nw != NULL) {
+                x_lo0 = vmulq_f32(vmulq_f32(x_lo0, virms), vld1q_f32(nw + i +  0));
+                x_lo1 = vmulq_f32(vmulq_f32(x_lo1, virms), vld1q_f32(nw + i +  4));
+                x_hi0 = vmulq_f32(vmulq_f32(x_hi0, virms), vld1q_f32(nw + i + 32));
+                x_hi1 = vmulq_f32(vmulq_f32(x_hi1, virms), vld1q_f32(nw + i + 36));
+            }
+
+            const float32x4_t c0 = vld1q_f32(cos_p + i + 0), c1 = vld1q_f32(cos_p + i + 4);
+            const float32x4_t s0 = vld1q_f32(sin_p + i + 0), s1 = vld1q_f32(sin_p + i + 4);
+
+            const float32x4_t r_lo0 = vfmsq_f32(vmulq_f32(x_lo0, c0), x_hi0, s0);
+            const float32x4_t r_lo1 = vfmsq_f32(vmulq_f32(x_lo1, c1), x_hi1, s1);
+            const float32x4_t r_hi0 = vfmaq_f32(vmulq_f32(x_hi0, c0), x_lo0, s0);
+            const float32x4_t r_hi1 = vfmaq_f32(vmulq_f32(x_hi1, c1), x_lo1, s1);
+
+            if (kp != NULL) {
+                neon_store_fp32_to_fp16x8(kp + i +  0, r_lo0, r_lo1);
+                neon_store_fp32_to_fp16x8(kp + i + 32, r_hi0, r_hi1);
+            } else {
+                vst1q_f32(hp + i +  0, r_lo0);
+                vst1q_f32(hp + i +  4, r_lo1);
+                vst1q_f32(hp + i + 32, r_hi0);
+                vst1q_f32(hp + i + 36, r_hi1);
+            }
+        }
+    }
+}
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #define lfm2_qk_norm_rope_simd       lfm2_qk_norm_rope_avx2
+    #define lfm2_store_fp32_to_fp16_simd lfm2_store_fp32_to_fp16_avx2
+#elif defined(__aarch64__)
+    #define lfm2_qk_norm_rope_simd       lfm2_qk_norm_rope_neon
+    #define lfm2_store_fp32_to_fp16_simd lfm2_store_fp32_to_fp16_neon
+#else
+    #define lfm2_qk_norm_rope_simd       lfm2_qk_norm_rope_scalar
+    #define lfm2_store_fp32_to_fp16_simd lfm2_store_fp32_to_fp16_scalar
+#endif
+
 /* ============================================================================
  * 3. Single-Pass Online Softmax (FlashAttention-CPU) over FP16 KV-Cache
  * ============================================================================
@@ -458,6 +797,211 @@ static inline void lfm2_online_gqa_f16_worker(void *arg, uint32_t tid, uint32_t 
     }
 }
 
+/* Portable C11 Scalar Fallback */
+static inline void lfm2_online_gqa_f16_worker_scalar(void *arg, uint32_t tid, uint32_t n_threads) {
+    (void)tid; (void)n_threads;
+    OnlineGQATaskCtx *c = (OnlineGQATaskCtx *)arg;
+    uint32_t group_start = 0, group_end = 0;
+
+    while (lfm2_threadpool_claim_chunk(c->pool, &group_start, &group_end)) {
+        for (uint32_t g = group_start; g < group_end; ++g) {
+            const uint32_t h_base = g * 4;
+            const uint32_t h_end  = (h_base + 4 <= c->n_head_q) ? (h_base + 4) : c->n_head_q;
+
+            for (uint32_t h = h_base; h < h_end; ++h) {
+                const float * restrict q_h = c->q + (size_t)h * 64;
+                const uint32_t kv_h        = h / c->kv_mul;
+                float vo[64] = {0.0f};
+                float m_prev = -1e30f;
+                float l_prev = 0.0f;
+
+                const uint16_t *k_ptr = c->k_cache_f16 + (size_t)kv_h * 64;
+                const uint16_t *v_ptr = c->v_cache_f16 + (size_t)kv_h * 64;
+                const size_t stride   = c->kv_dim;
+
+                for (uint32_t t = 0; t <= c->pos; ++t) {
+                    float dot = 0.0f;
+                    for (uint32_t i = 0; i < 64; ++i) {
+                        dot += q_h[i] * fp16_to_fp32(k_ptr[i]);
+                    }
+                    float score = dot * c->scale;
+
+                    if (score > m_prev) {
+                        float alpha = (m_prev <= -1e29f) ? 0.0f : expf(m_prev - score);
+                        l_prev = l_prev * alpha + 1.0f;
+                        m_prev = score;
+                        for (uint32_t i = 0; i < 64; ++i) {
+                            vo[i] = vo[i] * alpha + fp16_to_fp32(v_ptr[i]);
+                        }
+                    } else {
+                        float beta = expf(score - m_prev);
+                        l_prev += beta;
+                        for (uint32_t i = 0; i < 64; ++i) {
+                            vo[i] += beta * fp16_to_fp32(v_ptr[i]);
+                        }
+                    }
+                    k_ptr += stride;
+                    v_ptr += stride;
+                }
+
+                float inv_l = 1.0f / l_prev;
+                float * restrict out_h = c->xb_out + (size_t)h * 64;
+                for (uint32_t i = 0; i < 64; ++i) {
+                    out_h[i] = vo[i] * inv_l;
+                }
+            }
+
+            if (h_end - h_base == 4 && c->xb_q8_out != NULL) {
+                lfm2_quantize_row_q8_K_scalar(c->xb_out + (size_t)h_base * 64, &c->xb_q8_out[g], 256);
+            }
+        }
+    }
+}
+
+#if defined(__aarch64__)
+/* ARM64 NEON + FP16 Single-Pass Online Softmax GQA Worker */
+LFM2_TARGET_ARM_FP16
+static inline void lfm2_online_gqa_f16_worker_neon(void *arg, uint32_t tid, uint32_t n_threads) {
+    (void)tid; (void)n_threads;
+    OnlineGQATaskCtx *c = (OnlineGQATaskCtx *)arg;
+    uint32_t group_start = 0, group_end = 0;
+
+    while (lfm2_threadpool_claim_chunk(c->pool, &group_start, &group_end)) {
+        for (uint32_t g = group_start; g < group_end; ++g) {
+            const uint32_t h_base = g * 4;
+            const uint32_t h_end  = (h_base + 4 <= c->n_head_q) ? (h_base + 4) : c->n_head_q;
+
+            for (uint32_t h = h_base; h < h_end; ++h) {
+                const float * restrict q_h = c->q + (size_t)h * 64;
+                const uint32_t kv_h        = h / c->kv_mul;
+
+                /* Output accumulator in 16 NEON registers (vo0..vo15) */
+                float32x4_t vo0  = vdupq_n_f32(0.0f), vo1  = vdupq_n_f32(0.0f);
+                float32x4_t vo2  = vdupq_n_f32(0.0f), vo3  = vdupq_n_f32(0.0f);
+                float32x4_t vo4  = vdupq_n_f32(0.0f), vo5  = vdupq_n_f32(0.0f);
+                float32x4_t vo6  = vdupq_n_f32(0.0f), vo7  = vdupq_n_f32(0.0f);
+                float32x4_t vo8  = vdupq_n_f32(0.0f), vo9  = vdupq_n_f32(0.0f);
+                float32x4_t vo10 = vdupq_n_f32(0.0f), vo11 = vdupq_n_f32(0.0f);
+                float32x4_t vo12 = vdupq_n_f32(0.0f), vo13 = vdupq_n_f32(0.0f);
+                float32x4_t vo14 = vdupq_n_f32(0.0f), vo15 = vdupq_n_f32(0.0f);
+
+                float m_prev = -1e30f;
+                float l_prev = 0.0f;
+
+                const uint16_t *k_ptr = c->k_cache_f16 + (size_t)kv_h * 64;
+                const uint16_t *v_ptr = c->v_cache_f16 + (size_t)kv_h * 64;
+                const size_t stride   = c->kv_dim;
+
+                for (uint32_t t = 0; t <= c->pos; ++t) {
+                    if (t + 2 <= c->pos) {
+                        __builtin_prefetch(k_ptr + 2 * stride, 0, 0);
+                        __builtin_prefetch(v_ptr + 2 * stride, 0, 0);
+                    }
+
+                    /* 1. Hardware FP16 -> FP32 load of K_t[0..63] + dot product with Q_h
+                     * We stream Q_h in 8-lane chunks, using 4 scratch registers for loads/products.
+                     * This leaves vo0..vo15 completely unspilled in registers! */
+                    float32x4_t d0 = vdupq_n_f32(0.0f), d1 = vdupq_n_f32(0.0f);
+                    for (uint32_t i = 0; i < 64; i += 8) {
+                        float32x4_t k_lo, k_hi;
+                        neon_load_fp16x8_to_fp32(k_ptr + i, &k_lo, &k_hi);
+                        const float32x4_t q_lo = vld1q_f32(q_h + i + 0);
+                        const float32x4_t q_hi = vld1q_f32(q_h + i + 4);
+                        d0 = vfmaq_f32(d0, q_lo, k_lo);
+                        d1 = vfmaq_f32(d1, q_hi, k_hi);
+                    }
+
+                    const float score = vaddvq_f32(vaddq_f32(d0, d1)) * c->scale;
+
+                    /* 2. Single-Pass Online Softmax Rescaling & FP16 Value Accumulation */
+                    float32x4_t v_lo, v_hi;
+                    if (score > m_prev) {
+                        const float alpha = (m_prev <= -1e29f) ? 0.0f : expf(m_prev - score);
+                        l_prev = l_prev * alpha + 1.0f;
+                        m_prev = score;
+
+                        /* vfmaq_n_f32(v_t, vo, alpha) -> v_t + (vo * alpha) */
+                        neon_load_fp16x8_to_fp32(v_ptr +  0, &v_lo, &v_hi);
+                        vo0  = vfmaq_n_f32(v_lo, vo0,  alpha); vo1  = vfmaq_n_f32(v_hi, vo1,  alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr +  8, &v_lo, &v_hi);
+                        vo2  = vfmaq_n_f32(v_lo, vo2,  alpha); vo3  = vfmaq_n_f32(v_hi, vo3,  alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr + 16, &v_lo, &v_hi);
+                        vo4  = vfmaq_n_f32(v_lo, vo4,  alpha); vo5  = vfmaq_n_f32(v_hi, vo5,  alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr + 24, &v_lo, &v_hi);
+                        vo6  = vfmaq_n_f32(v_lo, vo6,  alpha); vo7  = vfmaq_n_f32(v_hi, vo7,  alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr + 32, &v_lo, &v_hi);
+                        vo8  = vfmaq_n_f32(v_lo, vo8,  alpha); vo9  = vfmaq_n_f32(v_hi, vo9,  alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr + 40, &v_lo, &v_hi);
+                        vo10 = vfmaq_n_f32(v_lo, vo10, alpha); vo11 = vfmaq_n_f32(v_hi, vo11, alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr + 48, &v_lo, &v_hi);
+                        vo12 = vfmaq_n_f32(v_lo, vo12, alpha); vo13 = vfmaq_n_f32(v_hi, vo13, alpha);
+                        neon_load_fp16x8_to_fp32(v_ptr + 56, &v_lo, &v_hi);
+                        vo14 = vfmaq_n_f32(v_lo, vo14, alpha); vo15 = vfmaq_n_f32(v_hi, vo15, alpha);
+                    } else {
+                        const float beta = expf(score - m_prev);
+                        l_prev += beta;
+
+                        /* vfmaq_n_f32(vo, v_t, beta) -> vo + (v_t * beta) */
+                        neon_load_fp16x8_to_fp32(v_ptr +  0, &v_lo, &v_hi);
+                        vo0  = vfmaq_n_f32(vo0,  v_lo, beta); vo1  = vfmaq_n_f32(vo1,  v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr +  8, &v_lo, &v_hi);
+                        vo2  = vfmaq_n_f32(vo2,  v_lo, beta); vo3  = vfmaq_n_f32(vo3,  v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr + 16, &v_lo, &v_hi);
+                        vo4  = vfmaq_n_f32(vo4,  v_lo, beta); vo5  = vfmaq_n_f32(vo5,  v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr + 24, &v_lo, &v_hi);
+                        vo6  = vfmaq_n_f32(vo6,  v_lo, beta); vo7  = vfmaq_n_f32(vo7,  v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr + 32, &v_lo, &v_hi);
+                        vo8  = vfmaq_n_f32(vo8,  v_lo, beta); vo9  = vfmaq_n_f32(vo9,  v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr + 40, &v_lo, &v_hi);
+                        vo10 = vfmaq_n_f32(vo10, v_lo, beta); vo11 = vfmaq_n_f32(vo11, v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr + 48, &v_lo, &v_hi);
+                        vo12 = vfmaq_n_f32(vo12, v_lo, beta); vo13 = vfmaq_n_f32(vo13, v_hi, beta);
+                        neon_load_fp16x8_to_fp32(v_ptr + 56, &v_lo, &v_hi);
+                        vo14 = vfmaq_n_f32(vo14, v_lo, beta); vo15 = vfmaq_n_f32(vo15, v_hi, beta);
+                    }
+
+                    k_ptr += stride;
+                    v_ptr += stride;
+                }
+
+                /* 3. Normalize by 1.0f / l_prev and store to xb_out[h * 64] */
+                const float inv_l = 1.0f / l_prev;
+                float * restrict out_h = c->xb_out + (size_t)h * 64;
+                vst1q_f32(out_h +  0, vmulq_n_f32(vo0,  inv_l));
+                vst1q_f32(out_h +  4, vmulq_n_f32(vo1,  inv_l));
+                vst1q_f32(out_h +  8, vmulq_n_f32(vo2,  inv_l));
+                vst1q_f32(out_h + 12, vmulq_n_f32(vo3,  inv_l));
+                vst1q_f32(out_h + 16, vmulq_n_f32(vo4,  inv_l));
+                vst1q_f32(out_h + 20, vmulq_n_f32(vo5,  inv_l));
+                vst1q_f32(out_h + 24, vmulq_n_f32(vo6,  inv_l));
+                vst1q_f32(out_h + 28, vmulq_n_f32(vo7,  inv_l));
+                vst1q_f32(out_h + 32, vmulq_n_f32(vo8,  inv_l));
+                vst1q_f32(out_h + 36, vmulq_n_f32(vo9,  inv_l));
+                vst1q_f32(out_h + 40, vmulq_n_f32(vo10, inv_l));
+                vst1q_f32(out_h + 44, vmulq_n_f32(vo11, inv_l));
+                vst1q_f32(out_h + 48, vmulq_n_f32(vo12, inv_l));
+                vst1q_f32(out_h + 52, vmulq_n_f32(vo13, inv_l));
+                vst1q_f32(out_h + 56, vmulq_n_f32(vo14, inv_l));
+                vst1q_f32(out_h + 60, vmulq_n_f32(vo15, inv_l));
+            }
+
+            /* Immediately quantize L1-hot 256-float (4-head) slice into xb_q8_out[g] */
+            if (h_end - h_base == 4 && c->xb_q8_out != NULL) {
+                lfm2_quantize_row_q8_K_neon(c->xb_out + (size_t)h_base * 64, &c->xb_q8_out[g], 256);
+            }
+        }
+    }
+}
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #define lfm2_online_gqa_f16_worker_simd lfm2_online_gqa_f16_worker
+#elif defined(__aarch64__)
+    #define lfm2_online_gqa_f16_worker_simd lfm2_online_gqa_f16_worker_neon
+#else
+    #define lfm2_online_gqa_f16_worker_simd lfm2_online_gqa_f16_worker_scalar
+#endif
+
 /* Complete Fused Single-Token GQA Attention Layer (with FP16 KV-Cache & Online Softmax) */
 static inline void lfm2_forward_gqa_fast(LFM2ThreadPool *pool,
                                          float * restrict x,
@@ -486,10 +1030,10 @@ static inline void lfm2_forward_gqa_fast(LFM2ThreadPool *pool,
                               xb, xq_scratch);
 
     /* 3. Vectorized Per-Head QK-Norm + RoPE LUT + Direct F16C Cache Write */
-    lfm2_qk_norm_rope_avx2(q, NULL, n_head_q, head_dim, layer->attn.q_norm, eps, rope_lut, pos);
-    lfm2_qk_norm_rope_avx2(k, k_cache_f16 + (size_t)pos * kv_dim, n_head_kv, head_dim,
+    lfm2_qk_norm_rope_simd(q, NULL, n_head_q, head_dim, layer->attn.q_norm, eps, rope_lut, pos);
+    lfm2_qk_norm_rope_simd(k, k_cache_f16 + (size_t)pos * kv_dim, n_head_kv, head_dim,
                            layer->attn.k_norm, eps, rope_lut, pos);
-    lfm2_store_fp32_to_fp16_avx2(v_cache_f16 + (size_t)pos * kv_dim, v, kv_dim);
+    lfm2_store_fp32_to_fp16_simd(v_cache_f16 + (size_t)pos * kv_dim, v, kv_dim);
 
     /* 4. Single-Pass Online Softmax GQA over FP16 KV-Cache + In-Place Q8_K Quantize */
     OnlineGQATaskCtx gqa_ctx = {
@@ -506,13 +1050,11 @@ static inline void lfm2_forward_gqa_fast(LFM2ThreadPool *pool,
         .scale       = 1.0f / sqrtf((float)head_dim)
     };
     const uint32_t n_head_groups = (n_head_q + 3) / 4;
-    lfm2_parallel_for(pool, n_head_groups, 1, lfm2_online_gqa_f16_worker, &gqa_ctx);
+    lfm2_parallel_for(pool, n_head_groups, 1, lfm2_online_gqa_f16_worker_simd, &gqa_ctx);
 
     /* 5. 1x4 Unrolled Output Projection (attn_output.weight) + Residual Add */
     lfm2_matmul_1x4_prequant_mt(pool, q, layer->attn.wo, xb, xq_scratch);
-    for (uint32_t d = 0; d < D; d += 8) {
-        _mm256_storeu_ps(x + d, _mm256_add_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(q + d)));
-    }
+    lfm2_vec_add_inplace(x, q, D);
 }
 
 /* ============================================================================

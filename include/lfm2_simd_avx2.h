@@ -15,6 +15,25 @@
 #define LFM2_HAS_AVX2 0
 #endif
 
+#ifndef LFM2_TARGET_AVX2
+#define LFM2_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#endif
+#ifndef LFM2_TARGET_AVXVNNI
+#define LFM2_TARGET_AVXVNNI __attribute__((target("avx2,fma,f16c,avxvnni")))
+#endif
+
+#ifndef LFM2_PREFETCH_1X4_NTA
+#define LFM2_PREFETCH_1X4_NTA(w0, w1, w2, w3, x_q8, b, row_blocks) do {       \
+    if ((b) + 1 < (row_blocks)) {                                             \
+        _mm_prefetch((const char *)&(x_q8)[(b) + 1], _MM_HINT_T0);            \
+        _mm_prefetch((const char *)&(w0)[(b) + 1],   _MM_HINT_NTA);           \
+        _mm_prefetch((const char *)&(w1)[(b) + 1],   _MM_HINT_NTA);           \
+        _mm_prefetch((const char *)&(w2)[(b) + 1],   _MM_HINT_NTA);           \
+        _mm_prefetch((const char *)&(w3)[(b) + 1],   _MM_HINT_NTA);           \
+    }                                                                         \
+} while (0)
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <xmmintrin.h>
 #include <pmmintrin.h>
@@ -28,9 +47,22 @@ static inline bool lfm2_get_denormals_zero_mode(void) {
     return (_MM_GET_FLUSH_ZERO_MODE() == _MM_FLUSH_ZERO_ON) &&
            (_MM_GET_DENORMALS_ZERO_MODE() == _MM_DENORMALS_ZERO_ON);
 }
+#elif defined(__aarch64__)
+static inline void lfm2_set_denormals_zero_mode(void) {
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ULL << 24) | (1ULL << 19); /* Bit 24 = FZ (FP32/64), Bit 19 = FZ16 (FP16 FZ) */
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
+}
+
+static inline bool lfm2_get_denormals_zero_mode(void) {
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    return ((fpcr & (1ULL << 24)) != 0) && ((fpcr & (1ULL << 19)) != 0);
+}
 #else
 static inline void lfm2_set_denormals_zero_mode(void) {
-    /* No-op on non-x86 architectures */
+    /* No-op on other architectures */
 }
 
 static inline bool lfm2_get_denormals_zero_mode(void) {
