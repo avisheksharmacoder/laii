@@ -36,6 +36,7 @@ def compile_liblfm2(target_path: Path) -> None:
         "-Wno-unused-function",
         f"-I{ROOT_DIR / 'include'}",
         "-D_GNU_SOURCE",
+        "-DLFM2_DISABLE_JNI",
     ]
 
     if arch in ("x86_64", "amd64"):

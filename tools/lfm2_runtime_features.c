@@ -753,6 +753,7 @@ void lfm2_think_commit_token(LFM2ThinkController *tc,
  * rolling state already represents the exact immediate tail at `pos - 1`!
  * ============================================================================ */
 
+#if defined(__x86_64__) || defined(_M_X64)
 /* AVX2 Hardware Accelerated Kernel */
 LFM2_TARGET_AVX2
 void lfm2_kv_cache_shift_sinks_avx2(uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
@@ -843,6 +844,7 @@ void lfm2_kv_cache_shift_sinks_avx2(uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
 
     *inout_pos = n_sink + n_keep;
 }
+#endif
 
 /* Portable Scalar Fallback Kernel */
 static inline void lfm2_kv_cache_shift_sinks_scalar(uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
@@ -1129,16 +1131,16 @@ int main(void) {
     }
 
     /* Rotate k_orig_f32 at `old_pos = 200` and store in k_cache_f16[0][200] */
-    lfm2_qk_norm_rope_avx2(k_orig_f32, k_cache_f16[0] + (size_t)old_pos * kv_dim,
+    lfm2_qk_norm_rope_simd(k_orig_f32, k_cache_f16[0] + (size_t)old_pos * kv_dim,
                            8, 64, NULL, 1e-5f, &rope_lut, old_pos);
 
     /* Rotate k_direct_f32 directly at `new_pos = 100` as ground-truth reference */
-    lfm2_qk_norm_rope_avx2(k_direct_f32, k_direct_f16,
+    lfm2_qk_norm_rope_simd(k_direct_f32, k_direct_f16,
                            8, 64, NULL, 1e-5f, &rope_lut, new_pos);
 
     /* Shift KV cache by discarding `n_discard = 100` tokens after `n_sink = 16` */
     uint32_t cursor = 256;
-    lfm2_kv_cache_shift_sinks_avx2(k_cache_f16, v_cache_f16, &mock_model,
+    lfm2_kv_cache_shift_sinks_simd(k_cache_f16, v_cache_f16, &mock_model,
                                    &rope_lut, &cursor, n_sink, n_discard);
 
     float max_shift_err = 0.0f;

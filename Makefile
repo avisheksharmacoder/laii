@@ -14,12 +14,18 @@ ifeq ($(NATIVE), 1)
     CFLAGS += -march=native
 endif
 
+# JNI configuration (auto-detect OpenJDK or override via JAVA_HOME)
+JAVA_HOME ?= $(shell if [ -d /usr/lib/jvm/java-17-openjdk-amd64 ]; then echo /usr/lib/jvm/java-17-openjdk-amd64; elif [ -d /usr/lib/jvm/java-17-openjdk-arm64 ]; then echo /usr/lib/jvm/java-17-openjdk-arm64; elif [ -n "$$JAVA_HOME" ]; then echo "$$JAVA_HOME"; elif command -v javac >/dev/null 2>&1; then dirname $$(dirname $$(readlink -f $$(command -v javac))); fi)
+ifneq ($(wildcard $(JAVA_HOME)/include/jni.h),)
+    CFLAGS += -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/linux -DLFM2_ENABLE_JNI=1
+endif
+
 SRC_CORE = src/arena.c src/gguf.c src/lfm_model.c src/lfm_simd.c src/lfm_fused.c src/lfm_threadpool.c src/lfm_forward.c src/lfm_tokenizer.c src/lfm_engine.c src/lfm_c_api.c src/lfm_server.c
 OBJ_CORE = $(SRC_CORE:src/%.c=build/%.o)
 
 TEST_BINS = bin/test_arena bin/test_math bin/test_simd_avx2 bin/test_quants bin/test_simd_kquants bin/test_fused_conv bin/test_threads bin/test_tokenizer bin/test_bpe bin/test_gguf bin/test_conv1d bin/test_attention bin/test_forward bin/test_c_api bin/test_lfm2_threadpool bin/test_optimizations bin/test_prefill_batch bin/test_decode_1x4 bin/test_kernels_fast bin/test_cpuid_quants bin/test_runtime_features bin/test_moe_checkpoint bin/test_cli_stream bin/test_sys_cache bin/test_lfm2_api bin/test_lfm2_server bin/test_hardening bin/test_simd_arm64 bin/test_android_io bin/test_speculative_pld
 
-.PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-parity cli server shared android python-wheel asan tsan parity help
+.PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-jni test-kotlin-app run-kotlin-app test-parity cli server shared android python-wheel asan tsan parity help
 
 all: dirs lib lfm-run lfm-server bin/lfm2 bin/lfm2-server bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld $(TEST_BINS)
 
@@ -37,7 +43,7 @@ lib/liblfm.a: $(OBJ_CORE)
 lib/liblfm.so: $(OBJ_CORE)
 	$(CC) -shared $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-lib/liblfm2.so: src/lfm2_api.c include/lfm2.h | dirs
+lib/liblfm2.so: src/lfm2_api.c src/lfm2_jni.c include/lfm2.h | dirs
 	$(CC) -shared -fPIC -fvisibility=hidden $(CFLAGS) -Wl,-soname,liblfm2.so -Wl,-z,max-page-size=16384 $< -o $@ $(LDFLAGS)
 	@cp -f $@ ./liblfm2.so
 
@@ -169,8 +175,8 @@ bin/lfm2-cli-stream-static: tools/lfm2_cli_stream.c | dirs
 bin/lfm2-sys-cache-static: tools/lfm2_sys_cache.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) -I. -static $< -o $@ $(LDFLAGS)
 
-bin/lfm2-server-static: tools/lfm2_server.c | dirs
-	$(CC) $(CFLAGS) -I. -static -DLFM2_SERVER_STANDALONE_DEMO $< -o $@ $(LDFLAGS)
+bin/lfm2-server-static: tools/lfm2_server.c src/lfm2_api.c include/lfm2.h | dirs
+	$(CC) $(CFLAGS) -I. -static -DLFM2_API_NO_SERVER -DLFM2_DISABLE_JNI tools/lfm2_server.c src/lfm2_api.c -o $@ $(LDFLAGS)
 
 bin/lfm2-simd-arm64-static: tools/lfm2_simd_arm64.c | dirs
 	$(CC) $(CFLAGS) -I. -static $< -o $@ $(LDFLAGS)
@@ -281,6 +287,50 @@ test-python: lib fixtures
 	@$(PYTHON) tests/test_python_bindings.py
 	@$(PYTHON) tests/test_python_lfm2.py
 	@$(PYTHON) tests/verify_parity.py
+
+test-jni: lib fixtures
+	@if command -v javac >/dev/null 2>&1; then \
+		echo "Compiling and running Java/Kotlin JNI bridge test suite..."; \
+		mkdir -p build/classes; \
+		javac -d build/classes android/src/main/java/ai/liquid/lfm2/*.java tests/TestJNI.java; \
+		java --add-opens java.base/java.io=ALL-UNNAMED -ea -cp build/classes -Djava.library.path=./lib tests.TestJNI $(MODEL); \
+	else \
+		echo "NOTE: javac not found on PATH. Skipping JNI test."; \
+	fi
+
+GRADLE_KOTLIN_JAR := $(shell find /home/avisheks/.gradle/wrapper/dists/gradle-8.14.3-all -name "kotlin-compiler-embeddable-*.jar" 2>/dev/null | head -n 1)
+GRADLE_LIB_DIR    := $(if $(GRADLE_KOTLIN_JAR),$(dir $(GRADLE_KOTLIN_JAR)),)
+
+test-kotlin-app: lib fixtures
+	@if [ -n "$(GRADLE_LIB_DIR)" ] && command -v javac >/dev/null 2>&1; then \
+		echo "Compiling and running Kotlin Android App Simulator (Zero Downloads)..."; \
+		mkdir -p build/kt_app; \
+		javac -d build/kt_app android/src/main/java/ai/liquid/lfm2/*.java; \
+		java -cp "$(GRADLE_LIB_DIR)*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib \
+			-cp "$(GRADLE_LIB_DIR)kotlin-stdlib-2.0.21.jar:build/kt_app" \
+			-d build/kt_app \
+			android/src/main/kotlin/ai/liquid/lfm2/*.kt \
+			android/src/main/kotlin/ai/liquid/lfm2/app/*.kt \
+			tests/AndroidAppRunner.kt; \
+		java -ea -cp "build/kt_app:$(GRADLE_LIB_DIR)kotlin-stdlib-2.0.21.jar" -Djava.library.path=./lib tests.AndroidAppRunner $(MODEL); \
+	else \
+		echo "NOTE: Local Kotlin compiler not detected. Skipping Kotlin App test."; \
+	fi
+
+run-kotlin-app: lib
+	@if [ -n "$(GRADLE_LIB_DIR)" ] && command -v javac >/dev/null 2>&1; then \
+		mkdir -p build/kt_app; \
+		javac -d build/kt_app android/src/main/java/ai/liquid/lfm2/*.java; \
+		java -cp "$(GRADLE_LIB_DIR)*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib \
+			-cp "$(GRADLE_LIB_DIR)kotlin-stdlib-2.0.21.jar:build/kt_app" \
+			-d build/kt_app \
+			android/src/main/kotlin/ai/liquid/lfm2/*.kt \
+			android/src/main/kotlin/ai/liquid/lfm2/app/*.kt \
+			tests/AndroidAppRunner.kt; \
+		java -ea -cp "build/kt_app:$(GRADLE_LIB_DIR)kotlin-stdlib-2.0.21.jar" -Djava.library.path=./lib tests.AndroidAppRunner $(MODEL) --interactive; \
+	else \
+		echo "NOTE: Local Kotlin compiler not detected."; \
+	fi
 
 test-parity: lib fixtures
 	@$(PYTHON) tests/verify_parity.py
@@ -405,7 +455,7 @@ test-core: all fixtures
 	@echo "-------------------------------------------------------"
 	@$(MAKE) test-python
 
-static-test: static
+static-test: static fixtures
 	@echo "-------------------------------------------------------"
 	@echo "[Test] Verifying Standalone Static ELF binary..."
 	@file bin/lfm-run-static | grep -q "statically linked" && echo "  Static binary verified: bin/lfm-run-static (statically linked)"
@@ -423,6 +473,15 @@ static-test: static
 	@file bin/lfm2-simd-arm64-static | grep -q "statically linked" && echo "  Static binary verified: bin/lfm2-simd-arm64-static (statically linked)"
 	@file bin/lfm2-speculative-pld-static | grep -q "statically linked" && echo "  Static binary verified: bin/lfm2-speculative-pld-static (statically linked)"
 	@./bin/lfm-run-static -h > /dev/null && echo "  Static executable ran successfully with zero dynamic dependencies."
+	@./bin/lfm2-server-static -m tests/lfm2_toy.gguf --port 19476 > /dev/null 2>&1 & \
+		SPID=$$!; \
+		trap 'kill $$SPID 2>/dev/null || true' EXIT; \
+		sleep 0.3; \
+		curl -sf http://127.0.0.1:19476/health | grep -q '"status":"ok"'; \
+		MODELS_JSON=$$(curl -sf http://127.0.0.1:19476/v1/models); \
+		echo "$$MODELS_JSON" | grep -q '"n_layers":2'; \
+		kill -TERM $$SPID; wait $$SPID 2>/dev/null || true; \
+		echo "  Static server verified real GGUF /health & /v1/models: $$MODELS_JSON"
 	@echo "PASSED: Standalone static ELF packaging verified!"
 
 test: test-core static-test
@@ -442,8 +501,13 @@ test-tsan: lib fixtures bin/lfm2-tsan
 	@mkdir -p bin
 	$(CC) -std=c11 -O1 -g -fsanitize=thread -fPIC -Wall -Wextra -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c) -I. tests/test_lfm2_threadpool.c -o bin/test_lfm2_threadpool_tsan -lm -lpthread
 	$(CC) -std=c11 -O1 -g -fsanitize=thread -fPIC -Wall -Wextra -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c) tests/test_threads.c src/lfm_threadpool.c src/arena.c src/lfm_simd.c src/lfm_fused.c -o bin/test_threads_tsan -lm -lpthread
-	@setarch x86_64 -R ./bin/test_lfm2_threadpool_tsan
-	@setarch x86_64 -R ./bin/test_threads_tsan
+	@if command -v setarch >/dev/null 2>&1 && setarch $$(uname -m) -R true 2>/dev/null; then \
+		setarch $$(uname -m) -R ./bin/test_lfm2_threadpool_tsan; \
+		setarch $$(uname -m) -R ./bin/test_threads_tsan; \
+	else \
+		./bin/test_lfm2_threadpool_tsan; \
+		./bin/test_threads_tsan; \
+	fi
 	@rm -f bin/test_lfm2_threadpool_tsan bin/test_threads_tsan
 	@echo "======================================================="
 	@echo "PASSED: ThreadSanitizer reports ZERO data races!       "
@@ -472,9 +536,9 @@ android:
 	fi
 	@mkdir -p lib/android-arm64-v8a
 	@echo "[ANDROID-NDK] Compiling lib/android-arm64-v8a/liblfm2.so with $(ANDROID_CC)..."
-	@$(ANDROID_CC) -std=c11 -O3 -fPIC -fvisibility=hidden -pthread -Wall -Wextra \
+	@$(ANDROID_CC) -std=c11 -O3 -fPIC -fvisibility=hidden -pthread -Wall -Wextra -Wno-unused-function \
 		-march=armv8.2-a+dotprod+fp16 \
-		-Iinclude -D_GNU_SOURCE \
+		-Iinclude -Isrc -D_GNU_SOURCE \
 		-shared -Wl,-soname,liblfm2.so \
 		-Wl,-z,max-page-size=16384 \
 		src/lfm2_api.c -o lib/android-arm64-v8a/liblfm2.so -lm -llog
@@ -499,7 +563,7 @@ test-asan:
 	@echo "Building with AddressSanitizer & UndefinedBehaviorSanitizer"
 	@echo "======================================================="
 	$(MAKE) clean
-	$(MAKE) all test-c-bins CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c)" LDFLAGS="-fsanitize=address,undefined -lm -lpthread"
+	$(MAKE) all test-c-bins CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Wno-unused-function -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c)" LDFLAGS="-fsanitize=address,undefined -lm -lpthread"
 
 help:
 	@echo "LFM2.c Production C11 Build Targets:"

@@ -392,13 +392,22 @@ LFM2_API lfm2_model_t *lfm2_model_load_from_fd(int fd, uint64_t file_size, int32
     /* Populate model info */
     const LFM2Config *c = &m->core.cfg;
     snprintf(m->info.arch, sizeof(m->info.arch), "%s", (c->n_experts > 0) ? "lfm2moe" : "lfm2");
-#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
-    snprintf(m->info.active_isa, sizeof(m->info.active_isa), "AVX2 + FMA + F16C");
-#elif defined(__aarch64__)
-    snprintf(m->info.active_isa, sizeof(m->info.active_isa), "ARM64 NEON");
-#else
-    snprintf(m->info.active_isa, sizeof(m->info.active_isa), "SCALAR");
-#endif
+    const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
+    const char *isa_str = "SCALAR";
+    if (kt && kt->isa_name) {
+        if (strstr(kt->isa_name, "AVX-VNNI") != NULL) {
+            isa_str = "AVX-VNNI + FMA + F16C";
+        } else if (strstr(kt->isa_name, "AVX2") != NULL) {
+            isa_str = "AVX2 + FMA + F16C";
+        } else if (strstr(kt->isa_name, "DOTPROD") != NULL) {
+            isa_str = (strstr(kt->isa_name, "I8MM") != NULL)
+                      ? "ARM64 NEON + DotProd + I8MM"
+                      : "ARM64 NEON + DotProd + FP16";
+        } else if (kt->quantize_q8_K != lfm2_quantize_row_q8_K_scalar) {
+            isa_str = "ARM64 NEON";
+        }
+    }
+    snprintf(m->info.active_isa, sizeof(m->info.active_isa), "%s", isa_str);
     m->info.n_layers = c->n_layers;
     uint32_t n_sc = 0;
     uint32_t n_gqa = 0;
@@ -1129,5 +1138,11 @@ LFM2_API lfm2_status_t lfm2_context_load_prompt_cache(lfm2_context_t *ctx,
     return LFM2_OK;
 }
 
+#ifndef LFM2_API_NO_SERVER
 #include "../tools/lfm2_server.c"
+#endif
+
+#if !defined(LFM2_DISABLE_JNI) && (defined(LFM2_ENABLE_JNI) || defined(__ANDROID__) || (defined(__has_include) && __has_include(<jni.h>)))
+#include "lfm2_jni.c"
+#endif
 

@@ -4,7 +4,11 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,10 +33,31 @@
 #include "../tools/lfm2_forward.c"
 #endif
 
+#ifndef LFM2_CPUID_QUANTS_INCLUDED
+#define LFM2_CPUID_QUANTS_NO_MAIN 1
+#if __has_include("tools/lfm2_cpuid_quants.c")
+#include "tools/lfm2_cpuid_quants.c"
+#elif __has_include("lfm2_cpuid_quants.c")
+#include "lfm2_cpuid_quants.c"
+#else
+#include "../tools/lfm2_cpuid_quants.c"
+#endif
+#endif
+
+#ifndef fp16_to_fp32
 #define fp16_to_fp32 lfm2_fp16_to_fp32
+#endif
+#ifndef get_scale_min_k4
 #define get_scale_min_k4 lfm2_get_scale_min_k4
+#endif
+#if LFM2_HAS_AVX2
+#ifndef hsum_epi32_avx2
 #define hsum_epi32_avx2 lfm2_hsum_epi32_avx2
+#endif
+#ifndef mm256_set_m128i
 #define mm256_set_m128i lfm2_mm256_set_m128i
+#endif
+#endif
 
 
 static inline void *lfm2_aligned_alloc(size_t align, size_t size) {
@@ -49,20 +74,22 @@ static inline void *lfm2_aligned_alloc(size_t align, size_t size) {
 #define LFM2_MAX_BATCH 8
 
 /* ============================================================================
- * 1. Batched AVX2 Q8_K Quantizer: Quantizes B Vectors [B x n_cols] at Once
+ * 1. Batched Q8_K Quantizer: Quantizes B Vectors [B x n_cols] at Once
  * ============================================================================ */
 void lfm2_quantize_batch_q8_K_avx2(const float * restrict x_batch,
                                    block_q8_K_t * restrict y_batch,
                                    uint32_t B,
                                    uint32_t n_cols) {
     const uint32_t nb = n_cols / 256;
+    const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
     for (uint32_t t = 0; t < B; ++t) {
-        lfm2_quantize_row_q8_K_avx2(x_batch + (size_t)t * n_cols,
-                                    y_batch + (size_t)t * nb,
-                                    n_cols);
+        kt->quantize_q8_K(x_batch + (size_t)t * n_cols,
+                          y_batch + (size_t)t * nb,
+                          n_cols);
     }
 }
 
+#if LFM2_HAS_AVX2
 /* ============================================================================
  * 2. Batched AVX2 Q4_K x Q8_K GEMM Micro-Kernel (Unpack Weight Once for B Tokens)
  * ============================================================================
@@ -250,6 +277,278 @@ static inline void lfm2_gemm_row_q6_K_q8_K_avx2(const block_q6_K_t * restrict w_
         out_batch[(size_t)t * n_rows + row_idx] = sumf[t];
     }
 }
+#elif defined(__aarch64__)
+
+/* ============================================================================
+ * 2. Batched ARM64 DotProd Q4_K x Q8_K GEMM Micro-Kernel
+ * ============================================================================ */
+LFM2_TARGET_ARM_DOTPROD
+static inline void lfm2_gemm_row_q4_K_q8_K_neon_dp(const block_q4_K_t * restrict w_row,
+                                                   const block_q8_K_t * restrict x_q8_batch,
+                                                   uint32_t B,
+                                                   uint32_t n_cols,
+                                                   uint32_t n_rows,
+                                                   uint32_t row_idx,
+                                                   float * restrict out_batch) {
+    const uint32_t nb = n_cols / 256;
+    const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+    const int32x4_t  vzero   = vdupq_n_s32(0);
+    float sumf[LFM2_MAX_BATCH] = {0.0f};
+
+    for (uint32_t b = 0; b < nb; ++b) {
+        const float d_super    = fp16_to_fp32_arm(w_row[b].d);
+        const float dmin_super = fp16_to_fp32_arm(w_row[b].dmin);
+        const uint8_t * restrict q4 = w_row[b].qs;
+
+        int32x4_t acc_i32[LFM2_MAX_BATCH];
+        int32_t   sum_mins[LFM2_MAX_BATCH];
+        for (uint32_t t = 0; t < B; ++t) {
+            acc_i32[t]  = vzero;
+            sum_mins[t] = 0;
+        }
+
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, w_row[b].scales, &sc1, &m1);
+            get_scale_min_k4(is + 1, w_row[b].scales, &sc2, &m2);
+
+            const uint8x16_t q4_0 = vld1q_u8(q4 +  0);
+            const uint8x16_t q4_1 = vld1q_u8(q4 + 16);
+            const int8x16_t u_lo0 = vreinterpretq_s8_u8(vandq_u8(q4_0, mask_0f));
+            const int8x16_t u_lo1 = vreinterpretq_s8_u8(vandq_u8(q4_1, mask_0f));
+            const int8x16_t u_hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q4_0, 4));
+            const int8x16_t u_hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q4_1, 4));
+
+            for (uint32_t t = 0; t < B; ++t) {
+                const block_q8_K_t *xb_q8 = &x_q8_batch[(size_t)t * nb + b];
+                const int16_t * restrict bs = xb_q8->bsums;
+                sum_mins[t] += (int32_t)m1 * ((int32_t)bs[2 * is + 0] + (int32_t)bs[2 * is + 1])
+                             + (int32_t)m2 * ((int32_t)bs[2 * is + 2] + (int32_t)bs[2 * is + 3]);
+
+                const int8_t * restrict q8 = xb_q8->qs + j;
+                const int32x4_t dot_lo = vdotq_s32(
+                    vdotq_s32(vzero, u_lo0, vld1q_s8(q8 +  0)), u_lo1, vld1q_s8(q8 + 16));
+                const int32x4_t dot_hi = vdotq_s32(
+                    vdotq_s32(vzero, u_hi0, vld1q_s8(q8 + 32)), u_hi1, vld1q_s8(q8 + 48));
+
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], dot_lo, (int32_t)sc1);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], dot_hi, (int32_t)sc2);
+            }
+
+            q4 += 32;
+            is += 2;
+        }
+
+        for (uint32_t t = 0; t < B; ++t) {
+            const float d8 = x_q8_batch[(size_t)t * nb + b].d;
+            if (d8 != 0.0f) {
+                const int32_t sum_q4q8 = vaddvq_s32(acc_i32[t]);
+                sumf[t] += (d_super * d8) * (float)sum_q4q8 - (dmin_super * d8) * (float)sum_mins[t];
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < B; ++t) {
+        out_batch[(size_t)t * n_rows + row_idx] = sumf[t];
+    }
+}
+
+/* ============================================================================
+ * 3. Batched ARM64 DotProd Q6_K x Q8_K GEMM Micro-Kernel
+ * ============================================================================ */
+LFM2_TARGET_ARM_DOTPROD
+static inline void lfm2_gemm_row_q6_K_q8_K_neon_dp(const block_q6_K_t * restrict w_row,
+                                                   const block_q8_K_t * restrict x_q8_batch,
+                                                   uint32_t B,
+                                                   uint32_t n_cols,
+                                                   uint32_t n_rows,
+                                                   uint32_t row_idx,
+                                                   float * restrict out_batch) {
+    const uint32_t nb = n_cols / 256;
+    const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+    const uint8x16_t mask_30 = vdupq_n_u8(0x30);
+    const int32x4_t  vzero   = vdupq_n_s32(0);
+    float sumf[LFM2_MAX_BATCH] = {0.0f};
+
+    for (uint32_t b = 0; b < nb; ++b) {
+        const float d_super = fp16_to_fp32_arm(w_row[b].d);
+        const uint8_t * restrict ql = w_row[b].ql;
+        const uint8_t * restrict qh = w_row[b].qh;
+        const int8_t  * restrict sc = w_row[b].scales;
+
+        int32_t sum_offset[LFM2_MAX_BATCH] = {0};
+        int32x4_t acc_i32[LFM2_MAX_BATCH];
+
+        for (uint32_t t = 0; t < B; ++t) {
+            acc_i32[t] = vzero;
+            const int16_t * restrict bs = x_q8_batch[(size_t)t * nb + b].bsums;
+            int32_t off = 0;
+            for (int is = 0; is < 16; ++is) off += (int32_t)sc[is] * (int32_t)bs[is];
+            sum_offset[t] = off;
+        }
+
+        for (int half = 0; half < 2; ++half) {
+            const uint8x16_t ql0_0 = vld1q_u8(ql +  0), ql0_1 = vld1q_u8(ql + 16);
+            const uint8x16_t ql1_0 = vld1q_u8(ql + 32), ql1_1 = vld1q_u8(ql + 48);
+            const uint8x16_t qh_0  = vld1q_u8(qh +  0), qh_1  = vld1q_u8(qh + 16);
+
+            const int8x16_t u0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0_0, mask_0f), vandq_u8(vshlq_n_u8(qh_0, 4), mask_30)));
+            const int8x16_t u1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0_1, mask_0f), vandq_u8(vshlq_n_u8(qh_1, 4), mask_30)));
+            const int8x16_t u2 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql1_0, mask_0f), vandq_u8(vshlq_n_u8(qh_0, 2), mask_30)));
+            const int8x16_t u3 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql1_1, mask_0f), vandq_u8(vshlq_n_u8(qh_1, 2), mask_30)));
+            const int8x16_t u4 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql0_0, 4),  vandq_u8(qh_0, mask_30)));
+            const int8x16_t u5 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql0_1, 4),  vandq_u8(qh_1, mask_30)));
+            const int8x16_t u6 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql1_0, 4),  vandq_u8(vshrq_n_u8(qh_0, 2), mask_30)));
+            const int8x16_t u7 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql1_1, 4),  vandq_u8(vshrq_n_u8(qh_1, 2), mask_30)));
+
+            const int half_off = half * 128;
+            for (uint32_t t = 0; t < B; ++t) {
+                const int8_t * restrict q8 = x_q8_batch[(size_t)t * nb + b].qs + half_off;
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u0, vld1q_s8(q8 +   0)), (int32_t)sc[0]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u1, vld1q_s8(q8 +  16)), (int32_t)sc[1]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u2, vld1q_s8(q8 +  32)), (int32_t)sc[2]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u3, vld1q_s8(q8 +  48)), (int32_t)sc[3]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u4, vld1q_s8(q8 +  64)), (int32_t)sc[4]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u5, vld1q_s8(q8 +  80)), (int32_t)sc[5]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u6, vld1q_s8(q8 +  96)), (int32_t)sc[6]);
+                acc_i32[t] = vmlaq_n_s32(acc_i32[t], vdotq_s32(vzero, u7, vld1q_s8(q8 + 112)), (int32_t)sc[7]);
+            }
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+
+        for (uint32_t t = 0; t < B; ++t) {
+            const float d8 = x_q8_batch[(size_t)t * nb + b].d;
+            if (d8 != 0.0f) {
+                const int32_t sum_u6q8 = vaddvq_s32(acc_i32[t]);
+                sumf[t] += (d_super * d8) * (float)(sum_u6q8 - 32 * sum_offset[t]);
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < B; ++t) {
+        out_batch[(size_t)t * n_rows + row_idx] = sumf[t];
+    }
+}
+
+static inline void lfm2_gemm_row_f32_neon(const float * restrict w_row,
+                                          const float * restrict x_f32_batch,
+                                          uint32_t B,
+                                          uint32_t n_cols,
+                                          uint32_t n_rows,
+                                          uint32_t row_idx,
+                                          float * restrict out_batch) {
+    float32x4_t acc[LFM2_MAX_BATCH];
+    for (uint32_t t = 0; t < B; ++t) acc[t] = vdupq_n_f32(0.0f);
+
+    uint32_t i = 0;
+    for (; i + 4 <= n_cols; i += 4) {
+        const float32x4_t vw = vld1q_f32(w_row + i);
+        for (uint32_t t = 0; t < B; ++t) {
+            const float32x4_t vx = vld1q_f32(x_f32_batch + (size_t)t * n_cols + i);
+            acc[t] = vfmaq_f32(acc[t], vw, vx);
+        }
+    }
+    for (uint32_t t = 0; t < B; ++t) {
+        float sum = vaddvq_f32(acc[t]);
+        for (uint32_t k = i; k < n_cols; ++k) {
+            sum += w_row[k] * x_f32_batch[(size_t)t * n_cols + k];
+        }
+        out_batch[(size_t)t * n_rows + row_idx] = sum;
+    }
+}
+#endif
+
+static inline void lfm2_matmul_batch_dispatch_row(const void * restrict w_data,
+                                                  uint32_t w_type,
+                                                  const float * restrict x_f32_batch,
+                                                  const block_q8_K_t * restrict x_q8_batch,
+                                                  uint32_t B,
+                                                  uint32_t n_cols,
+                                                  uint32_t n_rows,
+                                                  uint32_t r,
+                                                  float * restrict out_batch) {
+    const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
+    const uint32_t nb_k = n_cols / 256;
+
+    if (w_type == GGML_TYPE_Q4_K) {
+        const size_t row_blocks = n_cols / 256;
+        const block_q4_K_t *w_row = (const block_q4_K_t *)w_data + (size_t)r * row_blocks;
+        if (B == 1) {
+            out_batch[r] = kt->vec_dot_1x1[GGML_TYPE_Q4_K](w_row, x_q8_batch, n_cols);
+        } else {
+#if LFM2_HAS_AVX2
+            if (kt->has_avx2 && kt->has_fma && kt->has_f16c &&
+                kt->vec_dot_1x1[GGML_TYPE_Q4_K] != lfm2_vec_dot_q4_K_q8_K_scalar) {
+                lfm2_gemm_row_q4_K_q8_K_avx2(w_row, x_q8_batch, B, n_cols, n_rows, r, out_batch);
+                return;
+            }
+#elif defined(__aarch64__)
+            if (kt->vec_dot_1x1[GGML_TYPE_Q4_K] != lfm2_vec_dot_q4_K_q8_K_scalar) {
+                lfm2_gemm_row_q4_K_q8_K_neon_dp(w_row, x_q8_batch, B, n_cols, n_rows, r, out_batch);
+                return;
+            }
+#endif
+            for (uint32_t t = 0; t < B; ++t) {
+                out_batch[(size_t)t * n_rows + r] =
+                    kt->vec_dot_1x1[GGML_TYPE_Q4_K](w_row, x_q8_batch + (size_t)t * nb_k, n_cols);
+            }
+        }
+    } else if (w_type == GGML_TYPE_Q6_K) {
+        const size_t row_blocks = n_cols / 256;
+        const block_q6_K_t *w_row = (const block_q6_K_t *)w_data + (size_t)r * row_blocks;
+        if (B == 1) {
+            out_batch[r] = kt->vec_dot_1x1[GGML_TYPE_Q6_K](w_row, x_q8_batch, n_cols);
+        } else {
+#if LFM2_HAS_AVX2
+            if (kt->has_avx2 && kt->has_fma && kt->has_f16c &&
+                kt->vec_dot_1x1[GGML_TYPE_Q6_K] != lfm2_vec_dot_q6_K_q8_K_scalar) {
+                lfm2_gemm_row_q6_K_q8_K_avx2(w_row, x_q8_batch, B, n_cols, n_rows, r, out_batch);
+                return;
+            }
+#elif defined(__aarch64__)
+            if (kt->vec_dot_1x1[GGML_TYPE_Q6_K] != lfm2_vec_dot_q6_K_q8_K_scalar) {
+                lfm2_gemm_row_q6_K_q8_K_neon_dp(w_row, x_q8_batch, B, n_cols, n_rows, r, out_batch);
+                return;
+            }
+#endif
+            for (uint32_t t = 0; t < B; ++t) {
+                out_batch[(size_t)t * n_rows + r] =
+                    kt->vec_dot_1x1[GGML_TYPE_Q6_K](w_row, x_q8_batch + (size_t)t * nb_k, n_cols);
+            }
+        }
+    } else if (w_type == GGML_TYPE_Q8_0 || w_type == GGML_TYPE_Q4_0 ||
+               w_type == GGML_TYPE_Q5_K || w_type == GGML_TYPE_IQ4_XS) {
+        ggml_type_traits_t traits;
+        get_ggml_type_traits(w_type, &traits);
+        const size_t row_bytes = ((size_t)n_cols / traits.block_elements) * traits.block_bytes;
+        const uint8_t *w_row = (const uint8_t *)w_data + (size_t)r * row_bytes;
+        for (uint32_t t = 0; t < B; ++t) {
+            out_batch[(size_t)t * n_rows + r] =
+                kt->vec_dot_1x1[w_type](w_row, x_q8_batch + (size_t)t * nb_k, n_cols);
+        }
+    } else if (w_type == GGML_TYPE_F32) {
+        const float *w_row = (const float *)w_data + (size_t)r * n_cols;
+#if defined(__aarch64__)
+        lfm2_gemm_row_f32_neon(w_row, x_f32_batch, B, n_cols, n_rows, r, out_batch);
+#elif defined(__x86_64__) || defined(_M_X64)
+        for (uint32_t t = 0; t < B; ++t) {
+            out_batch[(size_t)t * n_rows + r] =
+                lfm2_vec_dot_f32_avx2(w_row, x_f32_batch + (size_t)t * n_cols, n_cols);
+        }
+#else
+        for (uint32_t t = 0; t < B; ++t) {
+            float sum = 0.0f;
+            const float *xb = x_f32_batch + (size_t)t * n_cols;
+            for (uint32_t k = 0; k < n_cols; ++k) sum += w_row[k] * xb[k];
+            out_batch[(size_t)t * n_rows + r] = sum;
+        }
+#endif
+    }
+}
 
 /* ============================================================================
  * 4. Multi-Threaded Batched GEMM Dispatcher (Spin-Barrier Pool)
@@ -270,63 +569,14 @@ static void lfm2_matmul_batch_worker_task(void *arg, uint32_t tid, uint32_t n_th
     (void)tid; (void)n_threads;
     BatchMatMulTaskCtx *ctx  = (BatchMatMulTaskCtx *)arg;
     LFM2ThreadPool     *pool = ctx->pool;
-    const uint32_t      B    = ctx->B;
-
     uint32_t r_start = 0, r_end = 0;
 
-    if (ctx->w_type == GGML_TYPE_Q4_K) {
-        const size_t row_blocks = ctx->n_cols / 256;
-        const block_q4_K_t *W   = (const block_q4_K_t *)ctx->w_data;
-        while (lfm2_threadpool_claim_chunk(pool, &r_start, &r_end)) {
-            for (uint32_t r = r_start; r < r_end; ++r) {
-                if (B == 1) {
-                    ctx->out_batch[r] = lfm2_vec_dot_q4_K_q8_K_avx2(
-                        W + (size_t)r * row_blocks, ctx->x_q8_batch, ctx->n_cols);
-                } else {
-                    lfm2_gemm_row_q4_K_q8_K_avx2(
-                        W + (size_t)r * row_blocks, ctx->x_q8_batch,
-                        B, ctx->n_cols, ctx->n_rows, r, ctx->out_batch);
-                }
-            }
-        }
-    } else if (ctx->w_type == GGML_TYPE_Q6_K) {
-        const size_t row_blocks = ctx->n_cols / 256;
-        const block_q6_K_t *W   = (const block_q6_K_t *)ctx->w_data;
-        while (lfm2_threadpool_claim_chunk(pool, &r_start, &r_end)) {
-            for (uint32_t r = r_start; r < r_end; ++r) {
-                if (B == 1) {
-                    ctx->out_batch[r] = lfm2_vec_dot_q6_K_q8_K_avx2(
-                        W + (size_t)r * row_blocks, ctx->x_q8_batch, ctx->n_cols);
-                } else {
-                    lfm2_gemm_row_q6_K_q8_K_avx2(
-                        W + (size_t)r * row_blocks, ctx->x_q8_batch,
-                        B, ctx->n_cols, ctx->n_rows, r, ctx->out_batch);
-                }
-            }
-        }
-    } else if (ctx->w_type == GGML_TYPE_Q8_0) {
-        const size_t row_blocks = ctx->n_cols / 32;
-        const uint32_t nb_k     = ctx->n_cols / 256;
-        const block_q8_0_t *W   = (const block_q8_0_t *)ctx->w_data;
-        while (lfm2_threadpool_claim_chunk(pool, &r_start, &r_end)) {
-            for (uint32_t r = r_start; r < r_end; ++r) {
-                const block_q8_0_t *w_row = W + (size_t)r * row_blocks;
-                for (uint32_t t = 0; t < B; ++t) {
-                    ctx->out_batch[(size_t)t * ctx->n_rows + r] =
-                        lfm2_vec_dot_q8_0_q8_K_avx2(w_row, ctx->x_q8_batch + (size_t)t * nb_k, ctx->n_cols);
-                }
-            }
-        }
-    } else if (ctx->w_type == GGML_TYPE_F32) {
-        const float *W = (const float *)ctx->w_data;
-        while (lfm2_threadpool_claim_chunk(pool, &r_start, &r_end)) {
-            for (uint32_t r = r_start; r < r_end; ++r) {
-                const float *w_row = W + (size_t)r * ctx->n_cols;
-                for (uint32_t t = 0; t < B; ++t) {
-                    ctx->out_batch[(size_t)t * ctx->n_rows + r] =
-                        lfm2_vec_dot_f32_avx2(w_row, ctx->x_f32_batch + (size_t)t * ctx->n_cols, ctx->n_cols);
-                }
-            }
+    while (lfm2_threadpool_claim_chunk(pool, &r_start, &r_end)) {
+        for (uint32_t r = r_start; r < r_end; ++r) {
+            lfm2_matmul_batch_dispatch_row(
+                ctx->w_data, ctx->w_type,
+                ctx->x_f32_batch, ctx->x_q8_batch,
+                ctx->B, ctx->n_cols, ctx->n_rows, r, ctx->out_batch);
         }
     }
 }
@@ -340,57 +590,16 @@ void lfm2_matmul_batch_avx2_mt(LFM2ThreadPool *pool,
     const uint32_t n_cols = (uint32_t)W->ne[0];
     const uint32_t n_rows = (uint32_t)W->ne[1];
 
-    if (W->type == GGML_TYPE_Q4_K || W->type == GGML_TYPE_Q6_K || W->type == GGML_TYPE_Q8_0) {
+    if (W->type == GGML_TYPE_Q4_K || W->type == GGML_TYPE_Q6_K ||
+        W->type == GGML_TYPE_Q8_0 || W->type == GGML_TYPE_Q4_0 ||
+        W->type == GGML_TYPE_Q5_K || W->type == GGML_TYPE_IQ4_XS) {
         lfm2_quantize_batch_q8_K_avx2(x_batch, xq_scratch, B, n_cols);
     }
 
     if (!pool || pool->n_threads <= 1) {
-        if (W->type == GGML_TYPE_Q4_K) {
-            const size_t row_blocks = n_cols / 256;
-            const block_q4_K_t *W_q4 = (const block_q4_K_t *)W->data;
-            for (uint32_t r = 0; r < n_rows; ++r) {
-                if (B == 1) {
-                    out_batch[r] = lfm2_vec_dot_q4_K_q8_K_avx2(
-                        W_q4 + (size_t)r * row_blocks, xq_scratch, n_cols);
-                } else {
-                    lfm2_gemm_row_q4_K_q8_K_avx2(
-                        W_q4 + (size_t)r * row_blocks, xq_scratch,
-                        B, n_cols, n_rows, r, out_batch);
-                }
-            }
-        } else if (W->type == GGML_TYPE_Q6_K) {
-            const size_t row_blocks = n_cols / 256;
-            const block_q6_K_t *W_q6 = (const block_q6_K_t *)W->data;
-            for (uint32_t r = 0; r < n_rows; ++r) {
-                if (B == 1) {
-                    out_batch[r] = lfm2_vec_dot_q6_K_q8_K_avx2(
-                        W_q6 + (size_t)r * row_blocks, xq_scratch, n_cols);
-                } else {
-                    lfm2_gemm_row_q6_K_q8_K_avx2(
-                        W_q6 + (size_t)r * row_blocks, xq_scratch,
-                        B, n_cols, n_rows, r, out_batch);
-                }
-            }
-        } else if (W->type == GGML_TYPE_Q8_0) {
-            const size_t row_blocks = n_cols / 32;
-            const uint32_t nb_k     = n_cols / 256;
-            const block_q8_0_t *W_q8 = (const block_q8_0_t *)W->data;
-            for (uint32_t r = 0; r < n_rows; ++r) {
-                const block_q8_0_t *w_row = W_q8 + (size_t)r * row_blocks;
-                for (uint32_t t = 0; t < B; ++t) {
-                    out_batch[(size_t)t * n_rows + r] =
-                        lfm2_vec_dot_q8_0_q8_K_avx2(w_row, xq_scratch + (size_t)t * nb_k, n_cols);
-                }
-            }
-        } else if (W->type == GGML_TYPE_F32) {
-            const float *W_f32 = (const float *)W->data;
-            for (uint32_t r = 0; r < n_rows; ++r) {
-                const float *w_row = W_f32 + (size_t)r * n_cols;
-                for (uint32_t t = 0; t < B; ++t) {
-                    out_batch[(size_t)t * n_rows + r] =
-                        lfm2_vec_dot_f32_avx2(w_row, x_batch + (size_t)t * n_cols, n_cols);
-                }
-            }
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            lfm2_matmul_batch_dispatch_row(
+                W->data, W->type, x_batch, xq_scratch, B, n_cols, n_rows, r, out_batch);
         }
         return;
     }
@@ -574,6 +783,22 @@ void lfm2_batch_state_free(LFM2BatchState *s) {
  * 6. Batched Hybrid Layer Operators (ShortConv, GQA, SwiGLU)
  * ============================================================================ */
 
+static inline void lfm2_vec_add_f32(float * restrict dst, const float * restrict src, size_t n) {
+    size_t i = 0;
+#if LFM2_HAS_AVX2
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), _mm256_loadu_ps(src + i)));
+    }
+#elif defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(dst + i, vaddq_f32(vld1q_f32(dst + i), vld1q_f32(src + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] += src[i];
+    }
+}
+
 static inline void lfm2_rmsnorm_batch(float *out_batch, const float *x_batch,
                                       const GGUFTensor *w_tensor, uint32_t B,
                                       uint32_t dim, float eps) {
@@ -602,8 +827,9 @@ static inline void lfm2_qk_norm_and_rope_table(const float *rope_cos, const floa
 
         /* 2. NeoX RoPE */
         if (cos_table && sin_table) {
+            uint32_t i = 0;
 #if LFM2_HAS_AVX2
-            for (uint32_t i = 0; i < half_dim; i += 8) {
+            for (; i + 8 <= half_dim; i += 8) {
                 __m256 vx0  = _mm256_loadu_ps(head + i);
                 __m256 vx1  = _mm256_loadu_ps(head + half_dim + i);
                 __m256 vcos = _mm256_loadu_ps(cos_table + i);
@@ -615,8 +841,21 @@ static inline void lfm2_qk_norm_and_rope_table(const float *rope_cos, const floa
                 _mm256_storeu_ps(head + i, vout0);
                 _mm256_storeu_ps(head + half_dim + i, vout1);
             }
-#else
-            for (uint32_t i = 0; i < half_dim; ++i) {
+#elif defined(__aarch64__)
+            for (; i + 4 <= half_dim; i += 4) {
+                float32x4_t vx0  = vld1q_f32(head + i);
+                float32x4_t vx1  = vld1q_f32(head + half_dim + i);
+                float32x4_t vcos = vld1q_f32(cos_table + i);
+                float32x4_t vsin = vld1q_f32(sin_table + i);
+
+                float32x4_t vout0 = vfmsq_f32(vmulq_f32(vx0, vcos), vx1, vsin);
+                float32x4_t vout1 = vfmaq_f32(vmulq_f32(vx1, vcos), vx0, vsin);
+
+                vst1q_f32(head + i, vout0);
+                vst1q_f32(head + half_dim + i, vout1);
+            }
+#endif
+            for (; i < half_dim; ++i) {
                 const float cos_a = cos_table[i];
                 const float sin_a = sin_table[i];
                 const float x0 = head[i];
@@ -624,7 +863,6 @@ static inline void lfm2_qk_norm_and_rope_table(const float *rope_cos, const floa
                 head[i]            = x0 * cos_a - x1 * sin_a;
                 head[i + half_dim] = x1 * cos_a + x0 * sin_a;
             }
-#endif
         } else {
             for (uint32_t i = 0; i < half_dim; ++i) {
                 const float freq  = powf(10000.0f, -((float)(2 * i) / (float)head_dim));
@@ -668,8 +906,9 @@ static void lfm2_forward_shortconv_batch(LFM2BatchState *s, const LFM2Model *m,
         if (w0 && w1 && w2 && hist == 2) {
             const float *s0 = state;
             const float *s1 = state + D;
+            uint32_t d = 0;
 #if LFM2_HAS_AVX2
-            for (uint32_t d = 0; d < D; d += 8) {
+            for (; d + 8 <= D; d += 8) {
                 __m256 vb = _mm256_loadu_ps(B_gate + d);
                 __m256 vx = _mm256_loadu_ps(x_tilde + d);
                 __m256 vu = _mm256_mul_ps(vb, vx);
@@ -687,14 +926,31 @@ static void lfm2_forward_shortconv_batch(LFM2BatchState *s, const LFM2Model *m,
                 __m256 vout = _mm256_mul_ps(vc, vacc);
                 _mm256_storeu_ps(out_t + d, vout);
             }
-#else
-            for (uint32_t d = 0; d < D; ++d) {
+#elif defined(__aarch64__)
+            for (; d + 4 <= D; d += 4) {
+                float32x4_t vb = vld1q_f32(B_gate + d);
+                float32x4_t vx = vld1q_f32(x_tilde + d);
+                float32x4_t vu = vmulq_f32(vb, vx);
+                vst1q_f32(B_gate + d, vu);
+
+                float32x4_t vw0 = vld1q_f32(w0 + d);
+                float32x4_t vs0 = vld1q_f32(s0 + d);
+                float32x4_t vw1 = vld1q_f32(w1 + d);
+                float32x4_t vs1 = vld1q_f32(s1 + d);
+                float32x4_t vw2 = vld1q_f32(w2 + d);
+                float32x4_t vc  = vld1q_f32(C_gate + d);
+
+                float32x4_t vacc = vfmaq_f32(vmulq_f32(vw1, vs1), vw0, vs0);
+                vacc = vfmaq_f32(vacc, vw2, vu);
+                vst1q_f32(out_t + d, vmulq_f32(vc, vacc));
+            }
+#endif
+            for (; d < D; ++d) {
                 float u = B_gate[d] * x_tilde[d];
                 B_gate[d] = u;
                 float acc = w0[d] * s0[d] + w1[d] * s1[d] + w2[d] * u;
                 out_t[d] = C_gate[d] * acc;
             }
-#endif
         } else {
             const GGUFTensor *conv_t = layer->shortconv.conv;
             const bool stride_is_lcache = (conv_t->ne[0] == l_cache);
@@ -733,11 +989,7 @@ static void lfm2_forward_shortconv_batch(LFM2BatchState *s, const LFM2Model *m,
 
     /* 3. Batched Output Projection: conv_out [B, D] -> xb [B, D] + Residual Add */
     lfm2_matmul_batch_avx2_mt(&s->pool, s->xb, layer->shortconv.out_proj, s->conv_out, B, s->xq);
-
-    const size_t total = (size_t)B * D;
-    for (size_t i = 0; i < total; ++i) {
-        s->x[i] += s->xb[i];
-    }
+    lfm2_vec_add_f32(s->x, s->xb, (size_t)B * D);
 }
 
 /* Batched GQA Block:
@@ -781,14 +1033,28 @@ static void lfm2_forward_gqa_batch(LFM2BatchState *s, const LFM2Model *m,
         if (s->k_cache_f16[l_idx] && s->v_cache_f16[l_idx]) {
             uint16_t *k_step = s->k_cache_f16[l_idx] + (size_t)pos * kv_dim;
             uint16_t *v_step = s->v_cache_f16[l_idx] + (size_t)pos * kv_dim;
+            uint32_t i = 0;
 #if defined(__F16C__)
-            for (uint32_t i = 0; i < kv_dim; i += 8) {
+            for (; i + 8 <= kv_dim; i += 8) {
                 __m256 vk = _mm256_loadu_ps(k_t + i);
                 __m256 vv = _mm256_loadu_ps(v_t + i);
                 _mm_storeu_si128((__m128i *)(k_step + i), _mm256_cvtps_ph(vk, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
                 _mm_storeu_si128((__m128i *)(v_step + i), _mm256_cvtps_ph(vv, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
             }
+#elif defined(__aarch64__)
+            for (; i + 8 <= kv_dim; i += 8) {
+                float16x4_t hk0 = vcvt_f16_f32(vld1q_f32(k_t + i + 0));
+                float16x4_t hk1 = vcvt_f16_f32(vld1q_f32(k_t + i + 4));
+                float16x4_t hv0 = vcvt_f16_f32(vld1q_f32(v_t + i + 0));
+                float16x4_t hv1 = vcvt_f16_f32(vld1q_f32(v_t + i + 4));
+                vst1q_u16(k_step + i, vreinterpretq_u16_f16(vcombine_f16(hk0, hk1)));
+                vst1q_u16(v_step + i, vreinterpretq_u16_f16(vcombine_f16(hv0, hv1)));
+            }
 #endif
+            for (; i < kv_dim; ++i) {
+                k_step[i] = lfm2_fp32_to_fp16(k_t[i]);
+                v_step[i] = lfm2_fp32_to_fp16(v_t[i]);
+            }
         }
 
         GQAAttnTaskCtx gqa_ctx = {
@@ -813,11 +1079,7 @@ static void lfm2_forward_gqa_batch(LFM2BatchState *s, const LFM2Model *m,
 
     /* 3. Batched Output Projection: xb [B, D] -> conv_out [B, D] + Residual Add */
     lfm2_matmul_batch_avx2_mt(&s->pool, s->conv_out, layer->attn.wo, s->xb, B, s->xq);
-
-    const size_t total = (size_t)B * D;
-    for (size_t i = 0; i < total; ++i) {
-        s->x[i] += s->conv_out[i];
-    }
+    lfm2_vec_add_f32(s->x, s->conv_out, (size_t)B * D);
 }
 
 /* Batched SwiGLU FFN Block */
@@ -840,11 +1102,7 @@ static void lfm2_forward_ffn_batch(LFM2BatchState *s, const LFM2Model *m,
 
     /* Batched Down Projection: hb [B, n_ff] -> xb [B, D] + Residual Add */
     lfm2_matmul_batch_avx2_mt(&s->pool, s->xb, layer->ffn_down, s->hb, B, s->xq);
-
-    const size_t total_d = (size_t)B * D;
-    for (size_t i = 0; i < total_d; ++i) {
-        s->x[i] += s->xb[i];
-    }
+    lfm2_vec_add_f32(s->x, s->xb, (size_t)B * D);
 }
 
 /* ============================================================================
@@ -890,7 +1148,14 @@ float *lfm2_forward_batch(const LFM2Model *m,
     /* Project ONLY the last token in the batch (index B - 1) through the LM head */
     float *last_x = s->x + (size_t)(B - 1) * D;
     lfm2_rmsnorm(last_x, last_x, m->output_norm, D, m->cfg.rms_norm_eps);
-    lfm2_matmul_vec(s->logits, m->output, last_x, (block_q8_K_t *)s->xq, &s->pool);
+    if (m->output->type == GGML_TYPE_Q4_K || m->output->type == GGML_TYPE_Q6_K ||
+        m->output->type == GGML_TYPE_Q8_0 || m->output->type == GGML_TYPE_Q4_0 ||
+        m->output->type == GGML_TYPE_Q5_K || m->output->type == GGML_TYPE_IQ4_XS ||
+        m->output->type == GGML_TYPE_F32) {
+        lfm2_matmul_batch_avx2_mt(&s->pool, s->logits, m->output, last_x, 1, (block_q8_K_t *)s->xq);
+    } else {
+        lfm2_matmul_vec(s->logits, m->output, last_x, (block_q8_K_t *)s->xq, &s->pool);
+    }
     return s->logits;
 }
 

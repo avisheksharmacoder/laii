@@ -143,12 +143,12 @@ def _find_liblfm2(lib_path: str | Path | None = None) -> Path:
     if lib_path is not None:
         p = Path(lib_path)
         if p.exists():
-            return p
+            return p.resolve()
 
     # 1. Check explicit environment override
     env_path = os.environ.get("LFM2_LIB_PATH")
     if env_path and Path(env_path).exists():
-        return Path(env_path)
+        return Path(env_path).resolve()
 
     # 2. Package directory (for wheel/pip installed distributions) and workspace
     pkg_dir = Path(__file__).resolve().parent
@@ -172,7 +172,7 @@ def _find_liblfm2(lib_path: str | Path | None = None) -> Path:
 
     for c in candidates:
         if c.exists():
-            return c
+            return c.resolve()
 
     # 4. System library fallback via ld.so
     sys_lib = ctypes.util.find_library("lfm2")
@@ -589,7 +589,7 @@ class LFM2Context:
                 ctypes.byref(self._out_phase),
             )
             if self._out_len.value > 0:
-                yield self._utf8_buf.raw[: self._out_len.value].decode("utf-8")
+                yield self._utf8_buf.raw[: self._out_len.value].decode("utf-8", errors="replace")
                 tokens_emitted += 1
                 if max_tokens > 0 and tokens_emitted >= max_tokens:
                     break

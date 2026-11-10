@@ -8,8 +8,15 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -194,9 +201,21 @@ static inline int get_scale_iq4_xs(int ib, const uint8_t scales_l[4], uint16_t s
 }
 #endif
 
+#if defined(__aarch64__)
+#define LFM2_SIMD_ARM64_NO_MAIN 1
+#if __has_include("tools/lfm2_simd_arm64.c")
+#include "tools/lfm2_simd_arm64.c"
+#elif __has_include("lfm2_simd_arm64.c")
+#include "lfm2_simd_arm64.c"
+#else
+#include "../tools/lfm2_simd_arm64.c"
+#endif
+#endif
+
 /* ============================================================================
  * 3. Portable Scalar Fallback Kernels (ISA_SCALAR)
  * ============================================================================ */
+#ifndef LFM2_SIMD_ARM64_INCLUDED
 static inline void lfm2_quantize_row_q8_K_scalar(const float * restrict x,
                                                  block_q8_K_t * restrict y,
                                                  uint32_t n_cols) {
@@ -343,6 +362,7 @@ static inline float lfm2_vec_dot_iq4_xs_q8_K_scalar(const void * restrict w_raw,
     }
     return sumf;
 }
+#endif /* !LFM2_SIMD_ARM64_INCLUDED */
 
 static inline void lfm2_vec_dot_q4_0_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
                                                      const block_q8_K_t * restrict x_q8,
@@ -365,6 +385,7 @@ static inline void lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar(const void * restrict w_r
     for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_iq4_xs_q8_K_scalar(w + k * rb, x_q8, n_cols);
 }
 
+#ifndef LFM2_SIMD_ARM64_INCLUDED
 static inline float lfm2_vec_dot_q8_0_q8_K_scalar(const void * restrict w_raw,
                                                   const block_q8_K_t * restrict x_q8,
                                                   uint32_t n_cols) {
@@ -387,6 +408,7 @@ static inline float lfm2_vec_dot_q8_0_q8_K_scalar(const void * restrict w_raw,
     }
     return sumf;
 }
+#endif /* !LFM2_SIMD_ARM64_INCLUDED */
 
 static inline void lfm2_vec_dot_q8_0_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
                                                      const block_q8_K_t * restrict x_q8,
@@ -395,6 +417,7 @@ static inline void lfm2_vec_dot_q8_0_q8_K_1x4_scalar(const void * restrict w_raw
     for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q8_0_q8_K_scalar(w + k * rb, x_q8, n_cols);
 }
 
+#ifndef LFM2_SIMD_ARM64_INCLUDED
 static inline float lfm2_vec_dot_q4_K_q8_K_scalar(const void * restrict w_raw,
                                                   const block_q8_K_t * restrict x_q8,
                                                   uint32_t n_cols) {
@@ -431,6 +454,7 @@ static inline float lfm2_vec_dot_q4_K_q8_K_scalar(const void * restrict w_raw,
     }
     return sumf;
 }
+#endif /* !LFM2_SIMD_ARM64_INCLUDED */
 
 static inline void lfm2_vec_dot_q4_K_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
                                                      const block_q8_K_t * restrict x_q8,
@@ -439,6 +463,7 @@ static inline void lfm2_vec_dot_q4_K_q8_K_1x4_scalar(const void * restrict w_raw
     for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q4_K_q8_K_scalar(w + k * rb, x_q8, n_cols);
 }
 
+#ifndef LFM2_SIMD_ARM64_INCLUDED
 static inline float lfm2_vec_dot_q6_K_q8_K_scalar(const void * restrict w_raw,
                                                   const block_q8_K_t * restrict x_q8,
                                                   uint32_t n_cols) {
@@ -481,6 +506,7 @@ static inline float lfm2_vec_dot_q6_K_q8_K_scalar(const void * restrict w_raw,
     }
     return sumf;
 }
+#endif /* !LFM2_SIMD_ARM64_INCLUDED */
 
 static inline void lfm2_vec_dot_q6_K_q8_K_1x4_scalar(const void * restrict w_raw0, size_t rb,
                                                      const block_q8_K_t * restrict x_q8,
@@ -489,6 +515,7 @@ static inline void lfm2_vec_dot_q6_K_q8_K_1x4_scalar(const void * restrict w_raw
     for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q6_K_q8_K_scalar(w + k * rb, x_q8, n_cols);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 /* ============================================================================
  * 4. Target-Attributed AVX2 + FMA + F16C Kernels (Safe Multi-ISA Target)
  * ============================================================================ */
@@ -1712,10 +1739,13 @@ void lfm2_vec_dot_q8_0_q8_K_1x4_avx_vnni(const void * restrict w_raw0, size_t rb
     const block_q8_0_t *w = (const block_q8_0_t *)w_raw0;
     for (int k = 0; k < 4; ++k) out4[k] = lfm2_vec_dot_q8_0_q8_K_avx_vnni(w + k * rb, x_q8, n_cols);
 }
+#endif /* __x86_64__ || _M_X64 */
 
 /* ============================================================================
  * 5. Runtime CPUID Inspector & Multi-ISA Kernel Dispatch Table
  * ============================================================================ */
+#ifndef LFM2_KERNEL_FN_TYPES_DEFINED
+#define LFM2_KERNEL_FN_TYPES_DEFINED
 typedef void  (*lfm2_quantize_q8_K_fn)(const float * restrict x,
                                        block_q8_K_t * restrict y,
                                        uint32_t n_cols);
@@ -1729,6 +1759,7 @@ typedef void  (*lfm2_vec_dot_1x4_fn)(const void * restrict w_row0,
                                      const block_q8_K_t * restrict x_q8,
                                      uint32_t n_cols,
                                      float out4[4]);
+#endif
 
 typedef struct {
     const char *isa_name;
@@ -1745,6 +1776,7 @@ typedef struct {
     lfm2_vec_dot_1x4_fn   vec_dot_1x4[GGML_TYPE_COUNT];
 } LFM2KernelTable;
 
+#if defined(__x86_64__) || defined(_M_X64)
 static inline void query_x86_brand_string(char out_brand[64]) {
     uint32_t regs[12] = {0};
     uint32_t max_ext = 0, unused = 0;
@@ -1759,10 +1791,13 @@ static inline void query_x86_brand_string(char out_brand[64]) {
         snprintf(out_brand, 64, "Generic x86_64 CPU");
     }
 }
+#endif
 
-/* Queries hardware CPUID at startup and populates the optimal kernel pointers */
+/* Queries hardware CPUID / HWCAP at startup and populates the optimal kernel pointers */
 static inline void lfm2_init_cpu_kernels(LFM2KernelTable *kt) {
     memset(kt, 0, sizeof(*kt));
+
+#if defined(__x86_64__) || defined(_M_X64)
     query_x86_brand_string(kt->cpu_brand);
 
     __builtin_cpu_init();
@@ -1837,6 +1872,47 @@ static inline void lfm2_init_cpu_kernels(LFM2KernelTable *kt) {
         kt->vec_dot_1x4[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_1x4_scalar;
         kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar;
     }
+#elif defined(__aarch64__)
+    LFM2MobileKernelTable mkt;
+    lfm2_init_mobile_kernels(&mkt);
+    const char *force_isa = getenv("LFM2_FORCE_ISA");
+    const bool forced_scalar = (force_isa && strcmp(force_isa, "scalar") == 0);
+
+    kt->isa_name = forced_scalar ? "GENERIC_SCALAR_ARM64" : mkt.isa_name;
+    snprintf(kt->cpu_brand, sizeof(kt->cpu_brand), "ARM64 (%s)", kt->isa_name);
+    kt->quantize_q8_K = mkt.quantize_q8_K;
+
+    kt->vec_dot_1x1[GGML_TYPE_Q4_0]   = mkt.vec_dot_1x1[LFM2_GGML_TYPE_Q4_0];
+    kt->vec_dot_1x1[GGML_TYPE_Q8_0]   = mkt.vec_dot_1x1[LFM2_GGML_TYPE_Q8_0];
+    kt->vec_dot_1x1[GGML_TYPE_Q4_K]   = mkt.vec_dot_1x1[LFM2_GGML_TYPE_Q4_K];
+    kt->vec_dot_1x1[GGML_TYPE_Q5_K]   = mkt.vec_dot_1x1[LFM2_GGML_TYPE_Q5_K];
+    kt->vec_dot_1x1[GGML_TYPE_Q6_K]   = mkt.vec_dot_1x1[LFM2_GGML_TYPE_Q6_K];
+    kt->vec_dot_1x1[GGML_TYPE_IQ4_XS] = mkt.vec_dot_1x1[LFM2_GGML_TYPE_IQ4_XS];
+
+    kt->vec_dot_1x4[GGML_TYPE_Q4_0]   = mkt.vec_dot_1x4[LFM2_GGML_TYPE_Q4_0];
+    kt->vec_dot_1x4[GGML_TYPE_Q8_0]   = mkt.vec_dot_1x4[LFM2_GGML_TYPE_Q8_0];
+    kt->vec_dot_1x4[GGML_TYPE_Q4_K]   = mkt.vec_dot_1x4[LFM2_GGML_TYPE_Q4_K];
+    kt->vec_dot_1x4[GGML_TYPE_Q5_K]   = mkt.vec_dot_1x4[LFM2_GGML_TYPE_Q5_K];
+    kt->vec_dot_1x4[GGML_TYPE_Q6_K]   = mkt.vec_dot_1x4[LFM2_GGML_TYPE_Q6_K];
+    kt->vec_dot_1x4[GGML_TYPE_IQ4_XS] = mkt.vec_dot_1x4[LFM2_GGML_TYPE_IQ4_XS];
+#else
+    snprintf(kt->cpu_brand, sizeof(kt->cpu_brand), "Generic Scalar CPU");
+    kt->isa_name                            = "GENERIC_SCALAR";
+    kt->quantize_q8_K                       = lfm2_quantize_row_q8_K_scalar;
+    kt->vec_dot_1x1[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_scalar;
+    kt->vec_dot_1x1[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_scalar;
+    kt->vec_dot_1x1[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_scalar;
+    kt->vec_dot_1x1[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_scalar;
+    kt->vec_dot_1x1[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_scalar;
+    kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_scalar;
+
+    kt->vec_dot_1x4[GGML_TYPE_Q4_0]         = lfm2_vec_dot_q4_0_q8_K_1x4_scalar;
+    kt->vec_dot_1x4[GGML_TYPE_Q8_0]         = lfm2_vec_dot_q8_0_q8_K_1x4_scalar;
+    kt->vec_dot_1x4[GGML_TYPE_Q4_K]         = lfm2_vec_dot_q4_K_q8_K_1x4_scalar;
+    kt->vec_dot_1x4[GGML_TYPE_Q5_K]         = lfm2_vec_dot_q5_K_q8_K_1x4_scalar;
+    kt->vec_dot_1x4[GGML_TYPE_Q6_K]         = lfm2_vec_dot_q6_K_q8_K_1x4_scalar;
+    kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]       = lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar;
+#endif
 }
 
 /* Global singleton kernel table accessor */

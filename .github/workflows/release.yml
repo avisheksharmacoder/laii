@@ -15,71 +15,110 @@ env:
 
 jobs:
   # ============================================================================
-  # Job 1: AddressSanitizer, UBSan, ThreadSanitizer & Numerical Parity Gate
+  # Job 1: AddressSanitizer, UBSan, ThreadSanitizer, JNI & Numerical Parity Gate
   # ============================================================================
   sanitizers-and-parity:
-    name: "Sanitizers (ASan/UBSan/TSan) & 5-Tier Parity"
-    runs-on: ubuntu-24.04
+    name: "Sanitizers (ASan/UBSan/TSan), JNI & Parity (${{ matrix.arch }})"
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate Synthetic 4-Layer Hybrid LFM2 GGUF Fixture
-        run: python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
-
-      - name: Build & Run ASan + UBSan Parity Suite (AVX2/VNNI vs Scalar)
+      - name: Build & Run ASan + UBSan Parity Suite (SIMD vs Scalar)
         run: |
           make asan
-          export ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:verify_asan_link_order=0"
-          export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+          python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+          ASAN_LIB="$(gcc -print-file-name=libasan.so)"
+          test -f "$ASAN_LIB"
 
-          # 1. Generate golden logits using hardware SIMD path
-          python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
-            --golden-file build/ci.lfm_golden --generate-golden
+          # Keep LeakSanitizer off only when preloaded into CPython (Python itself retains exit allocations)
+          # 1. Generate golden logits using hardware SIMD path with live ASan interception
+          LD_PRELOAD="$ASAN_LIB" \
+            ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1" \
+            UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
+            python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./lib/liblfm2.so \
+              --golden-file build/ci.lfm_golden --generate-golden
 
           # 2. Verify portable scalar fallback matches SIMD golden logits
-          LFM2_FORCE_ISA=scalar python3 tests/verify_parity.py \
-            -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
-            --golden-file build/ci.lfm_golden -q F32
+          LFM2_FORCE_ISA=scalar \
+            LD_PRELOAD="$ASAN_LIB" \
+            ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1" \
+            UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
+            python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./lib/liblfm2.so \
+              --golden-file build/ci.lfm_golden -q F32
 
       - name: Build & Run ThreadSanitizer (TSan) on Spin-Barrier Pool
         run: |
           make clean
           make tsan
+          python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+          TSAN_CMD="./bin/lfm2-tsan"
+          if command -v setarch >/dev/null 2>&1 && setarch "$(uname -m)" -R true 2>/dev/null; then
+            TSAN_CMD="setarch $(uname -m) -R ./bin/lfm2-tsan"
+          fi
           TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-            setarch x86_64 -R ./bin/lfm2-tsan -m "$CI_GGUF_PATH" -p "Verify lock-free barrier" -n 16
+            $TSAN_CMD -m "$CI_GGUF_PATH" -p "Verify lock-free barrier" -n 16
+
+      - name: Build Shared Library & Verify Java/JNI Bridge
+        run: |
+          if ! command -v javac >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-17-jdk-headless
+          fi
+          make clean
+          python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+          make test-jni MODEL="$CI_GGUF_PATH"
 
   # ============================================================================
-  # Job 2: Zero-Dependency Static Linux ELF Binaries (musl-gcc)
+  # Job 2: Zero-Dependency Static Linux ELF Binaries (Alpine musl x86_64 & arm64)
   # ============================================================================
   build-static-linux:
-    name: "Static Linux ELF (musl-gcc x86_64)"
+    name: "Static Linux ELF (musl ${{ matrix.arch }})"
     needs: sanitizers-and-parity
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl-tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools file
-
-      - name: Build Stripped Static CLI & epoll HTTP Server
+      - name: Build & Smoke-Test Stripped musl Static CLI & HTTP Server (${{ matrix.arch }})
         run: |
-          make static MUSL_CC=musl-gcc
-          strip --strip-unneeded bin/lfm2-static bin/lfm2-server-static
+          docker run --rm \
+            -e CI_GGUF_PATH="$CI_GGUF_PATH" \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            alpine:3.20 sh -c '
+              set -eu
+              apk add --no-cache build-base musl-dev linux-headers file binutils python3 curl
+              make static-test CC=gcc PYTHON=python3
+              strip --strip-unneeded bin/lfm2-static bin/lfm2-server-static
 
-          # Verify zero dynamic library dependencies
-          file bin/lfm2-static | grep -E "statically linked|static-pie linked"
-          file bin/lfm2-server-static | grep -E "statically linked|static-pie linked"
+              file bin/lfm2-static | grep -E "statically linked|static-pie linked"
+              file bin/lfm2-server-static | grep -E "statically linked|static-pie linked"
+              if readelf -l bin/lfm2-static | grep -q "INTERP"; then exit 1; fi
+              if readelf -l bin/lfm2-server-static | grep -q "INTERP"; then exit 1; fi
 
-          mkdir -p dist/lfm2-linux-x86_64-static
-          cp bin/lfm2-static dist/lfm2-linux-x86_64-static/lfm2
-          cp bin/lfm2-server-static dist/lfm2-linux-x86_64-static/lfm2-server
-          cp include/lfm2.h README.md dist/lfm2-linux-x86_64-static/
-          tar -czvf dist/lfm2-linux-x86_64-static.tar.gz -C dist/lfm2-linux-x86_64-static .
+              mkdir -p "dist/lfm2-linux-${{ matrix.arch }}-static"
+              cp bin/lfm2-static "dist/lfm2-linux-${{ matrix.arch }}-static/lfm2"
+              cp bin/lfm2-server-static "dist/lfm2-linux-${{ matrix.arch }}-static/lfm2-server"
+              cp include/lfm2.h README.md "dist/lfm2-linux-${{ matrix.arch }}-static/"
+              tar -czvf "dist/lfm2-linux-${{ matrix.arch }}-static.tar.gz" -C "dist/lfm2-linux-${{ matrix.arch }}-static" .
+            '
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lfm2-linux-x86_64-static
-          path: dist/lfm2-linux-x86_64-static.tar.gz
+          name: lfm2-linux-${{ matrix.arch }}-static
+          path: dist/lfm2-linux-${{ matrix.arch }}-static.tar.gz
 
   # ============================================================================
   # Job 3: Python manylinux Wheels (x86_64 & ARM64 aarch64)
@@ -94,6 +133,10 @@ jobs:
             runner: ubuntu-24.04
             image: quay.io/pypa/manylinux_2_28_x86_64
             plat_tag: manylinux_2_28_x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+            plat_tag: manylinux_2_28_aarch64
     runs-on: ${{ matrix.runner }}
     container:
       image: ${{ matrix.image }}
@@ -156,6 +199,8 @@ jobs:
 
           mkdir -p dist/android-arm64-v8a
           cp lib/android-arm64-v8a/liblfm2.so include/lfm2.h python/lfm2.py dist/android-arm64-v8a/
+          cp docs/ANDROID_KOTLIN_INTEGRATION.md dist/android-arm64-v8a/
+          cp -r android dist/android-arm64-v8a/
           cp -r p4a-recipes dist/android-arm64-v8a/ 2>/dev/null || true
           tar -czvf dist/lfm2-android-arm64-v8a.tar.gz -C dist/android-arm64-v8a .
 

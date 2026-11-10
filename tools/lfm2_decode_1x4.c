@@ -4,7 +4,11 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,6 +65,7 @@ static inline void *lfm2_aligned_alloc_64(size_t size) {
 }
 #endif
 
+#if LFM2_HAS_AVX2
 /* ============================================================================
  * 1. 4-Row Simultaneous Horizontal Reduction (4 x __m256i -> 1 x __m128i)
  * ============================================================================
@@ -375,6 +380,216 @@ static inline void lfm2_vec_dot_q6_K_q8_K_1x4_avx2(const block_q6_K_t * restrict
     (void)n_cols;
     _mm_storeu_ps(out4, v_sumf);
 }
+#elif defined(__aarch64__)
+
+static inline float lfm2_vec_dot_f32_neon(const float * restrict w,
+                                          const float * restrict x,
+                                          uint32_t n_cols) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 8 <= n_cols; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(w + i + 0), vld1q_f32(x + i + 0));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(w + i + 4), vld1q_f32(x + i + 4));
+    }
+    float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n_cols; ++i) sum += w[i] * x[i];
+    return sum;
+}
+
+static inline void lfm2_vec_dot_f32_1x4_neon(const float * restrict w_row0,
+                                             uint32_t n_cols,
+                                             const float * restrict x,
+                                             float out4[4]) {
+    const float * restrict w0 = w_row0 + 0 * (size_t)n_cols;
+    const float * restrict w1 = w_row0 + 1 * (size_t)n_cols;
+    const float * restrict w2 = w_row0 + 2 * (size_t)n_cols;
+    const float * restrict w3 = w_row0 + 3 * (size_t)n_cols;
+
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    uint32_t i = 0;
+    for (; i + 4 <= n_cols; i += 4) {
+        const float32x4_t vx = vld1q_f32(x + i);
+        acc0 = vfmaq_f32(acc0, vld1q_f32(w0 + i), vx);
+        acc1 = vfmaq_f32(acc1, vld1q_f32(w1 + i), vx);
+        acc2 = vfmaq_f32(acc2, vld1q_f32(w2 + i), vx);
+        acc3 = vfmaq_f32(acc3, vld1q_f32(w3 + i), vx);
+    }
+    float32x4_t sums = vpaddq_f32(vpaddq_f32(acc0, acc1), vpaddq_f32(acc2, acc3));
+    vst1q_f32(out4, sums);
+
+    for (; i < n_cols; ++i) {
+        const float xv = x[i];
+        out4[0] += w0[i] * xv;
+        out4[1] += w1[i] * xv;
+        out4[2] += w2[i] * xv;
+        out4[3] += w3[i] * xv;
+    }
+}
+
+static inline void lfm2_rmsnorm_quantize_q8_K_neon(float * restrict out_f32,
+                                                   block_q8_K_t * restrict out_q8,
+                                                   const float * restrict x,
+                                                   const GGUFTensor * restrict norm_w,
+                                                   uint32_t dim,
+                                                   float eps) {
+    float32x4_t vss0 = vdupq_n_f32(0.0f);
+    float32x4_t vss1 = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        float32x4_t vx0 = vld1q_f32(x + i + 0);
+        float32x4_t vx1 = vld1q_f32(x + i + 4);
+        vss0 = vfmaq_f32(vss0, vx0, vx0);
+        vss1 = vfmaq_f32(vss1, vx1, vx1);
+    }
+    float ss = vaddvq_f32(vaddq_f32(vss0, vss1));
+    for (; i < dim; ++i) ss += x[i] * x[i];
+
+    const float inv_rms = 1.0f / sqrtf(ss / (float)dim + eps);
+    const float32x4_t v_irms = vdupq_n_f32(inv_rms);
+
+    const float    *wf32 = (norm_w && norm_w->type == GGML_TYPE_F32) ? (const float *)norm_w->data : NULL;
+    const uint16_t *wf16 = (norm_w && norm_w->type != GGML_TYPE_F32) ? (const uint16_t *)norm_w->data : NULL;
+
+    const uint32_t nb = dim / 256;
+    for (uint32_t b = 0; b < nb; ++b) {
+        const uint32_t base = b * 256;
+        float *xb_out = out_f32 + base;
+        float32x4_t vmax0 = vdupq_n_f32(0.0f);
+        float32x4_t vmax1 = vdupq_n_f32(0.0f);
+
+        if (wf32) {
+            for (uint32_t j = 0; j < 256; j += 8) {
+                float32x4_t n0 = vmulq_f32(vmulq_f32(vld1q_f32(x + base + j + 0), v_irms),
+                                           vld1q_f32(wf32 + base + j + 0));
+                float32x4_t n1 = vmulq_f32(vmulq_f32(vld1q_f32(x + base + j + 4), v_irms),
+                                           vld1q_f32(wf32 + base + j + 4));
+                vst1q_f32(xb_out + j + 0, n0);
+                vst1q_f32(xb_out + j + 4, n1);
+                vmax0 = vmaxq_f32(vmax0, vabsq_f32(n0));
+                vmax1 = vmaxq_f32(vmax1, vabsq_f32(n1));
+            }
+        } else if (wf16) {
+            for (uint32_t j = 0; j < 256; j += 8) {
+                uint16x8_t hw = vld1q_u16(wf16 + base + j);
+                float32x4_t w0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(hw)));
+                float32x4_t w1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(hw)));
+                float32x4_t n0 = vmulq_f32(vmulq_f32(vld1q_f32(x + base + j + 0), v_irms), w0);
+                float32x4_t n1 = vmulq_f32(vmulq_f32(vld1q_f32(x + base + j + 4), v_irms), w1);
+                vst1q_f32(xb_out + j + 0, n0);
+                vst1q_f32(xb_out + j + 4, n1);
+                vmax0 = vmaxq_f32(vmax0, vabsq_f32(n0));
+                vmax1 = vmaxq_f32(vmax1, vabsq_f32(n1));
+            }
+        } else {
+            for (uint32_t j = 0; j < 256; j += 8) {
+                float32x4_t n0 = vmulq_f32(vld1q_f32(x + base + j + 0), v_irms);
+                float32x4_t n1 = vmulq_f32(vld1q_f32(x + base + j + 4), v_irms);
+                vst1q_f32(xb_out + j + 0, n0);
+                vst1q_f32(xb_out + j + 4, n1);
+                vmax0 = vmaxq_f32(vmax0, vabsq_f32(n0));
+                vmax1 = vmaxq_f32(vmax1, vabsq_f32(n1));
+            }
+        }
+
+        if (out_q8 == NULL) continue;
+
+        const float max_abs = vmaxvq_f32(vmaxq_f32(vmax0, vmax1));
+        if (max_abs == 0.0f) {
+            out_q8[b].d = 0.0f;
+            memset(out_q8[b].qs, 0, sizeof(out_q8[b].qs));
+            memset(out_q8[b].bsums, 0, sizeof(out_q8[b].bsums));
+            continue;
+        }
+
+        out_q8[b].d = max_abs / 127.0f;
+        const float32x4_t vscale = vdupq_n_f32(127.0f / max_abs);
+        for (int j = 0; j < 16; ++j) {
+            const float *x16 = xb_out + j * 16;
+            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x16 +  0), vscale));
+            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x16 +  4), vscale));
+            int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x16 +  8), vscale));
+            int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x16 + 12), vscale));
+
+            out_q8[b].bsums[j] = (int16_t)vaddvq_s32(vaddq_s32(vaddq_s32(i0, i1), vaddq_s32(i2, i3)));
+
+            int16x8_t s16_lo = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+            int16x8_t s16_hi = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+            vst1q_s8(out_q8[b].qs + j * 16, vcombine_s8(vqmovn_s16(s16_lo), vqmovn_s16(s16_hi)));
+        }
+    }
+
+    for (uint32_t j = nb * 256; j < dim; ++j) {
+        float w = 1.0f;
+        if (wf32) w = wf32[j];
+        else if (wf16) w = fp16_to_fp32_arm(wf16[j]);
+        out_f32[j] = x[j] * inv_rms * w;
+    }
+}
+#endif
+
+static inline float lfm2_vec_dot_f32_simd(const float * restrict w,
+                                          const float * restrict x,
+                                          uint32_t n_cols) {
+#if LFM2_HAS_AVX2
+    return lfm2_vec_dot_f32_avx2(w, x, n_cols);
+#elif defined(__aarch64__)
+    return lfm2_vec_dot_f32_neon(w, x, n_cols);
+#else
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_cols; ++i) sum += w[i] * x[i];
+    return sum;
+#endif
+}
+
+static inline void lfm2_vec_dot_f32_1x4_simd(const float * restrict w_row0,
+                                             uint32_t n_cols,
+                                             const float * restrict x,
+                                             float out4[4]) {
+#if defined(__aarch64__)
+    lfm2_vec_dot_f32_1x4_neon(w_row0, n_cols, x, out4);
+#else
+    for (int k = 0; k < 4; ++k) {
+        out4[k] = lfm2_vec_dot_f32_simd(w_row0 + (size_t)k * n_cols, x, n_cols);
+    }
+#endif
+}
+
+static inline void lfm2_rmsnorm_quantize_q8_K_simd(float * restrict out_f32,
+                                                   block_q8_K_t * restrict out_q8,
+                                                   const float * restrict x,
+                                                   const GGUFTensor * restrict norm_w,
+                                                   uint32_t dim,
+                                                   float eps) {
+#if LFM2_HAS_AVX2
+    lfm2_rmsnorm_quantize_q8_K_avx2(out_f32, out_q8, x, norm_w, dim, eps);
+#elif defined(__aarch64__)
+    lfm2_rmsnorm_quantize_q8_K_neon(out_f32, out_q8, x, norm_w, dim, eps);
+#else
+    double ss = 0.0;
+    for (uint32_t i = 0; i < dim; ++i) ss += (double)x[i] * (double)x[i];
+    const float inv_rms = 1.0f / sqrtf((float)(ss / (double)dim) + eps);
+    const float    *wf32 = (norm_w && norm_w->type == GGML_TYPE_F32) ? (const float *)norm_w->data : NULL;
+    const uint16_t *wf16 = (norm_w && norm_w->type != GGML_TYPE_F32) ? (const uint16_t *)norm_w->data : NULL;
+    for (uint32_t i = 0; i < dim; ++i) {
+        float w = 1.0f;
+        if (wf32) w = wf32[i];
+        else if (wf16) w = fp16_to_fp32_scalar(wf16[i]);
+        out_f32[i] = x[i] * inv_rms * w;
+    }
+    if (out_q8) lfm2_quantize_row_q8_K_scalar(out_f32, out_q8, dim);
+#endif
+}
+
+#if !LFM2_HAS_AVX2
+#ifndef lfm2_rmsnorm_quantize_q8_K_avx2
+#define lfm2_rmsnorm_quantize_q8_K_avx2 lfm2_rmsnorm_quantize_q8_K_simd
+#endif
+#endif
 
 /* ============================================================================
  * 5. Unified 4-Row & 1-Row Tensor Dispatcher Helper
@@ -392,8 +607,13 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
             kt->vec_dot_1x4[GGML_TYPE_Q4_K]((const block_q4_K_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
         } else {
+#if LFM2_HAS_AVX2
             lfm2_vec_dot_q4_K_q8_K_1x4_avx2((const block_q4_K_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
+#else
+            lfm2_vec_dot_q4_K_q8_K_1x4_scalar((const block_q4_K_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+#endif
         }
     } else if (W->type == GGML_TYPE_Q6_K) {
         const size_t rb = n_cols / 256;
@@ -401,8 +621,13 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
             kt->vec_dot_1x4[GGML_TYPE_Q6_K]((const block_q6_K_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
         } else {
+#if LFM2_HAS_AVX2
             lfm2_vec_dot_q6_K_q8_K_1x4_avx2((const block_q6_K_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
+#else
+            lfm2_vec_dot_q6_K_q8_K_1x4_scalar((const block_q6_K_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+#endif
         }
     } else if (W->type == GGML_TYPE_Q8_0) {
         const size_t rb = n_cols / 32;
@@ -410,10 +635,15 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
             kt->vec_dot_1x4[GGML_TYPE_Q8_0]((const block_q8_0_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
         } else {
+#if defined(__x86_64__) || defined(_M_X64)
             const block_q8_0_t *base = (const block_q8_0_t *)W->data + (size_t)r * rb;
             for (int k = 0; k < 4; ++k) {
                 out4[k] = lfm2_vec_dot_q8_0_q8_K_avx2(base + (size_t)k * rb, x_q8, n_cols);
             }
+#else
+            lfm2_vec_dot_q8_0_q8_K_1x4_scalar((const block_q8_0_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+#endif
         }
     } else if (W->type == GGML_TYPE_Q4_0) {
         const size_t rb = n_cols / 32;
@@ -421,8 +651,13 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
             kt->vec_dot_1x4[GGML_TYPE_Q4_0]((const block_q4_0_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
         } else {
+#if defined(__x86_64__) || defined(_M_X64)
             lfm2_vec_dot_q4_0_q8_K_1x4_avx2((const block_q4_0_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
+#else
+            lfm2_vec_dot_q4_0_q8_K_1x4_scalar((const block_q4_0_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+#endif
         }
     } else if (W->type == GGML_TYPE_Q5_K) {
         const size_t rb = n_cols / 256;
@@ -430,8 +665,13 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
             kt->vec_dot_1x4[GGML_TYPE_Q5_K]((const block_q5_K_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
         } else {
+#if defined(__x86_64__) || defined(_M_X64)
             lfm2_vec_dot_q5_K_q8_K_1x4_avx2((const block_q5_K_t *)W->data + (size_t)r * rb,
                                             rb, x_q8, n_cols, out4);
+#else
+            lfm2_vec_dot_q5_K_q8_K_1x4_scalar((const block_q5_K_t *)W->data + (size_t)r * rb,
+                                              rb, x_q8, n_cols, out4);
+#endif
         }
     } else if (W->type == GGML_TYPE_IQ4_XS) {
         const size_t rb = n_cols / 256;
@@ -439,14 +679,17 @@ static inline void lfm2_compute_4rows_avx2(const GGUFTensor * restrict W,
             kt->vec_dot_1x4[GGML_TYPE_IQ4_XS]((const block_iq4_xs_t *)W->data + (size_t)r * rb,
                                               rb, x_q8, n_cols, out4);
         } else {
+#if defined(__x86_64__) || defined(_M_X64)
             lfm2_vec_dot_iq4_xs_q8_K_1x4_avx2((const block_iq4_xs_t *)W->data + (size_t)r * rb,
                                               rb, x_q8, n_cols, out4);
+#else
+            lfm2_vec_dot_iq4_xs_q8_K_1x4_scalar((const block_iq4_xs_t *)W->data + (size_t)r * rb,
+                                                rb, x_q8, n_cols, out4);
+#endif
         }
     } else {
         const float *base = (const float *)W->data + (size_t)r * n_cols;
-        for (int k = 0; k < 4; ++k) {
-            out4[k] = lfm2_vec_dot_f32_avx2(base + (size_t)k * n_cols, x_f32, n_cols);
-        }
+        lfm2_vec_dot_f32_1x4_simd(base, n_cols, x_f32, out4);
     }
 }
 
@@ -461,39 +704,63 @@ static inline float lfm2_compute_1row_avx2(const GGUFTensor * restrict W,
         if (kt->vec_dot_1x1[GGML_TYPE_Q4_K]) {
             return kt->vec_dot_1x1[GGML_TYPE_Q4_K]((const block_q4_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
         }
+#if LFM2_HAS_AVX2
         return lfm2_vec_dot_q4_K_q8_K_avx2((const block_q4_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#else
+        return lfm2_vec_dot_q4_K_q8_K_scalar((const block_q4_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#endif
     } else if (W->type == GGML_TYPE_Q6_K) {
         const size_t rb = n_cols / 256;
         if (kt->vec_dot_1x1[GGML_TYPE_Q6_K]) {
             return kt->vec_dot_1x1[GGML_TYPE_Q6_K]((const block_q6_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
         }
+#if LFM2_HAS_AVX2
         return lfm2_vec_dot_q6_K_q8_K_avx2((const block_q6_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#else
+        return lfm2_vec_dot_q6_K_q8_K_scalar((const block_q6_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#endif
     } else if (W->type == GGML_TYPE_Q8_0) {
         const size_t rb = n_cols / 32;
         if (kt->vec_dot_1x1[GGML_TYPE_Q8_0]) {
             return kt->vec_dot_1x1[GGML_TYPE_Q8_0]((const block_q8_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
         }
+#if defined(__x86_64__) || defined(_M_X64)
         return lfm2_vec_dot_q8_0_q8_K_avx2((const block_q8_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#else
+        return lfm2_vec_dot_q8_0_q8_K_scalar((const block_q8_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#endif
     } else if (W->type == GGML_TYPE_Q4_0) {
         const size_t rb = n_cols / 32;
         if (kt->vec_dot_1x1[GGML_TYPE_Q4_0]) {
             return kt->vec_dot_1x1[GGML_TYPE_Q4_0]((const block_q4_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
         }
+#if defined(__x86_64__) || defined(_M_X64)
         return lfm2_vec_dot_q4_0_q8_K_avx2((const block_q4_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#else
+        return lfm2_vec_dot_q4_0_q8_K_scalar((const block_q4_0_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#endif
     } else if (W->type == GGML_TYPE_Q5_K) {
         const size_t rb = n_cols / 256;
         if (kt->vec_dot_1x1[GGML_TYPE_Q5_K]) {
             return kt->vec_dot_1x1[GGML_TYPE_Q5_K]((const block_q5_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
         }
+#if defined(__x86_64__) || defined(_M_X64)
         return lfm2_vec_dot_q5_K_q8_K_avx2((const block_q5_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#else
+        return lfm2_vec_dot_q5_K_q8_K_scalar((const block_q5_K_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#endif
     } else if (W->type == GGML_TYPE_IQ4_XS) {
         const size_t rb = n_cols / 256;
         if (kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]) {
             return kt->vec_dot_1x1[GGML_TYPE_IQ4_XS]((const block_iq4_xs_t *)W->data + (size_t)r * rb, x_q8, n_cols);
         }
+#if defined(__x86_64__) || defined(_M_X64)
         return lfm2_vec_dot_iq4_xs_q8_K_avx2((const block_iq4_xs_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#else
+        return lfm2_vec_dot_iq4_xs_q8_K_scalar((const block_iq4_xs_t *)W->data + (size_t)r * rb, x_q8, n_cols);
+#endif
     } else {
-        return lfm2_vec_dot_f32_avx2((const float *)W->data + (size_t)r * n_cols, x_f32, n_cols);
+        return lfm2_vec_dot_f32_simd((const float *)W->data + (size_t)r * n_cols, x_f32, n_cols);
     }
 }
 
@@ -725,12 +992,13 @@ static void lfm2_ffn_swiglu_fused_worker(void *arg, uint32_t tid, uint32_t n_thr
 
             /* Immediately quantize this L1-hot 256-float SwiGLU block to Q8_K for ffn_down */
             if (c->hb_q8_out != NULL) {
+                const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
                 if (end_r - base_r == 256) {
-                    lfm2_quantize_row_q8_K_avx2(hb_block, &c->hb_q8_out[sb], 256);
+                    kt->quantize_q8_K(hb_block, &c->hb_q8_out[sb], 256);
                 } else {
                     float pad[256] = {0};
                     memcpy(pad, hb_block, (end_r - base_r) * sizeof(float));
-                    lfm2_quantize_row_q8_K_avx2(pad, &c->hb_q8_out[sb], 256);
+                    kt->quantize_q8_K(pad, &c->hb_q8_out[sb], 256);
                 }
             }
         }
@@ -748,6 +1016,7 @@ void lfm2_ffn_swiglu_fused_1x4_mt(LFM2ThreadPool *pool,
     const uint32_t n_sblocks = (n_ff + 255) / 256;
 
     if (pool == NULL || pool->n_threads <= 1) {
+        const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
         for (uint32_t sb = 0; sb < n_sblocks; ++sb) {
             const uint32_t base_r = sb * 256;
             const uint32_t end_r  = (base_r + 256 <= n_ff) ? (base_r + 256) : n_ff;
@@ -769,11 +1038,11 @@ void lfm2_ffn_swiglu_fused_1x4_mt(LFM2ThreadPool *pool,
             }
             if (hb_q8_out != NULL) {
                 if (end_r - base_r == 256) {
-                    lfm2_quantize_row_q8_K_avx2(hb_block, &hb_q8_out[sb], 256);
+                    kt->quantize_q8_K(hb_block, &hb_q8_out[sb], 256);
                 } else {
                     float pad[256] = {0};
                     memcpy(pad, hb_block, (end_r - base_r) * sizeof(float));
-                    lfm2_quantize_row_q8_K_avx2(pad, &hb_q8_out[sb], 256);
+                    kt->quantize_q8_K(pad, &hb_q8_out[sb], 256);
                 }
             }
         }
@@ -807,7 +1076,7 @@ void lfm2_forward_ffn_fused_1x4(LFM2ThreadPool *pool,
                                 uint32_t D,
                                 float eps) {
     /* 1. Fused RMSNorm(x -> xb) + Quantize(xb -> xq_scratch) */
-    lfm2_rmsnorm_quantize_q8_K_avx2(xb, xq_scratch, x, layer->ffn_norm, D, eps);
+    lfm2_rmsnorm_quantize_q8_K_simd(xb, xq_scratch, x, layer->ffn_norm, D, eps);
 
     /* 2. Barrier #1: Fused 1x4 Gate + Up + SwiGLU + in-place hb_q8 quantization!
      *    Note: We store hb_q8 at xq_scratch + (D / 256) so it doesn't overwrite x_q8 */
@@ -819,9 +1088,16 @@ void lfm2_forward_ffn_fused_1x4(LFM2ThreadPool *pool,
 
     /* 4. Vectorized Residual Add: x[0..D-1] += xb[0..D-1] */
     uint32_t d = 0;
+#if LFM2_HAS_AVX2
     for (; d + 8 <= D; d += 8) {
         _mm256_storeu_ps(x + d, _mm256_add_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(xb + d)));
     }
+#elif defined(__aarch64__)
+    for (; d + 8 <= D; d += 8) {
+        vst1q_f32(x + d + 0, vaddq_f32(vld1q_f32(x + d + 0), vld1q_f32(xb + d + 0)));
+        vst1q_f32(x + d + 4, vaddq_f32(vld1q_f32(x + d + 4), vld1q_f32(xb + d + 4)));
+    }
+#endif
     for (; d < D; ++d) {
         x[d] += xb[d];
     }

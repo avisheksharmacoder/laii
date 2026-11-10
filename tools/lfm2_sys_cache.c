@@ -20,7 +20,11 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #ifndef LFM2_SYS_CACHE_INCLUDED
 #define LFM2_SYS_CACHE_INCLUDED 1
@@ -428,31 +432,39 @@ static inline float lfm2_fp16_to_fp32_scalar(uint16_t h) {
 }
 
 static inline void lfm2_convert_f32_to_f16(uint16_t *dst, const float *src, size_t n) {
-#if defined(__F16C__)
     size_t i = 0;
+#if defined(__F16C__)
     for (; i + 8 <= n; i += 8) {
         __m256 v = _mm256_loadu_ps(src + i);
         __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         _mm_storeu_si128((__m128i *)(dst + i), h);
     }
-    for (; i < n; ++i) dst[i] = lfm2_fp32_to_fp16_scalar(src[i]);
-#else
-    for (size_t i = 0; i < n; ++i) dst[i] = lfm2_fp32_to_fp16_scalar(src[i]);
+#elif defined(__aarch64__)
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t lo = vcvt_f16_f32(vld1q_f32(src + i + 0));
+        float16x4_t hi = vcvt_f16_f32(vld1q_f32(src + i + 4));
+        vst1q_u16(dst + i, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
+    }
 #endif
+    for (; i < n; ++i) dst[i] = lfm2_fp32_to_fp16_scalar(src[i]);
 }
 
 static inline void lfm2_convert_f16_to_f32(float *dst, const uint16_t *src, size_t n) {
-#if defined(__F16C__)
     size_t i = 0;
+#if defined(__F16C__)
     for (; i + 8 <= n; i += 8) {
         __m128i h = _mm_loadu_si128((const __m128i *)(src + i));
         __m256 v = _mm256_cvtph_ps(h);
         _mm256_storeu_ps(dst + i, v);
     }
-    for (; i < n; ++i) dst[i] = lfm2_fp16_to_fp32_scalar(src[i]);
-#else
-    for (size_t i = 0; i < n; ++i) dst[i] = lfm2_fp16_to_fp32_scalar(src[i]);
+#elif defined(__aarch64__)
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t h = vld1q_u16(src + i);
+        vst1q_f32(dst + i + 0, vcvt_f32_f16(vget_low_f16(vreinterpretq_f16_u16(h))));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(vreinterpretq_f16_u16(h))));
+    }
 #endif
+    for (; i < n; ++i) dst[i] = lfm2_fp16_to_fp32_scalar(src[i]);
 }
 
 /* Saves the exact LFM2 Hybrid State (ShortConv buffers + FP16 GQA KV-caches up to

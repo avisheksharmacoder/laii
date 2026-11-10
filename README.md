@@ -108,6 +108,8 @@ Because only 6 of the 16 layers in `LFM2.5-1.2B` use GQA attention (with `n_head
 | **`LFM2.5-2.6B`** | `Q4_K_M` | 1.54 GB | 1.54 GB | 80.3 MB | 17 tok/s / **41 tok/s** | 38 tok/s / **89 tok/s** | **12 tok/s** |
 | **`LFM2-8B-A1B` (MoE)** | `Q4_K_M` | 4.82 GB | **~890 MB** (Top-4/32) | 48.3 MB | 27 tok/s / **64 tok/s** | 61 tok/s / **140 tok/s** | — |
 
+*For empirical side-by-side benchmarks against `llama.cpp` (21.6x faster cold startup, ~500 MB less RAM), see [docs/BENCHMARKS.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/BENCHMARKS.md).*
+
 ---
 
 ## Quick Start & Building from Source
@@ -221,22 +223,49 @@ with LFM2Model("LFM2.5-1.2B-Instruct-Q4_K_M.gguf") as model:
 
 ---
 
-## 4. Android & Kivy Mobile Deployment (`arm64-v8a`)
+## 4. Android Mobile Deployment (`arm64-v8a`)
 
-**LFM2.c** includes a custom `python-for-android` (`p4a`) recipe (`p4a-recipes/lfm2/__init__.py`) and an Android-hardened runtime:
+**LFM2.c** delivers turnkey mobile support for modern Android smartphone SoCs (Qualcomm Snapdragon, Google Tensor, MediaTek Dimensity, Samsung Exynos) via both **Native Android Studio (Kotlin & Java)** and **Python / Kivy**:
 
+### Native Kotlin & Java SDK (Android Studio)
+Drop `liblfm2.so` and the `ai.liquid.lfm2` package directly into any Android Studio project:
+
+```kotlin
+import ai.liquid.lfm2.*
+
+// 1. Zero-copy mmap load from internal storage or Scoped Storage (Content URI)
+val model = LFM2Model.load("/data/data/com.example.app/files/LFM2.5-1.2B-Instruct-Q4_K_M.gguf")
+
+// 2. Stateful context with auto-planned threads (pinned to Prime/Performance cores)
+val context = model.createContext(contextParams { maxSeqLen = 2048; numThreads = 4 })
+context.setSystemPrompt("You are an on-device AI assistant.")
+
+// 3. Stream tokens reactively into Jetpack Compose UI
+context.generateSequence("Explain on-device hybrid inference.", sampleParams {
+    temperature = 0.25f
+    topK = 40
+}).forEach { chunk ->
+    print(chunk.text)
+}
+
+// 4. Android Lifecycle hooks: Drop RAM by ~90% onPause to survive lmkd!
+model.releasePageCache() // madvise(MADV_DONTNEED)
+model.warmupPageCache()  // Sequential background pre-fault on onResume()
+```
+* Complete Android Studio guide, Jetpack Compose `ViewModel` with Coroutines `Flow`, and Scoped Storage `loadFromFd()`: see **[`docs/ANDROID_KOTLIN_INTEGRATION.md`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/ANDROID_KOTLIN_INTEGRATION.md)**.
+* Run end-to-end JNI test suite: `make test-jni`
+
+### Python / Kivy Mobile Runtime
+**LFM2.c** also includes a custom `python-for-android` (`p4a`) recipe (`p4a-recipes/lfm2/__init__.py`) and an Android-hardened runtime:
 1. **Android 15+ (16 KB Page Size) & Scoped Storage `fd` Support:**
    Uses Android’s Storage Access Framework (`Intent.ACTION_OPEN_DOCUMENT`) + `ParcelFileDescriptor.detachFd()` to `mmap` `.gguf` models directly from the user’s `Downloads` folder without legacy storage permissions or file copying.
 2. **Surviving the Android Low Memory Killer (`lmkd`):**
-   When the Kivy app enters `on_pause()`, `lfm2_android_on_pause_release_weights()` invokes `madvise(..., MADV_DONTNEED)` on the read-only weight mapping—instantly dropping ~700 MB from process RSS while keeping the `160 KB` ShortConv state and `FP16` GQA KV-cache alive in RAM.
-3. **Build & Deploy APK via Buildozer:**
+   When the app enters `on_pause()`, `model.release_page_cache()` invokes dual-layer `madvise(..., MADV_DONTNEED)` and `posix_fadvise(..., POSIX_FADV_DONTNEED)`—instantly dropping ~700 MB from process RSS while keeping the `160 KB` ShortConv state and `FP16` GQA KV-cache alive in RAM.
+3. **Cross-Compile Standalone Shared Library:**
    ```bash
-   # Cross-compile standalone liblfm2.so via Android NDK
-   ANDROID_NDK_HOME=/path/to/android-ndk-r27 make android
-
-   # Or package the full Kivy APK with Buildozer and stream logs over ADB
-   buildozer android debug deploy run logcat | grep -E "python|LFM2Engine"
+   make android ANDROID_NDK_HOME=/path/to/android-ndk-r26d ANDROID_API=26
    ```
+* Detailed Kivy documentation: see **[`docs/ANDROID_KIVY_INTEGRATION.md`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/ANDROID_KIVY_INTEGRATION.md)**.
 
 ---
 

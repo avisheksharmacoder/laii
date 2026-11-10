@@ -10,11 +10,21 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef LFM2_SIMD_ARM64_INCLUDED
+#define LFM2_SIMD_ARM64_INCLUDED 1
+
+#if __has_include("include/lfm2_simd_arm64.h")
 #include "include/lfm2_simd_arm64.h"
+#elif __has_include("lfm2_simd_arm64.h")
+#include "lfm2_simd_arm64.h"
+#else
+#include "../include/lfm2_simd_arm64.h"
+#endif
 
 /* ============================================================================
  * 1. Shared Bit-Unpacking & FP16 Helpers
  * ============================================================================ */
+#ifndef get_scale_min_k4
 static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     if (j < 4) {
         *d = q[j] & 63;
@@ -24,12 +34,17 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t
         *m = (q[j + 4] >> 4)   | ((q[j - 0] >> 6) << 4);
     }
 }
+#endif
 
+#ifndef LFM2_GET_SCALE_IQ4_XS_DEFINED
+#define LFM2_GET_SCALE_IQ4_XS_DEFINED
+#define get_scale_iq4_xs get_scale_iq4_xs
 static inline int get_scale_iq4_xs(int ib, const uint8_t scales_l[4], uint16_t scales_h) {
     const int low4  = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
     const int high2 = ((scales_h >> (2 * ib)) & 0x03) << 4;
     return (low4 | high2) - 32;
 }
+#endif
 
 static inline float fp16_to_fp32_arm(uint16_t h) {
 #if defined(__aarch64__)
@@ -813,10 +828,15 @@ void lfm2_vec_dot_q8_0_q8_K_1x4_neon_dp(const void * restrict w_raw0, size_t rb,
 void lfm2_store_fp32_to_fp16_neon(uint16_t * restrict dst_f16,
                                   const float * restrict src_f32,
                                   uint32_t n_elems) {
-    for (uint32_t i = 0; i < n_elems; i += 8) {
+    uint32_t i = 0;
+    for (; i + 8 <= n_elems; i += 8) {
         float16x4_t lo = vcvt_f16_f32(vld1q_f32(src_f32 + i + 0));
         float16x4_t hi = vcvt_f16_f32(vld1q_f32(src_f32 + i + 4));
         vst1q_u16(dst_f16 + i, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
+    }
+    for (; i < n_elems; ++i) {
+        float16x4_t h = vcvt_f16_f32(vdupq_n_f32(src_f32[i]));
+        dst_f16[i] = vget_lane_u16(vreinterpret_u16_f16(h), 0);
     }
 }
 
@@ -883,6 +903,8 @@ void lfm2_init_mobile_kernels(LFM2MobileKernelTable *kt) {
     }
 #endif
 }
+
+#endif /* LFM2_SIMD_ARM64_INCLUDED */
 
 /* ============================================================================
  * 5. Standalone Verification & Benchmark Entry Point

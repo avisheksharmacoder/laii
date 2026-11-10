@@ -16,10 +16,18 @@
 #endif
 
 #ifndef LFM2_TARGET_AVX2
+#if defined(__x86_64__) || defined(_M_X64)
 #define LFM2_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#else
+#define LFM2_TARGET_AVX2
+#endif
 #endif
 #ifndef LFM2_TARGET_AVXVNNI
+#if defined(__x86_64__) || defined(_M_X64)
 #define LFM2_TARGET_AVXVNNI __attribute__((target("avx2,fma,f16c,avxvnni")))
+#else
+#define LFM2_TARGET_AVXVNNI
+#endif
 #endif
 
 #ifndef LFM2_PREFETCH_1X4_NTA
@@ -209,36 +217,6 @@ static inline int get_scale_iq4_xs(int ib, const uint8_t scales_l[4], uint16_t s
 }
 #endif
 
-#if LFM2_HAS_AVX2
-
-/* ============================================================================
- * 2. AVX2 Intrinsics Helpers
- * ============================================================================ */
-
-static inline __m256i lfm2_mm256_set_m128i(__m128i hi, __m128i lo) {
-    return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
-}
-
-/* Horizontally sums 8 x int32_t lanes in a __m256i register to a scalar int32_t */
-static inline int32_t lfm2_hsum_epi32_avx2(__m256i v) {
-    __m128i lo = _mm256_castsi256_si128(v);
-    __m128i hi = _mm256_extracti128_si256(v, 1);
-    __m128i sum128 = _mm_add_epi32(lo, hi);
-    sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
-    sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1)));
-    return _mm_cvtsi128_si32(sum128);
-}
-
-/* Horizontally sums 8 x float lanes in a __m256 register to a scalar float */
-static inline float lfm2_hsum_ps_avx2(__m256 v) {
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 s  = _mm_add_ps(lo, hi);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    return _mm_cvtss_f32(s);
-}
-
 /* ============================================================================
  * 2b. Portable Reference Activation Quantizer: float x[n_cols] -> block_q8_K_t y[(n_cols+255)/256]
  * ============================================================================ */
@@ -282,6 +260,36 @@ static inline void lfm2_quantize_row_q8_K_fallback(const float * restrict x, blo
         memcpy(pad, x + (size_t)nb * 256, (size_t)rem * sizeof(float));
         lfm2_quantize_block_q8_K_fallback(pad, &y[nb]);
     }
+}
+
+#if LFM2_HAS_AVX2
+
+/* ============================================================================
+ * 2. AVX2 Intrinsics Helpers
+ * ============================================================================ */
+
+static inline __m256i lfm2_mm256_set_m128i(__m128i hi, __m128i lo) {
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+/* Horizontally sums 8 x int32_t lanes in a __m256i register to a scalar int32_t */
+static inline int32_t lfm2_hsum_epi32_avx2(__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i sum128 = _mm_add_epi32(lo, hi);
+    sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2)));
+    sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(sum128);
+}
+
+/* Horizontally sums 8 x float lanes in a __m256 register to a scalar float */
+static inline float lfm2_hsum_ps_avx2(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
 }
 
 /* ============================================================================

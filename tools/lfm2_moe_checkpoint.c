@@ -8,7 +8,11 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -131,6 +135,34 @@ static inline GGUFTensor lfm2_slice_expert_tensor_2d(const GGUFTensor * restrict
  * 4. Selects Top-K experts maximizing `c[e]`
  * 5. Normalizes UNBIASED `s[e_k]` across the Top-K winners so sum(w_k) = routed_scale
  * ============================================================================ */
+static inline float lfm2_moe_dot_f16_f32(const uint16_t * restrict row,
+                                         const float * restrict xb,
+                                         uint32_t D) {
+    float logit = 0.0f;
+    uint32_t i = 0;
+#if LFM2_HAS_AVX2 && defined(__F16C__)
+    for (; i + 8 <= D; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i *)(row + i));
+        __m256  w = _mm256_cvtph_ps(h);
+        __m256  x = _mm256_loadu_ps(xb + i);
+        logit += hsum_ps_avx2(_mm256_mul_ps(w, x));
+    }
+#elif defined(__aarch64__)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (; i + 4 <= D; i += 4) {
+        uint16x4_t  h = vld1_u16(row + i);
+        float32x4_t w = vcvt_f32_f16(vreinterpret_f16_u16(h));
+        float32x4_t x = vld1q_f32(xb + i);
+        acc = vfmaq_f32(acc, w, x);
+    }
+    logit = vaddvq_f32(acc);
+#endif
+    for (; i < D; ++i) {
+        logit += fp16_to_fp32(row[i]) * xb[i];
+    }
+    return logit;
+}
+
 void lfm2_moe_route_sigmoid_topk(const LFM2MoELayerExt * restrict moe,
                                  const float * restrict xb,
                                  const block_q8_K_t * restrict x_q8,
@@ -151,7 +183,7 @@ void lfm2_moe_route_sigmoid_topk(const LFM2MoELayerExt * restrict moe,
     if (moe->ffn_gate_inp->type == GGML_TYPE_F32) {
         const float *w_router = (const float *)moe->ffn_gate_inp->data;
         for (uint32_t e = 0; e < n_exp; ++e) {
-            const float logit = lfm2_vec_dot_f32_avx2(w_router + (size_t)e * D, xb, D);
+            const float logit = lfm2_vec_dot_f32_simd(w_router + (size_t)e * D, xb, D);
             const float sig   = 1.0f / (1.0f + expf(-logit));
             raw_sigmoid[e]    = sig;
             sel_score[e]      = bias ? (sig + bias[e]) : sig;
@@ -160,20 +192,10 @@ void lfm2_moe_route_sigmoid_topk(const LFM2MoELayerExt * restrict moe,
         const uint16_t *w_router = (const uint16_t *)moe->ffn_gate_inp->data;
         for (uint32_t e = 0; e < n_exp; ++e) {
             const uint16_t *row = w_router + (size_t)e * D;
-            float logit = 0.0f;
-            uint32_t i = 0;
-            for (; i + 8 <= D; i += 8) {
-                __m128i h = _mm_loadu_si128((const __m128i *)(row + i));
-                __m256  w = _mm256_cvtph_ps(h);
-                __m256  x = _mm256_loadu_ps(xb + i);
-                logit += hsum_ps_avx2(_mm256_mul_ps(w, x));
-            }
-            for (; i < D; ++i) {
-                logit += fp16_to_fp32(row[i]) * xb[i];
-            }
-            const float sig = 1.0f / (1.0f + expf(-logit));
-            raw_sigmoid[e]  = sig;
-            sel_score[e]    = bias ? (sig + bias[e]) : sig;
+            const float logit   = lfm2_moe_dot_f16_f32(row, xb, D);
+            const float sig     = 1.0f / (1.0f + expf(-logit));
+            raw_sigmoid[e]      = sig;
+            sel_score[e]        = bias ? (sig + bias[e]) : sig;
         }
     } else {
         /* Quantized router weights (e.g. Q8_0, Q4_K) */
@@ -229,25 +251,56 @@ typedef struct {
     float               expert_weight;
 } MoEDownAccumTaskCtx;
 
+static inline void lfm2_moe_accum_down_chunk(float * restrict x_residual,
+                                             const GGUFTensor *w_down_2d,
+                                             const float *hb_f32,
+                                             const block_q8_K_t *hb_q8,
+                                             float expert_weight,
+                                             uint32_t r_start,
+                                             uint32_t r_end) {
+    uint32_t r = r_start;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m128 vw = _mm_set1_ps(expert_weight);
+    for (; r + 4 <= r_end; r += 4) {
+        float down4[4];
+        lfm2_compute_4rows_avx2(w_down_2d, r, hb_f32, hb_q8, down4);
+        __m128 vx = _mm_loadu_ps(x_residual + r);
+        __m128 vd = _mm_loadu_ps(down4);
+        _mm_storeu_ps(x_residual + r, _mm_fmadd_ps(vw, vd, vx));
+    }
+#elif defined(__aarch64__)
+    const float32x4_t vw = vdupq_n_f32(expert_weight);
+    for (; r + 4 <= r_end; r += 4) {
+        float down4[4];
+        lfm2_compute_4rows_avx2(w_down_2d, r, hb_f32, hb_q8, down4);
+        float32x4_t vx = vld1q_f32(x_residual + r);
+        float32x4_t vd = vld1q_f32(down4);
+        vst1q_f32(x_residual + r, vfmaq_f32(vx, vw, vd));
+    }
+#else
+    for (; r + 4 <= r_end; r += 4) {
+        float down4[4];
+        lfm2_compute_4rows_avx2(w_down_2d, r, hb_f32, hb_q8, down4);
+        x_residual[r + 0] += expert_weight * down4[0];
+        x_residual[r + 1] += expert_weight * down4[1];
+        x_residual[r + 2] += expert_weight * down4[2];
+        x_residual[r + 3] += expert_weight * down4[3];
+    }
+#endif
+    for (; r < r_end; ++r) {
+        const float d_val = lfm2_compute_1row_avx2(w_down_2d, r, hb_f32, hb_q8);
+        x_residual[r] += expert_weight * d_val;
+    }
+}
+
 static void lfm2_moe_down_accum_1x4_worker(void *arg, uint32_t tid, uint32_t n_threads) {
     (void)tid; (void)n_threads;
     MoEDownAccumTaskCtx *c = (MoEDownAccumTaskCtx *)arg;
-    const __m128 vw = _mm_set1_ps(c->expert_weight);
     uint32_t r_start = 0, r_end = 0;
 
     while (lfm2_threadpool_claim_chunk(c->pool, &r_start, &r_end)) {
-        uint32_t r = r_start;
-        for (; r + 4 <= r_end; r += 4) {
-            float down4[4];
-            lfm2_compute_4rows_avx2(c->w_down_2d, r, c->hb_f32, c->hb_q8, down4);
-            __m128 vx = _mm_loadu_ps(c->x_residual + r);
-            __m128 vd = _mm_loadu_ps(down4);
-            _mm_storeu_ps(c->x_residual + r, _mm_fmadd_ps(vw, vd, vx));
-        }
-        for (; r < r_end; ++r) {
-            const float d_val = lfm2_compute_1row_avx2(c->w_down_2d, r, c->hb_f32, c->hb_q8);
-            c->x_residual[r] += c->expert_weight * d_val;
-        }
+        lfm2_moe_accum_down_chunk(c->x_residual, c->w_down_2d, c->hb_f32, c->hb_q8,
+                                  c->expert_weight, r_start, r_end);
     }
 }
 
@@ -272,7 +325,7 @@ void lfm2_forward_moe_ffn_1x4(LFM2ThreadPool *pool,
     }
 
     /* 1. Normalize `x -> xb` and pre-quantize `xb -> xq_scratch` ONCE for all experts */
-    lfm2_rmsnorm_quantize_q8_K_avx2(xb, xq_scratch, x, layer->ffn_norm, D, eps);
+    lfm2_rmsnorm_quantize_q8_K_simd(xb, xq_scratch, x, layer->ffn_norm, D, eps);
 
     /* 2. Route to Top-K experts using Sigmoid + Expert Selection Bias */
     uint32_t top_experts[LFM2_MAX_TOP_K];
@@ -296,19 +349,7 @@ void lfm2_forward_moe_ffn_1x4(LFM2ThreadPool *pool,
 
         /* Fused 1x4 Down projection + weighted residual accumulation: x += exp_w * down */
         if (pool == NULL || pool->n_threads <= 1) {
-            const __m128 vw = _mm_set1_ps(exp_w);
-            uint32_t r = 0;
-            for (; r + 4 <= D; r += 4) {
-                float down4[4];
-                lfm2_compute_4rows_avx2(&down_2d, r, hb, hb_q8, down4);
-                __m128 vx = _mm_loadu_ps(x + r);
-                __m128 vd = _mm_loadu_ps(down4);
-                _mm_storeu_ps(x + r, _mm_fmadd_ps(vw, vd, vx));
-            }
-            for (; r < D; ++r) {
-                const float d_val = lfm2_compute_1row_avx2(&down_2d, r, hb, hb_q8);
-                x[r] += exp_w * d_val;
-            }
+            lfm2_moe_accum_down_chunk(x, &down_2d, hb, hb_q8, exp_w, 0, D);
         } else {
             MoEDownAccumTaskCtx down_ctx = {
                 .pool          = pool,

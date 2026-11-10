@@ -134,6 +134,9 @@ Assume a 16-layer model with $D = 2048$, generating a sequence of length $L = 40
 ### CPU Cache Benefit
 The entire recurrent state for all 10 convolution layers occupies only $\approx 164\text{ KB}$. This easily fits in the L2 cache (typically 512 KB to 1 MB per core) of modern x86 and ARM processors, resulting in near-zero memory bus traffic for short convolution state updates.
 
+> [!NOTE]
+> For real-world empirical benchmarks comparing LFM2.c against `llama.cpp` on `LFM2.5-1.2B` and `LFM2.5-230M` (including memory RSS reductions, cold load times, and roofline analysis), see [docs/BENCHMARKS.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/BENCHMARKS.md).
+
 ---
 
 ## 5. Real-World Liquid AI (LFM2/LFM2.5) GGUF Quirks & Loader Architecture

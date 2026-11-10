@@ -140,6 +140,7 @@ static inline void lfm2_planar_conv_free(LFM2PlanarConvWeights *pw) {
     memset(pw, 0, sizeof(*pw));
 }
 
+#if LFM2_HAS_AVX2
 /* Fused AVX2 ShortConv Operator:
  *   1. Gate 1: u_t = B * x_tilde
  *   2. 3-Tap Depthwise Conv1D: acc = w0 * state[t-2] + w1 * state[t-1] + w2 * u_t
@@ -198,6 +199,7 @@ static inline void lfm2_shortconv_gate_conv_quant_avx2(float * restrict conv_out
         }
     }
 }
+#endif
 
 /* Portable C11 Scalar Fallback */
 static inline void lfm2_shortconv_gate_conv_quant_scalar(float * restrict conv_out,
@@ -304,7 +306,7 @@ static inline void lfm2_shortconv_gate_conv_quant_neon(float * restrict conv_out
 
 /* Cross-Platform Vectorized In-Place Addition */
 static inline void lfm2_vec_add_inplace(float * restrict dst, const float * restrict src, uint32_t n) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if LFM2_HAS_AVX2
     for (uint32_t i = 0; i < n; i += 8) {
         _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), _mm256_loadu_ps(src + i)));
     }
@@ -318,7 +320,7 @@ static inline void lfm2_vec_add_inplace(float * restrict dst, const float * rest
 #endif
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if LFM2_HAS_AVX2
     #define lfm2_shortconv_gate_conv_quant_simd lfm2_shortconv_gate_conv_quant_avx2
 #elif defined(__aarch64__)
     #define lfm2_shortconv_gate_conv_quant_simd lfm2_shortconv_gate_conv_quant_neon
@@ -340,7 +342,7 @@ static inline void lfm2_forward_shortconv_fast(LFM2ThreadPool *pool,
                                                uint32_t D,
                                                float eps) {
     /* 1. Fused RMSNorm(x -> xb) + Quantize(xb -> xq_scratch) */
-    lfm2_rmsnorm_quantize_q8_K_avx2(xb, xq_scratch, x, layer->attn_norm, D, eps);
+    lfm2_rmsnorm_quantize_q8_K_simd(xb, xq_scratch, x, layer->attn_norm, D, eps);
 
     /* 2. 1x4 Unrolled Input Projection: xb [D] -> bcx [3 * D] */
     lfm2_matmul_1x4_prequant_mt(pool, bcx, layer->shortconv.in_proj, xb, xq_scratch);
@@ -392,6 +394,7 @@ static inline void lfm2_rope_lut_free(LFM2RoPELUT *lut) {
     memset(lut, 0, sizeof(*lut));
 }
 
+#if LFM2_HAS_AVX2
 /* Vectorized Per-Head QK-Norm + NeoX Half-Split RoPE (head_dim = 64):
  * - Normalizes each 64-dim head in AVX2 registers
  * - Rotates (head[0..31], head[32..63]) using precomputed `cos_lut[pos]` / `sin_lut[pos]`
@@ -502,6 +505,7 @@ static inline void lfm2_store_fp32_to_fp16_avx2(uint16_t * restrict dst_f16,
         _mm_storeu_si128((__m128i *)(dst_f16 + i), _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
     }
 }
+#endif
 
 /* Portable Scalar Fallbacks for QK-Norm & FP16 Cache Write */
 static inline void lfm2_qk_norm_rope_scalar(float * restrict vec_f32,
@@ -571,16 +575,23 @@ static inline void neon_store_fp32_to_fp16x8(uint16_t * restrict dst,
 }
 
 /* ARM64 NEON FP32 -> FP16 conversion vector store */
+#ifndef LFM2_SIMD_ARM64_INCLUDED
 LFM2_TARGET_ARM_FP16
 static inline void lfm2_store_fp32_to_fp16_neon(uint16_t * restrict dst_f16,
                                                 const float * restrict src_f32,
                                                 uint32_t n_elems) {
-    for (uint32_t i = 0; i < n_elems; i += 8) {
+    uint32_t i = 0;
+    for (; i + 8 <= n_elems; i += 8) {
         float32x4_t lo = vld1q_f32(src_f32 + i + 0);
         float32x4_t hi = vld1q_f32(src_f32 + i + 4);
         neon_store_fp32_to_fp16x8(dst_f16 + i, lo, hi);
     }
+    for (; i < n_elems; ++i) {
+        float16x4_t h = vcvt_f16_f32(vdupq_n_f32(src_f32[i]));
+        dst_f16[i] = vget_lane_u16(vreinterpret_u16_f16(h), 0);
+    }
 }
+#endif
 
 /* ARM64 NEON + FP16 Per-Head QK-Norm & Precomputed RoPE LUT */
 LFM2_TARGET_ARM_FP16
@@ -653,7 +664,7 @@ static inline void lfm2_qk_norm_rope_neon(float * restrict vec_f32,
 }
 #endif
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if LFM2_HAS_AVX2
     #define lfm2_qk_norm_rope_simd       lfm2_qk_norm_rope_avx2
     #define lfm2_store_fp32_to_fp16_simd lfm2_store_fp32_to_fp16_avx2
 #elif defined(__aarch64__)
@@ -685,6 +696,7 @@ typedef struct {
     float           scale;
 } OnlineGQATaskCtx;
 
+#if LFM2_HAS_AVX2
 static inline void lfm2_online_gqa_f16_worker(void *arg, uint32_t tid, uint32_t n_threads) {
     (void)tid; (void)n_threads;
     OnlineGQATaskCtx *c = (OnlineGQATaskCtx *)arg;
@@ -796,6 +808,7 @@ static inline void lfm2_online_gqa_f16_worker(void *arg, uint32_t tid, uint32_t 
         }
     }
 }
+#endif
 
 /* Portable C11 Scalar Fallback */
 static inline void lfm2_online_gqa_f16_worker_scalar(void *arg, uint32_t tid, uint32_t n_threads) {
@@ -994,7 +1007,7 @@ static inline void lfm2_online_gqa_f16_worker_neon(void *arg, uint32_t tid, uint
 }
 #endif
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if LFM2_HAS_AVX2
     #define lfm2_online_gqa_f16_worker_simd lfm2_online_gqa_f16_worker
 #elif defined(__aarch64__)
     #define lfm2_online_gqa_f16_worker_simd lfm2_online_gqa_f16_worker_neon
@@ -1023,7 +1036,7 @@ static inline void lfm2_forward_gqa_fast(LFM2ThreadPool *pool,
     const uint32_t kv_dim   = n_head_kv * head_dim;
 
     /* 1. Fused RMSNorm(x -> xb) + Quantize(xb -> xq_scratch) */
-    lfm2_rmsnorm_quantize_q8_K_avx2(xb, xq_scratch, x, layer->attn_norm, D, eps);
+    lfm2_rmsnorm_quantize_q8_K_simd(xb, xq_scratch, x, layer->attn_norm, D, eps);
 
     /* 2. Fused Single-Barrier 1x4 Q, K, V Projection */
     lfm2_gqa_qkv_fused_1x4_mt(pool, q, k, v, layer->attn.wq, layer->attn.wk, layer->attn.wv,
@@ -1148,8 +1161,16 @@ static inline float *lfm2_forward_token_fast(const LFM2Model *m,
     if (!compute_logits) return NULL;
 
     /* 3. Output RMSNorm + LM Head Projection */
-    lfm2_rmsnorm(s->x, s->x, m->output_norm, D, eps);
-    lfm2_matmul_vec(s->logits, m->output, s->x, s->xq_scratch, &s->pool);
+    if (m->output->type == GGML_TYPE_Q4_K || m->output->type == GGML_TYPE_Q6_K ||
+        m->output->type == GGML_TYPE_Q8_0 || m->output->type == GGML_TYPE_Q4_0 ||
+        m->output->type == GGML_TYPE_Q5_K || m->output->type == GGML_TYPE_IQ4_XS ||
+        m->output->type == GGML_TYPE_F32) {
+        lfm2_rmsnorm_quantize_q8_K_simd(s->xb, s->xq_scratch, s->x, m->output_norm, D, eps);
+        lfm2_matmul_1x4_prequant_mt(&s->pool, s->logits, m->output, s->xb, s->xq_scratch);
+    } else {
+        lfm2_rmsnorm(s->x, s->x, m->output_norm, D, eps);
+        lfm2_matmul_vec(s->logits, m->output, s->x, s->xq_scratch, &s->pool);
+    }
     return s->logits;
 }
 
@@ -1208,8 +1229,8 @@ int main(int argc, char **argv) {
         state_ref[D + d] = u_t;
     }
 
-    /* Fused AVX2 Planar ShortConv + Q8_K Quantize */
-    lfm2_shortconv_gate_conv_quant_avx2(out_avx, out_q8, bcx, state_avx, &pw, D);
+    /* Fused SIMD Planar ShortConv + Q8_K Quantize */
+    lfm2_shortconv_gate_conv_quant_simd(out_avx, out_q8, bcx, state_avx, &pw, D);
 
     float max_conv_err = 0.0f;
     for (uint32_t d = 0; d < D; ++d) {
@@ -1247,7 +1268,7 @@ int main(int argc, char **argv) {
             hp[i + 32] = x1 * c + x0 * s;
         }
     }
-    lfm2_qk_norm_rope_avx2(q_avx, NULL, n_head_q, head_dim, &t_qnorm, 1e-5f, &rope_lut, pos);
+    lfm2_qk_norm_rope_simd(q_avx, NULL, n_head_q, head_dim, &t_qnorm, 1e-5f, &rope_lut, pos);
 
     float max_rope_err = 0.0f;
     for (uint32_t i = 0; i < D; ++i) {
@@ -1271,8 +1292,8 @@ int main(int argc, char **argv) {
         k_cache_f32[i] = sinf((float)i * 0.0031f);
         v_cache_f32[i] = cosf((float)i * 0.0023f);
     }
-    lfm2_store_fp32_to_fp16_avx2(k_cache_f16, k_cache_f32, seq_len * kv_dim);
-    lfm2_store_fp32_to_fp16_avx2(v_cache_f16, v_cache_f32, seq_len * kv_dim);
+    lfm2_store_fp32_to_fp16_simd(k_cache_f16, k_cache_f32, seq_len * kv_dim);
+    lfm2_store_fp32_to_fp16_simd(v_cache_f16, v_cache_f32, seq_len * kv_dim);
 
     GQAAttnTaskCtx ref_ctx = {
         .pool = &pool, .q = q_avx, .k_cache = k_cache_f32, .v_cache = v_cache_f32,
@@ -1286,7 +1307,7 @@ int main(int argc, char **argv) {
         .xb_out = gqa_online, .xb_q8_out = out_q8, .n_head_q = n_head_q, .kv_mul = 4,
         .kv_dim = kv_dim, .pos = pos, .scale = 0.125f
     };
-    lfm2_parallel_for(&pool, n_head_q / 4, 1, lfm2_online_gqa_f16_worker, &online_ctx);
+    lfm2_parallel_for(&pool, n_head_q / 4, 1, lfm2_online_gqa_f16_worker_simd, &online_ctx);
 
     float max_gqa_err = 0.0f;
     for (uint32_t i = 0; i < D; ++i) {
@@ -1305,7 +1326,7 @@ int main(int argc, char **argv) {
 
     t0 = now_ms();
     for (int it = 0; it < iters; ++it) {
-        lfm2_parallel_for(&pool, n_head_q / 4, 1, lfm2_online_gqa_f16_worker, &online_ctx);
+        lfm2_parallel_for(&pool, n_head_q / 4, 1, lfm2_online_gqa_f16_worker_simd, &online_ctx);
     }
     double f16_ms = (now_ms() - t0) / iters;
 

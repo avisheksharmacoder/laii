@@ -10,6 +10,9 @@
 
 #ifndef LFM2_FORWARD_INCLUDED
 #define LFM2_FORWARD_INCLUDED 1
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -60,6 +63,31 @@ static inline float ggml_bf16_to_fp32(uint16_t b) {
 }
 
 #include "lfm2_simd_avx2.h"
+#ifndef LFM2_FP32_TO_FP16_DEFINED
+#define LFM2_FP32_TO_FP16_DEFINED 1
+static inline uint16_t lfm2_fp32_to_fp16(float f) {
+#if defined(__F16C__)
+    return (uint16_t)_cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+#else
+    uint32_t x;
+    memcpy(&x, &f, sizeof(float));
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x007FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant = (mant | 0x00800000u) >> (1 - exp);
+        return (uint16_t)(sign | ((mant + 0x1000u) >> 13));
+    }
+    if (exp >= 31) {
+        return (exp == 128 + 15 && mant != 0)
+             ? (uint16_t)(sign | 0x7E00u | (mant >> 13))
+             : (uint16_t)(sign | 0x7C00u);
+    }
+    return (uint16_t)(sign | (((uint32_t)exp << 10) + ((mant + 0x1000u) >> 13)));
+#endif
+}
+#endif
 #define get_scale_min_k4 lfm2_get_scale_min_k4
 
 #define LFM2_THREADPOOL_NO_MAIN 1
@@ -419,6 +447,8 @@ static void lfm2_matmul_vec(float *out, const GGUFTensor *W, const float *x,
         return;
     }
 #endif
+    (void)xq_scratch;
+    (void)pool;
 
     ggml_type_traits_t traits;
     get_ggml_type_traits(W->type, &traits);
@@ -606,6 +636,22 @@ void lfm2_state_free(LFM2State *s) {
  * ============================================================================ */
 
 /* Standard RMSNorm: out[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i] */
+static inline void lfm2_fwd_vec_add_f32(float * restrict dst, const float * restrict src, uint32_t n) {
+    uint32_t d = 0;
+#if LFM2_HAS_AVX2
+    for (; d + 8 <= n; d += 8) {
+        _mm256_storeu_ps(dst + d, _mm256_add_ps(_mm256_loadu_ps(dst + d), _mm256_loadu_ps(src + d)));
+    }
+#elif defined(__aarch64__)
+    for (; d + 4 <= n; d += 4) {
+        vst1q_f32(dst + d, vaddq_f32(vld1q_f32(dst + d), vld1q_f32(src + d)));
+    }
+#endif
+    for (; d < n; ++d) {
+        dst[d] += src[d];
+    }
+}
+
 static void lfm2_rmsnorm(float *out, const float *x, const GGUFTensor *weight_tensor,
                          uint32_t dim, float eps) {
 #if LFM2_HAS_AVX2
@@ -643,6 +689,37 @@ static void lfm2_rmsnorm(float *out, const float *x, const GGUFTensor *weight_te
             _mm256_storeu_ps(out + d, _mm256_mul_ps(_mm256_mul_ps(vx, vinv), vw));
         }
 #endif
+        for (; d < dim; ++d) out[d] = x[d] * inv_rms * ggml_fp16_to_fp32(w[d]);
+    }
+#elif defined(__aarch64__)
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    uint32_t d = 0;
+    for (; d + 4 <= dim; d += 4) {
+        float32x4_t vx = vld1q_f32(x + d);
+        vsum = vfmaq_f32(vsum, vx, vx);
+    }
+    double ss = (double)vaddvq_f32(vsum);
+    for (; d < dim; ++d) ss += (double)x[d] * (double)x[d];
+    const float inv_rms = 1.0f / sqrtf((float)(ss / (double)dim) + eps);
+    float32x4_t vinv = vdupq_n_f32(inv_rms);
+
+    if (weight_tensor->type == GGML_TYPE_F32) {
+        const float *w = (const float *)weight_tensor->data;
+        d = 0;
+        for (; d + 4 <= dim; d += 4) {
+            float32x4_t vx = vld1q_f32(x + d);
+            float32x4_t vw = vld1q_f32(w + d);
+            vst1q_f32(out + d, vmulq_f32(vmulq_f32(vx, vinv), vw));
+        }
+        for (; d < dim; ++d) out[d] = x[d] * inv_rms * w[d];
+    } else {
+        const uint16_t *w = (const uint16_t *)weight_tensor->data;
+        d = 0;
+        for (; d + 4 <= dim; d += 4) {
+            float32x4_t vx = vld1q_f32(x + d);
+            float32x4_t vw = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(w + d)));
+            vst1q_f32(out + d, vmulq_f32(vmulq_f32(vx, vinv), vw));
+        }
         for (; d < dim; ++d) out[d] = x[d] * inv_rms * ggml_fp16_to_fp32(w[d]);
     }
 #else
@@ -698,8 +775,9 @@ static void lfm2_qk_norm_and_rope(const LFM2State *s, float *vec, uint32_t n_hea
 
         /* 2. NeoX Half-Split RoPE: pairs (head[i], head[i + half_dim]) */
         if (cos_table && sin_table) {
+            uint32_t i = 0;
 #if LFM2_HAS_AVX2
-            for (uint32_t i = 0; i < half_dim; i += 8) {
+            for (; i + 8 <= half_dim; i += 8) {
                 __m256 vx0  = _mm256_loadu_ps(head + i);
                 __m256 vx1  = _mm256_loadu_ps(head + half_dim + i);
                 __m256 vcos = _mm256_loadu_ps(cos_table + i);
@@ -711,8 +789,21 @@ static void lfm2_qk_norm_and_rope(const LFM2State *s, float *vec, uint32_t n_hea
                 _mm256_storeu_ps(head + i, vout0);
                 _mm256_storeu_ps(head + half_dim + i, vout1);
             }
-#else
-            for (uint32_t i = 0; i < half_dim; ++i) {
+#elif defined(__aarch64__)
+            for (; i + 4 <= half_dim; i += 4) {
+                float32x4_t vx0  = vld1q_f32(head + i);
+                float32x4_t vx1  = vld1q_f32(head + half_dim + i);
+                float32x4_t vcos = vld1q_f32(cos_table + i);
+                float32x4_t vsin = vld1q_f32(sin_table + i);
+
+                float32x4_t vout0 = vfmsq_f32(vmulq_f32(vx0, vcos), vx1, vsin);
+                float32x4_t vout1 = vfmaq_f32(vmulq_f32(vx1, vcos), vx0, vsin);
+
+                vst1q_f32(head + i, vout0);
+                vst1q_f32(head + half_dim + i, vout1);
+            }
+#endif
+            for (; i < half_dim; ++i) {
                 const float cos_a = cos_table[i];
                 const float sin_a = sin_table[i];
                 const float x0 = head[i];
@@ -720,7 +811,6 @@ static void lfm2_qk_norm_and_rope(const LFM2State *s, float *vec, uint32_t n_hea
                 head[i]            = x0 * cos_a - x1 * sin_a;
                 head[i + half_dim] = x1 * cos_a + x0 * sin_a;
             }
-#endif
         } else {
             for (uint32_t i = 0; i < half_dim; ++i) {
                 const float freq  = powf(10000.0f, -((float)(2 * i) / (float)head_dim));
@@ -755,17 +845,23 @@ static void lfm2_forward_shortconv(LFM2State *s, const LFM2Model *m,
     float *x_tilde = s->bcx + 2 * D;
 
     /* 2. First multiplicative gate: Bx[d] = B[d] * x_tilde[d] (stored in B) */
+    uint32_t d = 0;
 #if LFM2_HAS_AVX2
-    for (uint32_t d = 0; d < D; d += 8) {
+    for (; d + 8 <= D; d += 8) {
         __m256 vb = _mm256_loadu_ps(B + d);
         __m256 vx = _mm256_loadu_ps(x_tilde + d);
         _mm256_storeu_ps(B + d, _mm256_mul_ps(vb, vx));
     }
-#else
-    for (uint32_t d = 0; d < D; ++d) {
-        B[d] = B[d] * x_tilde[d];
+#elif defined(__aarch64__)
+    for (; d + 4 <= D; d += 4) {
+        float32x4_t vb = vld1q_f32(B + d);
+        float32x4_t vx = vld1q_f32(x_tilde + d);
+        vst1q_f32(B + d, vmulq_f32(vb, vx));
     }
 #endif
+    for (; d < D; ++d) {
+        B[d] = B[d] * x_tilde[d];
+    }
 
     /* 3. Causal 1D Depthwise Convolution across (l_cache - 1) state steps + current B[d] */
     float *state = s->conv_state[l_idx]; /* shape: [hist][D] */
@@ -776,8 +872,9 @@ static void lfm2_forward_shortconv(LFM2State *s, const LFM2Model *m,
     if (w0 && w1 && w2 && hist == 2) {
         const float *s0 = state;
         const float *s1 = state + D;
+        d = 0;
 #if LFM2_HAS_AVX2
-        for (uint32_t d = 0; d < D; d += 8) {
+        for (; d + 8 <= D; d += 8) {
             __m256 vw0 = _mm256_loadu_ps(w0 + d);
             __m256 vs0 = _mm256_loadu_ps(s0 + d);
             __m256 vw1 = _mm256_loadu_ps(w1 + d);
@@ -791,12 +888,25 @@ static void lfm2_forward_shortconv(LFM2State *s, const LFM2Model *m,
             __m256 vy = _mm256_mul_ps(vc, vacc);
             _mm256_storeu_ps(s->conv_out + d, vy);
         }
-#else
-        for (uint32_t d = 0; d < D; ++d) {
+#elif defined(__aarch64__)
+        for (; d + 4 <= D; d += 4) {
+            float32x4_t vw0 = vld1q_f32(w0 + d);
+            float32x4_t vs0 = vld1q_f32(s0 + d);
+            float32x4_t vw1 = vld1q_f32(w1 + d);
+            float32x4_t vs1 = vld1q_f32(s1 + d);
+            float32x4_t vw2 = vld1q_f32(w2 + d);
+            float32x4_t vb  = vld1q_f32(B + d);
+            float32x4_t vc  = vld1q_f32(C + d);
+
+            float32x4_t vacc = vfmaq_f32(vmulq_f32(vw1, vs1), vw0, vs0);
+            vacc = vfmaq_f32(vacc, vw2, vb);
+            vst1q_f32(s->conv_out + d, vmulq_f32(vc, vacc));
+        }
+#endif
+        for (; d < D; ++d) {
             float acc = w0[d] * s0[d] + w1[d] * s1[d] + w2[d] * B[d];
             s->conv_out[d] = C[d] * acc;
         }
-#endif
     } else {
         const GGUFTensor *conv_t = layer->shortconv.conv;
         const bool stride_is_lcache = (conv_t->ne[0] == l_cache);
@@ -831,17 +941,7 @@ static void lfm2_forward_shortconv(LFM2State *s, const LFM2Model *m,
 
     /* 6. Output linear projection: conv_out [D] -> xb [D], then add to residual x */
     lfm2_matmul_vec(s->xb, layer->shortconv.out_proj, s->conv_out, s->xq_scratch, &s->pool);
-#if LFM2_HAS_AVX2
-    for (uint32_t d = 0; d < D; d += 8) {
-        __m256 vx  = _mm256_loadu_ps(s->x + d);
-        __m256 vxb = _mm256_loadu_ps(s->xb + d);
-        _mm256_storeu_ps(s->x + d, _mm256_add_ps(vx, vxb));
-    }
-#else
-    for (uint32_t d = 0; d < D; ++d) {
-        s->x[d] += s->xb[d];
-    }
-#endif
+    lfm2_fwd_vec_add_f32(s->x, s->xb, D);
 }
 
 /* ============================================================================
@@ -876,18 +976,28 @@ static void lfm2_forward_gqa(LFM2State *s, const LFM2Model *m,
     if (s->k_cache_f16[l_idx] && s->v_cache_f16[l_idx]) {
         uint16_t *k_step = s->k_cache_f16[l_idx] + (size_t)pos * kv_dim;
         uint16_t *v_step = s->v_cache_f16[l_idx] + (size_t)pos * kv_dim;
+        uint32_t i = 0;
 #if defined(__F16C__)
-        for (uint32_t i = 0; i < kv_dim; i += 8) {
+        for (; i + 8 <= kv_dim; i += 8) {
             __m256 vk = _mm256_loadu_ps(s->k + i);
             __m256 vv = _mm256_loadu_ps(s->v + i);
             _mm_storeu_si128((__m128i *)(k_step + i), _mm256_cvtps_ph(vk, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
             _mm_storeu_si128((__m128i *)(v_step + i), _mm256_cvtps_ph(vv, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         }
-#else
-        for (uint32_t i = 0; i < kv_dim; ++i) {
-            /* Fallback float-to-fp16 bit manipulation if needed */
+#elif defined(__aarch64__)
+        for (; i + 8 <= kv_dim; i += 8) {
+            float16x4_t hk0 = vcvt_f16_f32(vld1q_f32(s->k + i + 0));
+            float16x4_t hk1 = vcvt_f16_f32(vld1q_f32(s->k + i + 4));
+            float16x4_t hv0 = vcvt_f16_f32(vld1q_f32(s->v + i + 0));
+            float16x4_t hv1 = vcvt_f16_f32(vld1q_f32(s->v + i + 4));
+            vst1q_u16(k_step + i, vreinterpretq_u16_f16(vcombine_f16(hk0, hk1)));
+            vst1q_u16(v_step + i, vreinterpretq_u16_f16(vcombine_f16(hv0, hv1)));
         }
 #endif
+        for (; i < kv_dim; ++i) {
+            k_step[i] = lfm2_fp32_to_fp16(s->k[i]);
+            v_step[i] = lfm2_fp32_to_fp16(s->v[i]);
+        }
     }
 
     /* 4. Multi-Head Grouped-Query Scaled Dot-Product Attention */
@@ -912,17 +1022,7 @@ static void lfm2_forward_gqa(LFM2State *s, const LFM2Model *m,
 
     /* 5. Output Projection (attn_output.weight) & Residual Connection */
     lfm2_matmul_vec(s->conv_out, layer->attn.wo, s->xb, s->xq_scratch, &s->pool);
-#if LFM2_HAS_AVX2
-    for (uint32_t d = 0; d < D; d += 8) {
-        __m256 vx   = _mm256_loadu_ps(s->x + d);
-        __m256 vout = _mm256_loadu_ps(s->conv_out + d);
-        _mm256_storeu_ps(s->x + d, _mm256_add_ps(vx, vout));
-    }
-#else
-    for (uint32_t d = 0; d < D; ++d) {
-        s->x[d] += s->conv_out[d];
-    }
-#endif
+    lfm2_fwd_vec_add_f32(s->x, s->conv_out, D);
 }
 
 /* ============================================================================
@@ -962,17 +1062,7 @@ static void lfm2_forward_ffn(LFM2State *s, const LFM2Model *m, const LFM2Layer *
 
     /* 4. Down Projection: hb [n_ff] -> xb [D] & Residual Addition */
     lfm2_matmul_vec(s->xb, layer->ffn_down, s->hb, s->xq_scratch, &s->pool);
-#if LFM2_HAS_AVX2
-    for (uint32_t d = 0; d < D; d += 8) {
-        __m256 vx  = _mm256_loadu_ps(s->x + d);
-        __m256 vxb = _mm256_loadu_ps(s->xb + d);
-        _mm256_storeu_ps(s->x + d, _mm256_add_ps(vx, vxb));
-    }
-#else
-    for (uint32_t d = 0; d < D; ++d) {
-        s->x[d] += s->xb[d];
-    }
-#endif
+    lfm2_fwd_vec_add_f32(s->x, s->xb, D);
 }
 
 /* ============================================================================

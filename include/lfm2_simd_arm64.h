@@ -134,6 +134,8 @@ static const _Alignas(16) int8_t kvalues_iq4nl[16] = {
 /* ============================================================================
  * 2. Function Pointer Types & Mobile Kernel Table
  * ============================================================================ */
+#ifndef LFM2_KERNEL_FN_TYPES_DEFINED
+#define LFM2_KERNEL_FN_TYPES_DEFINED
 typedef void  (*lfm2_quantize_q8_K_fn)(const float * restrict x,
                                        block_q8_K_t * restrict y,
                                        uint32_t n_cols);
@@ -147,6 +149,7 @@ typedef void  (*lfm2_vec_dot_1x4_fn)(const void * restrict w_row0,
                                      const block_q8_K_t * restrict x_q8,
                                      uint32_t n_cols,
                                      float out4[4]);
+#endif
 
 typedef struct {
     const char *isa_name;

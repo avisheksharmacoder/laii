@@ -17,18 +17,33 @@ verify:asan-ubsan-parity:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends
         build-essential gcc clang llvm python3 ca-certificates
   script:
-    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
     - make asan
+    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+    - ASAN_LIB="$(gcc -print-file-name=libasan.so)"
+    - test -f "$ASAN_LIB"
     # 1. Run 5-Tier Parity Suite under ASan + UBSan with Hardware SIMD (AVX2 / VNNI)
-    - ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:verify_asan_link_order=0"
+    - LD_PRELOAD="$ASAN_LIB"
+      ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1"
       UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
-      python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
+      python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./lib/liblfm2.so \
         --golden-file build/ci.lfm_golden --generate-golden
     # 2. Verify Portable Scalar Fallback against the SIMD Golden Fixture (0.0 ULP check)
     - LFM2_FORCE_ISA=scalar
-      ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1:verify_asan_link_order=0"
-      python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./liblfm2.so \
+      LD_PRELOAD="$ASAN_LIB"
+      ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1"
+      UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+      python3 tests/verify_parity.py -m "$CI_GGUF_PATH" --lib ./lib/liblfm2.so \
         --golden-file build/ci.lfm_golden -q F32
+
+verify:jni-bridge:
+  stage: verify
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends
+        build-essential gcc make python3 openjdk-17-jdk-headless ca-certificates
+  script:
+    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+    - make test-jni MODEL="$CI_GGUF_PATH"
 
 verify:tsan-threadpool:
   stage: verify
@@ -37,10 +52,15 @@ verify:tsan-threadpool:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends
         build-essential gcc clang llvm python3 util-linux ca-certificates
   script:
-    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
     - make tsan
-    - TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1"
-      setarch x86_64 -R ./bin/lfm2-tsan -m "$CI_GGUF_PATH" -p "Test lock-free spin-barrier thread pool" -n 16
+    - python3 tests/gen_ci_gguf.py "$CI_GGUF_PATH"
+    - |
+      TSAN_CMD="./bin/lfm2-tsan"
+      if command -v setarch >/dev/null 2>&1 && setarch "$(uname -m)" -R true 2>/dev/null; then
+        TSAN_CMD="setarch $(uname -m) -R ./bin/lfm2-tsan"
+      fi
+      TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
+        $TSAN_CMD -m "$CI_GGUF_PATH" -p "Test lock-free spin-barrier thread pool" -n 16
 
 # ==============================================================================
 # Stage 2: Production Artifacts (Static musl ELF, manylinux Wheel, Android NDK)
@@ -49,13 +69,15 @@ build:linux-musl-static:
   stage: build
   image: alpine:3.20
   before_script:
-    - apk add --no-cache build-base musl-dev linux-headers file binutils python3
+    - apk add --no-cache build-base musl-dev linux-headers file binutils python3 curl
   script:
-    - make static CC=gcc
+    - make static-test CC=gcc PYTHON=python3
     - strip --strip-unneeded bin/lfm2-static bin/lfm2-server-static
     # Programmatically certify that the binary is 100% statically linked
     - file bin/lfm2-static | grep -E "statically linked|static-pie linked"
     - file bin/lfm2-server-static | grep -E "statically linked|static-pie linked"
+    - if readelf -l bin/lfm2-static | grep -q "INTERP"; then exit 1; fi
+    - if readelf -l bin/lfm2-server-static | grep -q "INTERP"; then exit 1; fi
     - mkdir -p dist/linux-x86_64-static
     - cp bin/lfm2-static dist/linux-x86_64-static/lfm2
     - cp bin/lfm2-server-static dist/linux-x86_64-static/lfm2-server
@@ -120,6 +142,9 @@ build:android-arm64-ndk:
     - echo "[PASS] Android arm64-v8a liblfm2.so verified with 16 KB page alignment"
     - mkdir -p dist/android-arm64-v8a
     - cp lib/android-arm64-v8a/liblfm2.so include/lfm2.h python/lfm2.py dist/android-arm64-v8a/
+    - cp docs/ANDROID_KOTLIN_INTEGRATION.md dist/android-arm64-v8a/
+    - cp -r android dist/android-arm64-v8a/
+    - cp -r p4a-recipes dist/android-arm64-v8a/ 2>/dev/null || true
     - tar -czvf dist/lfm2-android-arm64-v8a.tar.gz -C dist/android-arm64-v8a .
   artifacts:
     name: "lfm2-android-arm64-v8a-${CI_COMMIT_SHORT_SHA}"

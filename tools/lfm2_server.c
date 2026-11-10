@@ -80,16 +80,16 @@ static const char LFM2_INDEX_HTML[] =
     "msgs.push({role:'user',content:txt});"
     "let u=document.createElement('div');u.className='msg usr';u.textContent=txt;log.appendChild(u);"
     "let a=document.createElement('div');a.className='msg ast';log.appendChild(a);"
-    "const t0=performance.now();let tok=0,full='';stat.textContent='Generating...';"
+    "let t0=0,tok=0,full='';stat.textContent='Thinking...';"
     "const res=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({messages:msgs,stream:true,temperature:0.3})});"
     "const rdr=res.body.getReader(),dec=new TextDecoder();let buf='';"
     "while(true){const{value,done}=await rdr.read();if(done)break;"
     "buf+=dec.decode(value,{stream:true});const lines=buf.split('\\n');buf=lines.pop();"
     "for(const ln of lines){if(!ln.startsWith('data: '))continue;const d=ln.slice(6).trim();"
-    "if(d==='[DONE]')break;try{const j=JSON.parse(d),c=j.choices[0].delta.content||j.choices[0].delta.reasoning_content||'';"
-    "if(c){full+=c;tok++;a.textContent=full;log.scrollTop=log.scrollHeight;"
-    "stat.textContent=`${(tok/((performance.now()-t0)/1000)).toFixed(1)} tok/s`;}}catch(_){}}}"
+    "if(d==='[DONE]'){stat.textContent+=` (${tok} tokens)`;break;}try{const j=JSON.parse(d),c=j.choices[0].delta.content||j.choices[0].delta.reasoning_content||'';"
+    "if(c){full+=c;if(!t0){t0=performance.now();}else{tok++;const dt=(performance.now()-t0)/1000;if(dt>0.05)stat.textContent=`${(tok/dt).toFixed(1)} tok/s`;}"
+    "a.textContent=full;log.scrollTop=log.scrollHeight;}}catch(_){}}}"
     "msgs.push({role:'assistant',content:full});};</script></body></html>";
 
 /* ============================================================================

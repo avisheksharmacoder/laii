@@ -28,6 +28,7 @@
 #include <immintrin.h>
 #define lfm2_cpu_pause() _mm_pause()
 #elif defined(__aarch64__)
+#include <arm_neon.h>
 #define lfm2_cpu_pause() __asm__ volatile("yield" ::: "memory")
 #else
 #define lfm2_cpu_pause() do {} while (0)
@@ -825,6 +826,62 @@ static inline void lfm2_gqa_heads_worker_task(void *arg, uint32_t tid, uint32_t 
                 }
                 continue;
             }
+#elif defined(__aarch64__)
+            if (c->k_cache_f16 && c->v_cache_f16 && c->head_dim <= 64 && (c->head_dim % 8) == 0) {
+                /* ARM64 NEON Hardware FP16 + Single-Pass Online Softmax */
+                float m = -1e30f;
+                float l = 0.0f;
+                float32x4_t v_acc[16];
+                const uint32_t n_vec = c->head_dim / 4;
+                for (uint32_t v = 0; v < n_vec; ++v) {
+                    v_acc[v] = vdupq_n_f32(0.0f);
+                }
+
+                for (uint32_t t = 0; t <= c->pos; ++t) {
+                    const uint16_t *kt_ptr = c->k_cache_f16 + (size_t)t * c->kv_dim + (size_t)kv_h * c->head_dim;
+                    const uint16_t *vt_ptr = c->v_cache_f16 + (size_t)t * c->kv_dim + (size_t)kv_h * c->head_dim;
+
+                    float32x4_t dot0 = vdupq_n_f32(0.0f);
+                    float32x4_t dot1 = vdupq_n_f32(0.0f);
+                    for (uint32_t i = 0; i < c->head_dim; i += 8) {
+                        uint16x8_t hk = vld1q_u16(kt_ptr + i);
+                        float32x4_t vk0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(hk)));
+                        float32x4_t vk1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(hk)));
+                        dot0 = vfmaq_f32(dot0, vld1q_f32(q_head + i + 0), vk0);
+                        dot1 = vfmaq_f32(dot1, vld1q_f32(q_head + i + 4), vk1);
+                    }
+                    float s_t = vaddvq_f32(vaddq_f32(dot0, dot1)) * c->scale;
+
+                    if (s_t > m) {
+                        float scale_prev = expf(m - s_t);
+                        m = s_t;
+                        l = l * scale_prev + 1.0f;
+                        for (uint32_t v = 0; v < n_vec; v += 2) {
+                            uint16x8_t hv = vld1q_u16(vt_ptr + v * 4);
+                            float32x4_t vt0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(hv)));
+                            float32x4_t vt1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(hv)));
+                            v_acc[v + 0] = vfmaq_n_f32(vt0, v_acc[v + 0], scale_prev);
+                            v_acc[v + 1] = vfmaq_n_f32(vt1, v_acc[v + 1], scale_prev);
+                        }
+                    } else {
+                        float weight_t = expf(s_t - m);
+                        l += weight_t;
+                        for (uint32_t v = 0; v < n_vec; v += 2) {
+                            uint16x8_t hv = vld1q_u16(vt_ptr + v * 4);
+                            float32x4_t vt0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(hv)));
+                            float32x4_t vt1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(hv)));
+                            v_acc[v + 0] = vfmaq_n_f32(v_acc[v + 0], vt0, weight_t);
+                            v_acc[v + 1] = vfmaq_n_f32(v_acc[v + 1], vt1, weight_t);
+                        }
+                    }
+                }
+
+                float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                for (uint32_t v = 0; v < n_vec; ++v) {
+                    vst1q_f32(out_head + v * 4, vmulq_n_f32(v_acc[v], inv_l));
+                }
+                continue;
+            }
 #endif
 
             /* Fallback FP32 2-Pass Softmax */
@@ -835,6 +892,14 @@ static inline void lfm2_gqa_heads_worker_task(void *arg, uint32_t tid, uint32_t 
                 float dot = 0.0f;
 #if LFM2_HAS_AVX2
                 dot = lfm2_vec_dot_f32_avx2(q_head, k_t, c->head_dim);
+#elif defined(__aarch64__)
+                float32x4_t vdot = vdupq_n_f32(0.0f);
+                uint32_t i = 0;
+                for (; i + 4 <= c->head_dim; i += 4) {
+                    vdot = vfmaq_f32(vdot, vld1q_f32(q_head + i), vld1q_f32(k_t + i));
+                }
+                dot = vaddvq_f32(vdot);
+                for (; i < c->head_dim; ++i) dot += q_head[i] * k_t[i];
 #else
                 for (uint32_t i = 0; i < c->head_dim; ++i) dot += q_head[i] * k_t[i];
 #endif

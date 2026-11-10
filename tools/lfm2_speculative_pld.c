@@ -301,8 +301,9 @@ static void lfm2_forward_shortconv_spec_batch(LFM2SpecState *ss,
         if (w0 && w1 && w2 && hist == 2) {
             const float *s0 = state;
             const float *s1 = state + D;
+            uint32_t d = 0;
 #if LFM2_HAS_AVX2
-            for (uint32_t d = 0; d < D; d += 8) {
+            for (; d + 8 <= D; d += 8) {
                 __m256 vb = _mm256_loadu_ps(B_gate + d);
                 __m256 vx = _mm256_loadu_ps(x_tilde + d);
                 __m256 vu = _mm256_mul_ps(vb, vx);
@@ -320,14 +321,31 @@ static void lfm2_forward_shortconv_spec_batch(LFM2SpecState *ss,
                 __m256 vout = _mm256_mul_ps(vc, vacc);
                 _mm256_storeu_ps(out_t + d, vout);
             }
-#else
-            for (uint32_t d = 0; d < D; ++d) {
+#elif defined(__aarch64__)
+            for (; d + 4 <= D; d += 4) {
+                float32x4_t vb = vld1q_f32(B_gate + d);
+                float32x4_t vx = vld1q_f32(x_tilde + d);
+                float32x4_t vu = vmulq_f32(vb, vx);
+                vst1q_f32(B_gate + d, vu);
+
+                float32x4_t vw0 = vld1q_f32(w0 + d);
+                float32x4_t vs0 = vld1q_f32(s0 + d);
+                float32x4_t vw1 = vld1q_f32(w1 + d);
+                float32x4_t vs1 = vld1q_f32(s1 + d);
+                float32x4_t vw2 = vld1q_f32(w2 + d);
+                float32x4_t vc  = vld1q_f32(C_gate + d);
+
+                float32x4_t vacc = vfmaq_f32(vmulq_f32(vw1, vs1), vw0, vs0);
+                vacc = vfmaq_f32(vacc, vw2, vu);
+                vst1q_f32(out_t + d, vmulq_f32(vc, vacc));
+            }
+#endif
+            for (; d < D; ++d) {
                 float u = B_gate[d] * x_tilde[d];
                 B_gate[d] = u;
                 float acc = w0[d] * s0[d] + w1[d] * s1[d] + w2[d] * u;
                 out_t[d] = C_gate[d] * acc;
             }
-#endif
         } else {
             const GGUFTensor *conv_t = layer->shortconv.conv;
             const bool stride_is_lcache = (conv_t && conv_t->ne[0] == l_cache);
