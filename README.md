@@ -108,7 +108,7 @@ Because only 6 of the 16 layers in `LFM2.5-1.2B` use GQA attention (with `n_head
 | **`LFM2.5-2.6B`** | `Q4_K_M` | 1.54 GB | 1.54 GB | 80.3 MB | 17 tok/s / **41 tok/s** | 38 tok/s / **89 tok/s** | **12 tok/s** |
 | **`LFM2-8B-A1B` (MoE)** | `Q4_K_M` | 4.82 GB | **~890 MB** (Top-4/32) | 48.3 MB | 27 tok/s / **64 tok/s** | 61 tok/s / **140 tok/s** | — |
 
-*For empirical side-by-side benchmarks against `llama.cpp` (21.6x faster cold startup, ~500 MB less RAM), see [docs/BENCHMARKS.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/BENCHMARKS.md).*
+*For empirical side-by-side benchmarks against `llama.cpp` (21.6x faster cold startup, ~500 MB less RAM), see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).*
 
 ---
 
@@ -252,7 +252,7 @@ context.generateSequence("Explain on-device hybrid inference.", sampleParams {
 model.releasePageCache() // madvise(MADV_DONTNEED)
 model.warmupPageCache()  // Sequential background pre-fault on onResume()
 ```
-* Complete Android Studio guide, Jetpack Compose `ViewModel` with Coroutines `Flow`, and Scoped Storage `loadFromFd()`: see **[`docs/ANDROID_KOTLIN_INTEGRATION.md`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/ANDROID_KOTLIN_INTEGRATION.md)**.
+* Complete Android Studio guide, Jetpack Compose `ViewModel` with Coroutines `Flow`, and Scoped Storage `loadFromFd()`: see **[`docs/ANDROID_KOTLIN_INTEGRATION.md`](docs/ANDROID_KOTLIN_INTEGRATION.md)**.
 * Run end-to-end JNI test suite: `make test-jni`
 
 ### Python / Kivy Mobile Runtime
@@ -265,7 +265,7 @@ model.warmupPageCache()  // Sequential background pre-fault on onResume()
    ```bash
    make android ANDROID_NDK_HOME=/path/to/android-ndk-r26d ANDROID_API=26
    ```
-* Detailed Kivy documentation: see **[`docs/ANDROID_KIVY_INTEGRATION.md`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/ANDROID_KIVY_INTEGRATION.md)**.
+* Detailed Kivy documentation: see **[`docs/ANDROID_KIVY_INTEGRATION.md`](docs/ANDROID_KIVY_INTEGRATION.md)**.
 
 ---
 
@@ -289,6 +289,21 @@ python3 tests/verify_parity.py \
     -q Q4_K_M \
     --golden-file tests/lfm2_1.2b.lfm_golden
 ```
+
+---
+
+## Documentation
+
+Start at the **[Documentation Hub (`docs/README.md`)](docs/README.md)** or jump directly to a guide:
+
+| Guide | Covers |
+| :--- | :--- |
+| [Engine Architecture](docs/ARCHITECTURE.md) | Hybrid ShortConv + GQA + MoE math, AVX2/AVX-VNNI & ARM64 NEON/DotProd kernels, `.lfmcache`, `epoll` server, Speculative PLD |
+| [Benchmarks & Roofline](docs/BENCHMARKS.md) | Empirical `LFM2.c` vs. `llama.cpp` comparisons, RAM footprint, cold load times, and DRAM roofline math |
+| [Android Studio (Kotlin / Java)](docs/ANDROID_KOTLIN_INTEGRATION.md) | CMake/JNI setup, Kotlin Coroutines `Flow`, Java SDK, SAF Scoped Storage `fd`, and `lmkd` memory hooks |
+| [Android (Python / Kivy)](docs/ANDROID_KIVY_INTEGRATION.md) | NDK cross-compilation, `p4a` / `buildozer` recipe, async 60 FPS UI bridge, and SAF `detachFd()` |
+| [Test Suite & QA](docs/TEST_SUITE.md) | 30 C test binaries, Python/JNI/Kotlin/HTTP suites, 5-tier parity verification, ASan/TSan, and static ELF packaging |
+| [Engineering Roadmap](docs/ROADMAP.md) | Five-phase `v1.0.0` milestone history and Gen-1 vs. LFM2 module lineage |
 
 ---
 

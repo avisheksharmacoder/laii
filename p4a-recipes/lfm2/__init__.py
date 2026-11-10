@@ -27,10 +27,18 @@ class LFM2Recipe(Recipe):
 
     def prebuild_arch(self, arch):
         super().prebuild_arch(arch)
-        src_dir = Path(self.get_recipe_dir()) / "src"
+        recipe_dir = Path(self.get_recipe_dir())
+        src_dir = recipe_dir / "src"
+        repo_root = recipe_dir.parent.parent
         build_dir = Path(self.get_build_dir(arch.arch))
         if src_dir.exists():
             shutil.copytree(src_dir, build_dir, dirs_exist_ok=True)
+        elif (repo_root / "src" / "lfm2_api.c").exists():
+            shutil.copytree(repo_root / "include", build_dir / "include", dirs_exist_ok=True)
+            shutil.copytree(repo_root / "src", build_dir / "src", dirs_exist_ok=True)
+            shutil.copytree(repo_root / "tools", build_dir / "tools", dirs_exist_ok=True)
+            if (repo_root / "python" / "lfm2.py").exists():
+                shutil.copy2(repo_root / "python" / "lfm2.py", build_dir / "lfm2.py")
 
     def build_arch(self, arch):
         env = self.get_recipe_env(arch)
@@ -47,8 +55,11 @@ class LFM2Recipe(Recipe):
             "-fvisibility=hidden",
             "-pthread",
             "-Wall",
+            "-Wextra",
+            "-Wno-unused-function",
             "-I./include",
             "-D_GNU_SOURCE",
+            "-DLFM2_DISABLE_JNI",
         ]
 
         if arch.arch == "arm64-v8a":

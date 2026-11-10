@@ -1,6 +1,6 @@
 # LFM Engine Engineering Roadmap
 
-This document outlines the three-phase engineering trajectory for building a specialized, zero-dependency inference engine for Liquid AI models on Linux.
+This document outlines the five-phase engineering trajectory for building the specialized, zero-dependency **LFM2.c** inference engine for Liquid AI models (`v1.0.0` certified). For a quick navigation overview of all documentation, see [docs/README.md](README.md).
 
 ---
 
@@ -18,7 +18,7 @@ This document outlines the three-phase engineering trajectory for building a spe
     - SwiGLU FFN with SiLU activation.
   - [x] **Byte-level BPE Tokenizer:** Decode/encode pipeline handling vocab lookup, special tokens (`<|im_start|>`, `<|im_end|>`), and UTF-8 byte fallbacks.
   - [x] **Sampling Pipeline:** Greedy (argmax), temperature scaling, and top-k filtering.
-  - [x] **Comprehensive 7-Part Test Suite:** Unit tests, PyTorch numerical parity tests ($< 10^{-7}$ diff), end-to-end forward pass test, and AddressSanitizer/UBSan memory verification (see [TEST_SUITE.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/TEST_SUITE.md)).
+  - [x] **Comprehensive 7-Part Test Suite:** Unit tests, PyTorch numerical parity tests ($< 10^{-7}$ diff), end-to-end forward pass test, and AddressSanitizer/UBSan memory verification (see [TEST_SUITE.md](TEST_SUITE.md)).
 
 ---
 
@@ -43,7 +43,7 @@ This document outlines the three-phase engineering trajectory for building a spe
     - CLI options `-j / --threads` for user-configurable core parallelism.
   - [x] **Expanded 11-Part Automated Test Suite:**
     - Added `test_simd_avx2`, `test_quants`, `test_fused_conv`, and `test_threads` (11/11 tests passing, verified with ASan/UBSan).
-    - Detailed in [PHASE2_SPECIFICATION.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/PHASE2_SPECIFICATION.md) and [TEST_SUITE.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/TEST_SUITE.md).
+    - Detailed in [ARCHITECTURE.md](ARCHITECTURE.md) and [TEST_SUITE.md](TEST_SUITE.md).
 
 ---
 
@@ -70,7 +70,7 @@ This document outlines the three-phase engineering trajectory for building a spe
     - Interactive terminal chat REPL (`bin/lfm2_chat`) matching Liquid AI's post-training specifications: logit-space Min-P pre-filtering, deduplicated repetition penalty, and stateful multi-turn ChatML continuation.
   - [x] **Comprehensive 17-Part Automated Test Suite:**
     - Expanded test framework covering all 17 test suites with 100% pass rate under normal build and AddressSanitizer/UBSan runs.
-    - Detailed in [PHASE3_SPECIFICATION.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/PHASE3_SPECIFICATION.md) and [TEST_SUITE.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/TEST_SUITE.md).
+    - Detailed in [ARCHITECTURE.md](ARCHITECTURE.md) and [TEST_SUITE.md](TEST_SUITE.md).
 
 ---
 
@@ -137,7 +137,7 @@ This document outlines the three-phase engineering trajectory for building a spe
   - [x] **Expanded 30-Part Automated Test Suite & 18 Static ELF Binaries:**
     - 30 automated C test binaries (`make test-c-bins`) + Python SDK automated test (7/7 tests) + 16 standalone tools + 18 statically linked ELF binaries (`make static-test`).
     - 100% pass rate under normal compilation, AddressSanitizer/UBSan runs, and ThreadSanitizer (`make test-tsan`).
-    - Detailed in [PHASE4_SPECIFICATION.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/PHASE4_SPECIFICATION.md) and [TEST_SUITE.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/TEST_SUITE.md).
+    - Detailed in [ARCHITECTURE.md](ARCHITECTURE.md) (§8–§24) and [TEST_SUITE.md](TEST_SUITE.md).
 
 ---
 
@@ -168,13 +168,21 @@ This document outlines the three-phase engineering trajectory for building a spe
     - PC $N_{\text{phys}} - 1$ core rule vs Mobile $N_{\text{big}} - 1$ core rule (leaving 1 Big core for Kivy/OpenGL and Little cores for OS).
     - Thermal safety ceiling $N_{\text{total}} - 2$ (max 6 cores on 8-core SoCs) eliminating Vdroop brownouts and thermal shutdowns.
     - Worker 0 pinned to fastest Prime core accelerating single-threaded sequential ops.
-    - ARM64 `FPCR.FZ` and `FPCR.FZ16` flush-to-zero in [`include/lfm2_simd_avx2.h`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/include/lfm2_simd_avx2.h).
+    - ARM64 `FPCR.FZ` and `FPCR.FZ16` flush-to-zero in [`include/lfm2_simd_avx2.h`](../include/lfm2_simd_avx2.h).
     - Adaptive spin loops (25,000 on x86 vs 4,000 on ARM64) and `lfm2_cpu_pause()` (`yield` on ARM64).
   - [x] **ThreadSanitizer & Musl Static Build Pipeline (`Makefile`):**
-    - `make test-tsan` compiling with `-fsanitize=thread` and executed under `setarch x86_64 -R` (0 data races verified).
+    - `make test-tsan` compiling with `-fsanitize=thread` and executed under `setarch $(uname -m) -R` (0 data races verified).
     - `make static-musl` target for distro-agnostic static ELF binaries via `musl-gcc`.
-  - [x] **Mobile Integration Documentation (`docs/ANDROID_KIVY_INTEGRATION.md`):**
-    - Turnkey developer guide for NDK compilation, `p4a` recipe, threading, Scoped Storage, and lifecycle management without repo bloat.
+  - [x] **Mobile Integration Documentation ([`ANDROID_KOTLIN_INTEGRATION.md`](ANDROID_KOTLIN_INTEGRATION.md), [`ANDROID_KIVY_INTEGRATION.md`](ANDROID_KIVY_INTEGRATION.md)):**
+    - Turnkey developer guides for Android Studio (Kotlin/Java JNI + Jetpack Compose `ViewModel`), NDK compilation, `p4a` recipe, threading, Scoped Storage, and lifecycle management.
+
+---
+
+## Historical Note: Legacy Gen-1 (`src/lfm_*`) vs. Production `LFM2` Engine (`v1.0.0`)
+
+Phases 1–3 introduced the foundational Gen-1 reference runtime under `src/` (`arena.c`, `gguf.c`, `lfm_model.c`, `lfm_simd.c`, `lfm_fused.c`, `lfm_threadpool.c`, `lfm_forward.c`, `lfm_tokenizer.c`, `lfm_engine.c`, `include/lfm_c_api.h` / `src/lfm_c_api.c`, `src/lfm_server.c`, `src/lfm_webui.h`, `bindings/python/laii.py`, `bin/lfm-run-static`, `bin/lfm-server-static`), which remains compiled and verified in `Makefile` (`lib/liblfm.so`, `bin/test_arena`..`bin/test_c_api`, `tests/test_python_bindings.py`, `tests/test_http_server.sh`).
+
+Production `v1.0.0` workloads (CLI `bin/lfm2`, epoll server `bin/lfm2-server` / `bin/lfm2-server-static`, shared library `lib/liblfm2.so`, Python SDK `python/lfm2.py`, and Android Kotlin/Java JNI `src/lfm2_jni.c`) are built around [`include/lfm2.h`](../include/lfm2.h), [`src/lfm2_api.c`](../src/lfm2_api.c), and the specialized modules under `tools/lfm2_*.c` documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 
 

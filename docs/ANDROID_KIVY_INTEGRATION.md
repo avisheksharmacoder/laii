@@ -7,8 +7,8 @@ This guide provides everything an Android / Kivy developer needs to bundle and r
 ## 📱 Executive Overview
 
 The LAII engine is engineered in **ISO C11 with zero external dependencies**. It provides:
-1. **Public Flat C ABI ([`include/lfm2.h`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/include/lfm2.h)):** Clean opaque handles (`lfm2_model_t`, `lfm2_context_t`) with hidden internal symbols.
-2. **Pure Standard-Library Python SDK ([`python/lfm2.py`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/python/lfm2.py)):** Uses Python's built-in `ctypes` module. **No PyTorch, no NumPy, no CMake required at runtime.**
+1. **Public Flat C ABI ([`include/lfm2.h`](../include/lfm2.h)):** Clean opaque handles (`lfm2_model_t`, `lfm2_context_t`) with hidden internal symbols.
+2. **Pure Standard-Library Python SDK ([`python/lfm2.py`](../python/lfm2.py)):** Uses Python's built-in `ctypes` module. **No PyTorch, no NumPy, no CMake required at runtime.**
 3. **Native ARM64 NEON + DotProd (`vdotq_s32`) Acceleration:** Single-cycle signed 8-bit dot products utilizing 32 vector registers with zero stack spills.
 4. **Android-Specific Mobile APIs:**
    * `lfm2_model_load_from_fd(int fd, ...)`: Direct `mmap` over Android Storage Access Framework (`ACTION_OPEN_DOCUMENT`) file descriptors.
@@ -34,17 +34,18 @@ API_LEVEL=26 # Android 8.0+ compatibility
 $TOOLCHAIN/bin/${TARGET}${API_LEVEL}-clang \
     -std=c11 -O3 -fPIC -shared \
     -fvisibility=hidden \
-    -Iinclude -D_GNU_SOURCE \
+    -Wno-unused-function \
+    -Iinclude -D_GNU_SOURCE -DLFM2_DISABLE_JNI \
     -march=armv8.2-a+dotprod+fp16 \
     -Wl,-z,max-page-size=16384 \
-    src/lfm2_api.c tools/lfm2_simd_arm64.c \
+    src/lfm2_api.c \
     -o liblfm2.so \
     -lm -llog
 ```
 
 > [!TIP]
 > **Native ARM64 NEON + DotProd (`vdotq_s32`) Acceleration:**
-> By including [`tools/lfm2_simd_arm64.c`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/tools/lfm2_simd_arm64.c), the engine automatically activates hardware-accelerated integer dot products:
+> On `aarch64`, `src/lfm2_api.c` automatically includes [`tools/lfm2_simd_arm64.c`](../tools/lfm2_simd_arm64.c) (so do not pass it as a second translation unit on the compiler command line) and activates hardware-accelerated integer dot products:
 > * **32 Vector Registers (`v0..v31`):** 1x4 row-unrolled microkernels keep all 4 accumulators, activations, and weight pointers register-resident with **zero stack spills**.
 > * **Single-Cycle Signed `SDOT` (`vdotq_s32`):** Direct int8 $\times$ int8 $\to$ int32 dot products in 1 cycle, delivering **25–45 tokens/sec** and saturating mobile LPDDR5 bandwidth.
 > * **1-Cycle Table Lookup (`vqtbl1q_s8`):** Single-instruction 16-byte `TBL` translation for `IQ4_XS` non-linear grid lookups.
@@ -60,19 +61,19 @@ $TOOLCHAIN/bin/${TARGET}${API_LEVEL}-clang \
 To compile `liblfm2.so` automatically into your APK during `buildozer android debug`, create a custom `p4a` recipe in your Kivy project.
 
 ### 1. Directory Structure in your Kivy app:
+If your `buildozer.spec` points `p4a.local_recipes` directly to `laii/p4a-recipes`, the recipe automatically copies `include/`, `src/`, `tools/`, and `python/lfm2.py` from the repository root. If copying the recipe into an external Kivy repo, stage the sources under `src/`:
 ```text
 my_kivy_app/
 ├── main.py
 ├── buildozer.spec
 └── p4a-recipes/
     └── lfm2/
-        ├── __init__.py
-        └── src/
-            ├── include/lfm2.h
-            ├── include/lfm2_simd_arm64.h
-            ├── src/lfm2_api.c
-            ├── tools/lfm2_simd_arm64.c
-            └── lfm2.py                  # Copy from laii/python/lfm2.py
+        ├── __init__.py                  # Copy from laii/p4a-recipes/lfm2/__init__.py
+        └── src/                         # Required only outside the laii repo
+            ├── include/                 # Copy laii/include/
+            ├── src/                     # Copy laii/src/
+            ├── tools/                   # Copy laii/tools/
+            └── lfm2.py                  # Copy laii/python/lfm2.py
 ```
 
 ### 2. Recipe File (`p4a-recipes/lfm2/__init__.py`):
@@ -98,9 +99,18 @@ class LFM2Recipe(Recipe):
 
     def prebuild_arch(self, arch):
         super().prebuild_arch(arch)
-        src_dir = Path(self.get_recipe_dir()) / "src"
+        recipe_dir = Path(self.get_recipe_dir())
+        src_dir = recipe_dir / "src"
+        repo_root = recipe_dir.parent.parent
         build_dir = Path(self.get_build_dir(arch.arch))
-        shutil.copytree(src_dir, build_dir, dirs_exist_ok=True)
+        if src_dir.exists():
+            shutil.copytree(src_dir, build_dir, dirs_exist_ok=True)
+        elif (repo_root / "src" / "lfm2_api.c").exists():
+            shutil.copytree(repo_root / "include", build_dir / "include", dirs_exist_ok=True)
+            shutil.copytree(repo_root / "src", build_dir / "src", dirs_exist_ok=True)
+            shutil.copytree(repo_root / "tools", build_dir / "tools", dirs_exist_ok=True)
+            if (repo_root / "python" / "lfm2.py").exists():
+                shutil.copy2(repo_root / "python" / "lfm2.py", build_dir / "lfm2.py")
 
     def build_arch(self, arch):
         env = self.get_recipe_env(arch)
@@ -117,8 +127,11 @@ class LFM2Recipe(Recipe):
             "-fvisibility=hidden",
             "-pthread",
             "-Wall",
+            "-Wextra",
+            "-Wno-unused-function",
             "-I./include",
             "-D_GNU_SOURCE",
+            "-DLFM2_DISABLE_JNI",
         ]
 
         # Enable ARMv8.2-A DotProd + FP16 on 64-bit Android builds
@@ -136,7 +149,6 @@ class LFM2Recipe(Recipe):
             cc(
                 *cflags,
                 "src/lfm2_api.c",
-                "tools/lfm2_simd_arm64.c",
                 "-o", "liblfm2.so",
                 *ldflags,
                 _env=env
@@ -144,7 +156,8 @@ class LFM2Recipe(Recipe):
 
             # Copy pure-stdlib ctypes wrapper into Android Python site-packages
             site_pkgs = Path(self.ctx.get_site_packages_dir(arch))
-            shutil.copy2(build_dir / "lfm2.py", site_pkgs / "lfm2.py")
+            if (build_dir / "lfm2.py").exists():
+                shutil.copy2(build_dir / "lfm2.py", site_pkgs / "lfm2.py")
 
         # Install liblfm2.so into APK's libs/<arch>/ directory
         self.install_libs(arch, str(build_dir / "liblfm2.so"))

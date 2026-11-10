@@ -1,5 +1,44 @@
 # Liquid Foundation Model (LFM2) Engine Architecture
 
+> For the documentation index and recommended reading order, see [docs/README.md](README.md).
+
+## Contents
+
+* **Part I — Hybrid Model Architecture & Math**
+  * [§1 Overview & Motivation](#1-overview--motivation)
+  * [§2 Hybrid Layer Breakdown](#2-hybrid-layer-breakdown)
+  * [§3 Mathematical Formulations](#3-mathematical-formulations)
+  * [§4 Memory Footprint Analysis: LFM2 vs. Standard Transformer](#4-memory-footprint-analysis-lfm2-vs-standard-transformer)
+* **Part II — Zero-Copy Loader, Forward Pass, CLI & BPE Tokenizer**
+  * [§5 Real-World Liquid AI (LFM2/LFM2.5) GGUF Quirks & Loader Architecture](#5-real-world-liquid-ai-lfm2lfm25-gguf-quirks--loader-architecture)
+  * [§6 Forward Pass Engine & State Arena (`tools/lfm2_forward.c` / `src/lfm_forward.c`)](#6-forward-pass-engine--state-arena-lfm2_forwardc--srclfm_forwardc)
+  * [§7 Interactive Terminal Chat Engine & Sampler (`tools/lfm2_chat.c`)](#7-interactive-terminal-chat-engine--sampler-toolslfm2_chatc)
+  * [§9 Exact GGUF BPE Rank Merging Tokenizer Engine (`tools/lfm2_bpe.c`)](#9-exact-gguf-bpe-rank-merging-tokenizer-engine-toolslfm2_bpec)
+* **Part III — Thread Pool, Prefill & Multi-ISA SIMD Kernels**
+  * [§8 AVX2 `Q8_K` Activation Pre-Quantization & Integer SIMD Dot Products](#8-high-throughput-avx2-q8_k-activation-pre-quantization--integer-simd-dot-products-includelfm2_simd_avx2h)
+  * [§10 Lock-Free Spin-Barrier Thread Pool & Linux Futex Engine](#10-c11-lock-free-spin-barrier-thread-pool--linux-futex-engine-toolslfm2_threadpoolc)
+  * [§11 Batched Prefill Acceleration & Rank-1 Accumulator GEMM](#11-batched-prefill-acceleration--rank-1-accumulator-gemm-toolslfm2_prefill_batchc)
+  * [§12 1x4 Row-Unrolled AVX2 MatVec & Register-Resident SwiGLU FFN](#12-1x4-row-unrolled-avx2-matvec--register-resident-swiglu-ffn-toolslfm2_decode_1x4c)
+  * [§13 Planar ShortConv, Precomputed RoPE LUT & Single-Pass FP16 Online Softmax](#13-planar-shortconv-precomputed-rope-lut--single-pass-fp16-online-softmax-toolslfm2_kernels_fastc)
+  * [§14 Single-Binary CPUID Multi-ISA Dynamic Dispatch & Extended Quantization](#14-single-binary-cpuid-multi-isa-dynamic-dispatch--extended-quantization-toolslfm2_cpuid_quantsc)
+  * [§25 Native ARM64 NEON + DotProd (`vdotq_s32`) + FP16 SIMD Suite](#25-native-arm64-neon--dotprod-vdotq_s32--fp16-simd-suite-toolslfm2_simd_arm64c-includelfm2_simd_arm64h)
+* **Part IV — Control Plane, Sparse MoE, Checkpointing & Memory Cache**
+  * [§15 Runtime Control Plane: Grammar Masking, Reasoning Budgets & Attention Sinks](#15-runtime-control-plane-grammar-masking-reasoning-budgets--attention-sinks-toolslfm2_runtime_featuresc)
+  * [§16 Sparse Mixture-of-Experts Architecture (`lfm2moe`)](#16-sparse-mixture-of-experts-architecture-lfm2moe)
+  * [§17 Hybrid State Checkpointing & Speculative Rollback](#17-hybrid-state-checkpointing--speculative-rollback-toolslfm2_moe_checkpointc)
+  * [§18 Linux `/proc/meminfo` OOM Guard & Hybrid Memory Budgeting](#18-linux-procmeminfo-oom-guard--hybrid-memory-budgeting-toolslfm2_sys_cachec)
+  * [§19 Sequential `mmap` Page-Warmup Progress Bar (`--warmup`)](#19-sequential-mmap-page-warmup-progress-bar---warmup)
+  * [§20 Disk-Backed Hybrid Prompt Cache (`--prompt-cache`, `.lfmcache` v1)](#20-disk-backed-hybrid-prompt-cache---prompt-cache-lfmcache-v1)
+* **Part V — C11 Public ABI, Python SDK & Linux `epoll` HTTP/SSE Server**
+  * [§21 Public C11 ABI & High-Performance Language Bindings](#21-public-c11-abi--high-performance-language-bindings-includelfm2h-srclfm2_apic-pythonlfm2py)
+  * [§22 Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server](#22-non-blocking-linux-epoll-openai-httpsse-server-toolslfm2_serverc-lfm2_serverc)
+* **Part VI — Mobile Android Integration & Speculative Decoding**
+  * [§23 Mobile Edge & Android Scoped Storage Integration](#23-mobile-edge--android-scoped-storage-integration-lfm2_loaderc-srclfm2_apic-pythonlfm2py)
+  * [§24 Unified Cross-Platform Asymmetric `big.LITTLE` Thread Pool](#24-unified-cross-platform-asymmetric-biglittle-thread-pool-toolslfm2_threadpoolc)
+  * [§26 Zero-Weight Prompt-Lookup Speculative Decoding](#26-zero-weight-prompt-lookup-speculative-decoding-toolslfm2_speculative_pldc-includelfm2_speculative_pldh)
+
+---
+
 ## 1. Overview & Motivation
 
 Modern Large Language Models (LLMs) based entirely on pure Transformer architectures suffer from two fundamental bottlenecks when deployed on resource-constrained CPUs without dedicated GPUs:
@@ -135,7 +174,7 @@ Assume a 16-layer model with $D = 2048$, generating a sequence of length $L = 40
 The entire recurrent state for all 10 convolution layers occupies only $\approx 164\text{ KB}$. This easily fits in the L2 cache (typically 512 KB to 1 MB per core) of modern x86 and ARM processors, resulting in near-zero memory bus traffic for short convolution state updates.
 
 > [!NOTE]
-> For real-world empirical benchmarks comparing LFM2.c against `llama.cpp` on `LFM2.5-1.2B` and `LFM2.5-230M` (including memory RSS reductions, cold load times, and roofline analysis), see [docs/BENCHMARKS.md](file:///home/avisheks/Documents/python-projects/Python-projects/laii/docs/BENCHMARKS.md).
+> For real-world empirical benchmarks comparing LFM2.c against `llama.cpp` on `LFM2.5-1.2B` and `LFM2.5-230M` (including memory RSS reductions, cold load times, and roofline analysis), see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -352,7 +391,7 @@ Compiling with `-march=native` introduces AVX2 instructions into the ELF entry p
 ### 14.1 GCC/Clang Target Attributes & CPUID Query
 - Baseline functions are built for generic `x86-64`.
 - Accelerated SIMD kernels are decorated with `__attribute__((target("avx2,fma,f16c")))` and `__attribute__((target("avx2,fma,f16c,avxvnni")))`.
-- At startup, [`lfm2_init_cpu_kernels()`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/tools/lfm2_cpuid_quants.c) inspects CPU capabilities via `__cpuid_count(7, 0, ...)` and `__builtin_cpu_supports`:
+- At startup, [`lfm2_init_cpu_kernels()`](../tools/lfm2_cpuid_quants.c) inspects CPU capabilities via `__cpuid_count(7, 0, ...)` and `__builtin_cpu_supports`:
   - **AVX-VNNI Tier:** Selects `"AVX-VNNI (vpdpbusd) + FMA + F16C + NTA"` on modern CPUs (Intel 12th-15th Gen Alder/Raptor/Arrow Lake, AMD Zen 4/Zen 5).
   - **AVX2 Tier:** Selects `"AVX2 + FMA + F16C + NTA"` on baseline AVX2 systems (Intel Haswell through 11th Gen, AMD Zen 1-3).
   - **Scalar Fallback:** If AVX2 is absent or `LFM2_FORCE_ISA=scalar` is specified, the engine safely binds portable scalar fallbacks without `SIGILL` risk.
@@ -688,18 +727,18 @@ Deploying local on-device inference on Android smartphones (e.g. via Kivy, Flutt
 On Android 10+ (API level 29+), applications cannot access arbitrary raw filesystem paths like `/sdcard/model.gguf`. Models selected by users via Android SAF (`ACTION_OPEN_DOCUMENT`) are provided strictly as content URIs (`content://...`) and open file descriptors (`ParcelFileDescriptor.getFd()`).
 * **File Descriptor Duplication (`dup(fd)`):** `lfm2_load_gguf_from_fd` duplicates the descriptor using `dup(fd)` so the C engine owns an independent lifecycle reference, allowing the calling Java/Kotlin/Python layer to safely manage or close its original descriptor.
 * **Direct Virtual Memory Mapping:** Maps the descriptor directly into virtual memory via `mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0)` with `madvise(MADV_SEQUENTIAL)`. Zero byte copies are made from Android storage to user space.
-* **Pure Python stdlib Integration:** Exposed cleanly in [`python/lfm2.py`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/python/lfm2.py) as `LFM2Model.from_fd(fd)`.
+* **Pure Python stdlib Integration:** Exposed cleanly in [`python/lfm2.py`](../python/lfm2.py) as `LFM2Model.from_fd(fd)`.
 
 ### 23.2 Surviving the Android Low Memory Killer (`lmkd`) via `MADV_DONTNEED`
 When an Android app transitions to the background (`onPause` / `onStop`), Android's `lmkd` daemon aggressively terminates high-memory processes to reclaim RAM.
-* **Transparent Page Cache Eviction:** [`lfm2_model_release_page_cache`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/include/lfm2.h) issues `madvise(mmap_addr, mmap_size, MADV_DONTNEED)`.
+* **Transparent Page Cache Eviction:** [`lfm2_model_release_page_cache`](../include/lfm2.h) issues `madvise(mmap_addr, mmap_size, MADV_DONTNEED)`.
 * **Instant RSS Drop to Zero:** Tells the Linux kernel that the physical backing pages for the mapped `.gguf` file can be discarded immediately. The virtual memory address space remains intact, but the Resident Set Size (RSS) drops to zero, preventing `lmkd` kills.
 * **Seamless Resume:** When the user brings the app back to the foreground (`onResume`), the kernel automatically page-faults the model weights back into RAM on demand without reloading or re-initializing the engine.
 * **Python Binding:** Exposed directly via `model.release_page_cache()`.
 
 ### 23.3 Dynamic 16 KB Page Compatibility (Android 15+)
 Starting with Android 15, Android devices transition from legacy 4 KB memory pages to **16 KB physical pages**. Hardcoding 4096-byte alignment or page strides causes page-boundary misalignment faults and crashes.
-* Both [`tools/lfm2_loader.c`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/tools/lfm2_loader.c) and [`tools/lfm2_sys_cache.c`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/tools/lfm2_sys_cache.c) query the hardware page size dynamically at runtime via `sysconf(_SC_PAGESIZE)`:
+* Both [`tools/lfm2_loader.c`](../tools/lfm2_loader.c) and [`tools/lfm2_sys_cache.c`](../tools/lfm2_sys_cache.c) query the hardware page size dynamically at runtime via `sysconf(_SC_PAGESIZE)`:
   ```c
   long page_sz = sysconf(_SC_PAGESIZE);
   size_t stride = (page_sz > 0) ? (size_t)page_sz : 4096;
@@ -747,7 +786,7 @@ The thread pool scans the Linux sysfs hierarchy at startup:
 * **Homogeneous PC Invariant ($N_{\text{phys}} - 1$):** On PCs, reserves $N_{\text{phys}} - 1$ cores (e.g., 4 physical cores $\to$ 3 workers), leaving 1 dedicated physical core for OS tasks, browser audio, and UI rendering.
 * **Mobile Asymmetric Rule ($N_{\text{big}} - 1$):** On heterogeneous SoCs, automatically sets thread count to $N_{\text{big}} - 1$ (e.g., on a 1 Prime + 3 Perf + 4 Little phone, reserves 3 Big cores for inference: 1 Prime + 2 Perf). This leaves 1 high-performance Big core for Kivy's OpenGL UI thread and 100% of the Little cores for Android OS background services.
 * **Thermal Blackout & Vdroop Guard ($N_{\text{total}} - 2$):** Clamps maximum user-requested threads to $N_{\text{total}} - 2$ (e.g., 6 cores maximum on an 8-core phone). Completely eliminates full-chip saturation that causes thermal throttling, Vdroop voltage drops, and sudden device shutdowns.
-* **Worker 0 on Prime Core:** Pins Worker 0 (the calling thread) to the fastest Prime core (`recommended_cpus[0]`), accelerating single-threaded sequential kernels ([`RMSNorm`](file:///home/avisheks/Documents/python-projects/Python-projects/laii/src/lfm2_api.c), ShortConv 3-tap depthwise shift, RoPE, and sampling).
+* **Worker 0 on Prime Core:** Pins Worker 0 (the calling thread) to the fastest Prime core (`recommended_cpus[0]`), accelerating single-threaded sequential kernels ([`RMSNorm`](../src/lfm2_api.c), ShortConv 3-tap depthwise shift, RoPE, and sampling).
 
 ### 24.3 Cross-Platform Architecture Primitives & Flush-to-Zero
 * **Hardware Flush-to-Zero (`FPCR.FZ`):** On ARM64 workers, sets bit 24 (`FZ`) and bit 19 (`FZ16`) of the Floating-Point Control Register (`fpcr`). Prevents denormal floating-point numbers in ShortConv rolling states from triggering 100-cycle microcode assist traps.
