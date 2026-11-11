@@ -39,7 +39,8 @@
 #define LFM2_BLOCK_TYPE_DEFINED 1
 typedef enum {
     LFM2_BLOCK_SHORTCONV = 0,
-    LFM2_BLOCK_GQA_ATTN  = 1
+    LFM2_BLOCK_GQA_ATTN  = 1,
+    LFM2_BLOCK_SWA_ATTN  = 2
 } lfm2_block_type_t;
 #endif
 
@@ -50,16 +51,22 @@ typedef struct {
 
 typedef struct {
     char     arch[32];
+    bool     is_lfm3;
     uint32_t n_layers;
     uint32_t n_embd;
     uint32_t n_ff;
     uint32_t n_vocab;
     uint32_t n_ctx;
     uint32_t n_head_q;
+    uint32_t head_dim;
+    uint32_t rope_dim;
     uint32_t n_head_kv[LFM2_MAX_LAYERS];
+    bool     is_swa_layer[LFM2_MAX_LAYERS];
+    uint32_t sliding_window;
     uint32_t shortconv_l_cache;
     float    rms_norm_eps;
     float    rope_freq_base;
+    float    rope_freq_base_swa;
     uint32_t alignment;
 } LFM2Config;
 
@@ -157,19 +164,26 @@ static inline LFM2MemoryPlan lfm2_plan_memory_and_guard_oom(const LFM2Model *m,
 
     const LFM2Config *c = &m->cfg;
     const uint32_t D        = c->n_embd;
-    const uint32_t head_dim = (c->n_head_q > 0) ? (D / c->n_head_q) : 64;
+    const uint32_t head_dim = (c->head_dim > 0) ? c->head_dim
+                              : ((c->n_head_q > 0) ? (D / c->n_head_q) : 64);
     const uint32_t hist_len = (c->shortconv_l_cache > 1) ? (c->shortconv_l_cache - 1) : 2;
+    const uint32_t swa_cap  = ((c->sliding_window > 0) ? c->sliding_window : 256U) + 8U;
 
     plan.model_mmap_bytes     = m->file_size;
     plan.active_weights_bytes = m->file_size; /* Dense default; lower for MoE */
     plan.scratch_arena_bytes  = 32ULL * 1024ULL * 1024ULL; /* ~32 MB scratch + LUTs */
 
-    uint64_t kv_per_tok = 0;
-    uint32_t n_conv     = 0;
+    uint64_t kv_per_tok      = 0;
+    uint64_t fixed_swa_bytes = 0;
+    uint32_t n_conv          = 0;
 
     for (uint32_t l = 0; l < c->n_layers; ++l) {
         if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV) {
             n_conv++;
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN) {
+            /* SWA layers hold fixed ring buffer (sliding_window + 8 slots), independent of max_seq_len */
+            const uint64_t kv_dim = (uint64_t)c->n_head_kv[l] * head_dim;
+            fixed_swa_bytes += 2ULL * (uint64_t)swa_cap * kv_dim * sizeof(uint16_t);
         } else {
             /* FP16 K-cache + FP16 V-cache: 2 * n_head_kv[l] * head_dim * sizeof(uint16_t) */
             const uint64_t kv_dim = (uint64_t)c->n_head_kv[l] * head_dim;
@@ -196,7 +210,7 @@ static inline LFM2MemoryPlan lfm2_plan_memory_and_guard_oom(const LFM2Model *m,
                                 ? (mem.mem_available_bytes - reserve_bytes)
                                 : (mem.mem_available_bytes / 2);
 
-    const uint64_t fixed_heap = plan.scratch_arena_bytes + plan.conv_state_bytes;
+    const uint64_t fixed_heap = plan.scratch_arena_bytes + plan.conv_state_bytes + fixed_swa_bytes;
     /* Keep at least 50% of the mmap'd weights resident alongside the heap */
     const uint64_t min_model_resident = plan.model_mmap_bytes / 2;
 
@@ -373,6 +387,11 @@ static inline uint64_t lfm2_compute_model_fingerprint(const LFM2Model *m) {
     h = lfm2_fnv1a_update(h, &m->cfg.n_head_q, sizeof(uint32_t));
     h = lfm2_fnv1a_update(h, &m->cfg.shortconv_l_cache, sizeof(uint32_t));
     h = lfm2_fnv1a_update(h, m->cfg.n_head_kv, sizeof(uint32_t) * m->cfg.n_layers);
+    if (m->cfg.is_lfm3) {
+        h = lfm2_fnv1a_update(h, &m->cfg.head_dim, sizeof(uint32_t));
+        h = lfm2_fnv1a_update(h, &m->cfg.sliding_window, sizeof(uint32_t));
+        h = lfm2_fnv1a_update(h, m->cfg.is_swa_layer, sizeof(bool) * m->cfg.n_layers);
+    }
 
     if (m->tensors) {
         for (uint64_t i = 0; i < m->n_tensors; ++i) {
@@ -467,15 +486,16 @@ static inline void lfm2_convert_f16_to_f32(float *dst, const uint16_t *src, size
     for (; i < n; ++i) dst[i] = lfm2_fp16_to_fp32_scalar(src[i]);
 }
 
-/* Saves the exact LFM2 Hybrid State (ShortConv buffers + FP16 GQA KV-caches up to
- * `n_tokens`) to disk atomically via a `.tmp` file + POSIX `rename()`. */
-static inline bool lfm2_prompt_cache_save(const char *filepath,
-                                          const LFM2Model *m,
-                                          const uint32_t *tokens,
-                                          uint32_t n_tokens,
-                                          float * const conv_state[LFM2_MAX_LAYERS],
-                                          uint16_t * const k_cache_f16[LFM2_MAX_LAYERS],
-                                          uint16_t * const v_cache_f16[LFM2_MAX_LAYERS]) {
+/* Saves the exact LFM2/LFM3 Hybrid State (ShortConv buffers + FP16 SWA/GQA KV-caches) */
+static inline bool lfm2_prompt_cache_save_ex(const char *filepath,
+                                             const LFM2Model *m,
+                                             const uint32_t *tokens,
+                                             uint32_t n_tokens,
+                                             float * const conv_state[LFM2_MAX_LAYERS],
+                                             const uint32_t *conv_ring_heads,
+                                             uint16_t * const k_cache_f16[LFM2_MAX_LAYERS],
+                                             uint16_t * const v_cache_f16[LFM2_MAX_LAYERS],
+                                             uint32_t swa_cap) {
     if (!filepath || !m || !tokens || n_tokens == 0) return false;
 
     char tmp_path[512];
@@ -489,14 +509,21 @@ static inline bool lfm2_prompt_cache_save(const char *filepath,
 
     const LFM2Config *c = &m->cfg;
     const uint32_t D        = c->n_embd;
-    const uint32_t head_dim = (c->n_head_q > 0) ? (D / c->n_head_q) : 64;
+    const uint32_t head_dim = (c->head_dim > 0) ? c->head_dim
+                              : ((c->n_head_q > 0) ? (D / c->n_head_q) : 64);
     const uint32_t hist_len = (c->shortconv_l_cache > 1) ? (c->shortconv_l_cache - 1) : 2;
+    const uint32_t swa_win  = (c->sliding_window > 0) ? c->sliding_window : 256U;
+    const uint32_t eff_cap  = (swa_cap > 0) ? swa_cap : (swa_win + 8U);
     const size_t   conv_bytes = (size_t)hist_len * D * sizeof(float);
 
     uint64_t payload_bytes = (uint64_t)n_tokens * sizeof(uint32_t);
     for (uint32_t l = 0; l < c->n_layers; ++l) {
         if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV) {
             payload_bytes += conv_bytes;
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN) {
+            const uint32_t w_valid = (n_tokens < swa_win) ? n_tokens : swa_win;
+            const size_t kv_dim    = (size_t)c->n_head_kv[l] * head_dim;
+            payload_bytes += 2ULL * (uint64_t)w_valid * kv_dim * sizeof(uint16_t);
         } else {
             const size_t kv_dim = (size_t)c->n_head_kv[l] * head_dim;
             payload_bytes += 2ULL * (uint64_t)n_tokens * kv_dim * sizeof(uint16_t);
@@ -524,17 +551,47 @@ static inline bool lfm2_prompt_cache_save(const char *filepath,
         goto fail;
     }
 
-    /* 2. Write Hybrid Layer States (ShortConv ring buffers or GQA FP16 KV slices) */
+    float *lin_conv = conv_ring_heads ? (float *)malloc(conv_bytes) : NULL;
+    if (conv_ring_heads && !lin_conv) goto fail;
+
+    /* 2. Write Hybrid Layer States */
     for (uint32_t l = 0; l < c->n_layers; ++l) {
         if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV) {
-            if (!lfm2_write_exact_checked(f, conv_state[l], conv_bytes, &csum)) goto fail;
+            const float *src = conv_state[l];
+            if (conv_ring_heads && hist_len > 1U) {
+                const uint32_t head = conv_ring_heads[l];
+                for (uint32_t s = 0; s < hist_len; ++s) {
+                    const uint32_t slot = (head + s) % hist_len;
+                    memcpy(lin_conv + (size_t)s * D, src + (size_t)slot * D, (size_t)D * sizeof(float));
+                }
+                src = lin_conv;
+            }
+            if (!lfm2_write_exact_checked(f, src, conv_bytes, &csum)) { free(lin_conv); goto fail; }
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN) {
+            const uint32_t w_valid   = (n_tokens < swa_win) ? n_tokens : swa_win;
+            const uint32_t t_start   = n_tokens - w_valid;
+            const size_t   kv_dim    = (size_t)c->n_head_kv[l] * head_dim;
+            const size_t   row_bytes = kv_dim * sizeof(uint16_t);
+            for (uint32_t t = t_start; t < n_tokens; ++t) {
+                const uint32_t slot = t % eff_cap;
+                if (!lfm2_write_exact_checked(f, k_cache_f16[l] + (size_t)slot * kv_dim, row_bytes, &csum)) {
+                    free(lin_conv); goto fail;
+                }
+            }
+            for (uint32_t t = t_start; t < n_tokens; ++t) {
+                const uint32_t slot = t % eff_cap;
+                if (!lfm2_write_exact_checked(f, v_cache_f16[l] + (size_t)slot * kv_dim, row_bytes, &csum)) {
+                    free(lin_conv); goto fail;
+                }
+            }
         } else {
-            const size_t kv_dim = (size_t)c->n_head_kv[l] * head_dim;
+            const size_t kv_dim   = (size_t)c->n_head_kv[l] * head_dim;
             const size_t kv_bytes = (size_t)n_tokens * kv_dim * sizeof(uint16_t);
-            if (!lfm2_write_exact_checked(f, k_cache_f16[l], kv_bytes, &csum)) goto fail;
-            if (!lfm2_write_exact_checked(f, v_cache_f16[l], kv_bytes, &csum)) goto fail;
+            if (!lfm2_write_exact_checked(f, k_cache_f16[l], kv_bytes, &csum)) { free(lin_conv); goto fail; }
+            if (!lfm2_write_exact_checked(f, v_cache_f16[l], kv_bytes, &csum)) { free(lin_conv); goto fail; }
         }
     }
+    free(lin_conv);
 
     /* 3. Write trailing 64-bit FNV-1a integrity checksum */
     if (fwrite(&csum, sizeof(csum), 1, f) != 1) goto fail;
@@ -555,6 +612,17 @@ fail:
     return false;
 }
 
+static inline bool lfm2_prompt_cache_save(const char *filepath,
+                                          const LFM2Model *m,
+                                          const uint32_t *tokens,
+                                          uint32_t n_tokens,
+                                          float * const conv_state[LFM2_MAX_LAYERS],
+                                          uint16_t * const k_cache_f16[LFM2_MAX_LAYERS],
+                                          uint16_t * const v_cache_f16[LFM2_MAX_LAYERS]) {
+    return lfm2_prompt_cache_save_ex(filepath, m, tokens, n_tokens,
+                                     conv_state, NULL, k_cache_f16, v_cache_f16, 0U);
+}
+
 /* Attempts to load `filepath` and match its cached token sequence against the
  * prefix of `prompt_tokens[0 .. n_prompt - 1]`.
  *
@@ -565,15 +633,17 @@ fail:
  *
  * On match, restores ShortConv buffers + GQA FP16 KV caches, sets `*out_matched_pos = hdr.n_tokens`,
  * and returns `true` so the caller only prefills `prompt_tokens + hdr.n_tokens`! */
-static inline bool lfm2_prompt_cache_try_load_prefix(const char *filepath,
-                                                     const LFM2Model *m,
-                                                     const uint32_t *prompt_tokens,
-                                                     uint32_t n_prompt,
-                                                     uint32_t max_seq_len,
-                                                     float *conv_state[LFM2_MAX_LAYERS],
-                                                     uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
-                                                     uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
-                                                     uint32_t *out_matched_pos) {
+static inline bool lfm2_prompt_cache_try_load_prefix_ex(const char *filepath,
+                                                        const LFM2Model *m,
+                                                        const uint32_t *prompt_tokens,
+                                                        uint32_t n_prompt,
+                                                        uint32_t max_seq_len,
+                                                        float *conv_state[LFM2_MAX_LAYERS],
+                                                        uint32_t *out_conv_heads,
+                                                        uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
+                                                        uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
+                                                        uint32_t swa_cap,
+                                                        uint32_t *out_matched_pos) {
     if (out_matched_pos) *out_matched_pos = 0;
     if (!filepath || !m || !prompt_tokens) return false;
 
@@ -622,10 +692,13 @@ static inline bool lfm2_prompt_cache_try_load_prefix(const char *filepath,
     }
     free(cached_ids);
 
-    /* 2. Read ShortConv states and GQA FP16 KV-Caches directly into runtime buffers */
+    /* 2. Read ShortConv states and SWA/GQA FP16 KV-Caches directly into runtime buffers */
     const uint32_t D          = m->cfg.n_embd;
-    const uint32_t head_dim   = (m->cfg.n_head_q > 0) ? (D / m->cfg.n_head_q) : 64;
+    const uint32_t head_dim   = (m->cfg.head_dim > 0) ? m->cfg.head_dim
+                                : ((m->cfg.n_head_q > 0) ? (D / m->cfg.n_head_q) : 64);
     const uint32_t hist_len   = (m->cfg.shortconv_l_cache > 1) ? (m->cfg.shortconv_l_cache - 1) : 2;
+    const uint32_t swa_win    = (m->cfg.sliding_window > 0) ? m->cfg.sliding_window : 256U;
+    const uint32_t eff_cap    = (swa_cap > 0) ? swa_cap : (swa_win + 8U);
     const size_t   conv_bytes = (size_t)hist_len * D * sizeof(float);
 
     for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
@@ -635,6 +708,7 @@ static inline bool lfm2_prompt_cache_try_load_prefix(const char *filepath,
                     fclose(f);
                     return false;
                 }
+                if (out_conv_heads) out_conv_heads[l] = 0U;
             } else {
                 /* Discard if caller buffer is null */
                 float dummy[1024];
@@ -643,6 +717,33 @@ static inline bool lfm2_prompt_cache_try_load_prefix(const char *filepath,
                     size_t chunk = (rem < sizeof(dummy)) ? rem : sizeof(dummy);
                     if (!lfm2_read_exact_checked(f, dummy, chunk, &csum)) { fclose(f); return false; }
                     rem -= chunk;
+                }
+            }
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN) {
+            const uint32_t w_valid   = (hdr.n_tokens < swa_win) ? hdr.n_tokens : swa_win;
+            const uint32_t t_start   = hdr.n_tokens - w_valid;
+            const size_t   kv_dim    = (size_t)m->cfg.n_head_kv[l] * head_dim;
+            const size_t   row_bytes = kv_dim * sizeof(uint16_t);
+            if (k_cache_f16[l] != NULL && v_cache_f16[l] != NULL) {
+                for (uint32_t t = t_start; t < hdr.n_tokens; ++t) {
+                    const uint32_t slot = t % eff_cap;
+                    if (!lfm2_read_exact_checked(f, k_cache_f16[l] + (size_t)slot * kv_dim, row_bytes, &csum)) {
+                        fclose(f); return false;
+                    }
+                }
+                for (uint32_t t = t_start; t < hdr.n_tokens; ++t) {
+                    const uint32_t slot = t % eff_cap;
+                    if (!lfm2_read_exact_checked(f, v_cache_f16[l] + (size_t)slot * kv_dim, row_bytes, &csum)) {
+                        fclose(f); return false;
+                    }
+                }
+            } else {
+                uint8_t dummy[2048];
+                size_t total_skip = 2ULL * (size_t)w_valid * row_bytes;
+                while (total_skip > 0) {
+                    size_t chunk = (total_skip < sizeof(dummy)) ? total_skip : sizeof(dummy);
+                    if (!lfm2_read_exact_checked(f, dummy, chunk, &csum)) { fclose(f); return false; }
+                    total_skip -= chunk;
                 }
             }
         } else {
@@ -679,6 +780,20 @@ static inline bool lfm2_prompt_cache_try_load_prefix(const char *filepath,
     fclose(f);
     if (out_matched_pos) *out_matched_pos = hdr.n_tokens;
     return true;
+}
+
+static inline bool lfm2_prompt_cache_try_load_prefix(const char *filepath,
+                                                     const LFM2Model *m,
+                                                     const uint32_t *prompt_tokens,
+                                                     uint32_t n_prompt,
+                                                     uint32_t max_seq_len,
+                                                     float *conv_state[LFM2_MAX_LAYERS],
+                                                     uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
+                                                     uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
+                                                     uint32_t *out_matched_pos) {
+    return lfm2_prompt_cache_try_load_prefix_ex(filepath, m, prompt_tokens, n_prompt, max_seq_len,
+                                                conv_state, NULL, k_cache_f16, v_cache_f16, 0U,
+                                                out_matched_pos);
 }
 
 /* Universal FP32 wrapper saving prompt cache when caller uses float* KV buffers */

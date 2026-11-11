@@ -110,23 +110,33 @@ typedef struct {
     const void *data;           /* Direct zero-copy pointer into mmap buffer */
 } GGUFTensor;
 
+#ifndef LFM2_BLOCK_TYPE_DEFINED
+#define LFM2_BLOCK_TYPE_DEFINED 1
 typedef enum {
     LFM2_BLOCK_SHORTCONV = 0,   /* Double-Gated LIV Short Convolution Block */
-    LFM2_BLOCK_GQA_ATTN  = 1    /* Grouped-Query Attention Block            */
+    LFM2_BLOCK_GQA_ATTN  = 1,   /* Global Grouped-Query Attention Block     */
+    LFM2_BLOCK_SWA_ATTN  = 2    /* Sliding-Window Grouped-Query Attention   */
 } lfm2_block_type_t;
+#endif
+
+static inline bool lfm2_block_is_attn(lfm2_block_type_t bt) {
+    return bt == LFM2_BLOCK_GQA_ATTN || bt == LFM2_BLOCK_SWA_ATTN;
+}
 
 typedef struct {
     uint32_t          layer_idx;
     lfm2_block_type_t block_type;
 
-    /* Shared Layer Pre-Norms & SwiGLU FFN Tensors */
-    const GGUFTensor *attn_norm; /* blk.i.attn_norm.weight [n_embd] (F32) */
-    const GGUFTensor *ffn_norm;  /* blk.i.ffn_norm.weight  [n_embd] (F32) */
-    const GGUFTensor *ffn_gate;  /* blk.i.ffn_gate.weight  [n_embd, n_ff] */
-    const GGUFTensor *ffn_up;    /* blk.i.ffn_up.weight    [n_embd, n_ff] */
-    const GGUFTensor *ffn_down;  /* blk.i.ffn_down.weight  [n_ff, n_embd] */
+    /* Shared Layer Pre-Norms, Post-Norms (LFM3 Sandwich Norm) & SwiGLU FFN Tensors */
+    const GGUFTensor *attn_norm;      /* blk.i.attn_norm.weight [n_embd] (F32)            */
+    const GGUFTensor *post_attn_norm; /* blk.i.post_attention_norm.weight [n_embd] (LFM3) */
+    const GGUFTensor *ffn_norm;       /* blk.i.ffn_norm.weight  [n_embd] (F32)            */
+    const GGUFTensor *post_ffn_norm;  /* blk.i.post_ffw_norm.weight [n_embd] (LFM3)       */
+    const GGUFTensor *ffn_gate;       /* blk.i.ffn_gate.weight  [n_embd, n_ff]            */
+    const GGUFTensor *ffn_up;         /* blk.i.ffn_up.weight    [n_embd, n_ff]            */
+    const GGUFTensor *ffn_down;       /* blk.i.ffn_down.weight  [n_ff, n_embd]            */
 
-    /* Operator Union: Either LIV ShortConv or GQA Attention */
+    /* Operator Union: Either LIV ShortConv or GQA/SWA Attention */
     union {
         struct {
             const GGUFTensor *in_proj;  /* blk.i.shortconv.in_proj.weight  [n_embd, 3*n_embd] */
@@ -140,6 +150,7 @@ typedef struct {
             const GGUFTensor *wv;       /* blk.i.attn_v.weight      [n_embd, n_embd_kv] */
             const GGUFTensor *q_norm;   /* blk.i.attn_q_norm.weight [head_dim] (F32)    */
             const GGUFTensor *k_norm;   /* blk.i.attn_k_norm.weight [head_dim] (F32)    */
+            const GGUFTensor *gate;     /* blk.i.attn_gate.weight   [n_embd, n_head_q]  */
             const GGUFTensor *wo;       /* blk.i.attn_output.weight [n_embd, n_embd]    */
         } attn;
     };
@@ -147,19 +158,26 @@ typedef struct {
 
 typedef struct {
     char     arch[32];
+    bool     is_lfm3;
     uint32_t n_layers;
     uint32_t n_embd;
     uint32_t n_ff;
     uint32_t n_vocab;
     uint32_t n_ctx;
     uint32_t n_head_q;
-    uint32_t n_head_kv[LFM2_MAX_LAYERS]; /* 0 = shortconv layer, >0 = GQA layer */
-    uint32_t shortconv_l_cache;          /* Typically 3 (stores last 2 tokens)  */
+    uint32_t head_dim;                   /* Explicit key/value length (64 LFM2, 128 LFM3) */
+    uint32_t rope_dim;                   /* RoPE dim count (typically == head_dim)        */
+    uint32_t n_head_kv[LFM2_MAX_LAYERS]; /* 0 = shortconv layer, >0 = GQA/SWA layer       */
+    bool     is_swa_layer[LFM2_MAX_LAYERS]; /* true = sliding_window attention (LFM3)     */
+    uint32_t sliding_window;             /* e.g. 256 for LFM3 SWA layers, 0 for LFM2      */
+    uint32_t shortconv_l_cache;          /* 3 for LFM2, 7 for LFM3                        */
     float    rms_norm_eps;
     float    rope_freq_base;
+    float    rope_freq_base_swa;         /* e.g. 10000.0f for LFM3 sliding_attention      */
     uint32_t alignment;
     uint32_t n_experts;
     uint32_t n_experts_used;
+    int8_t   add_bos_token;              /* -1 unset, 0 false, 1 true                     */
 } LFM2Config;
 
 typedef struct {
@@ -177,6 +195,7 @@ typedef struct {
     const GGUFTensor *token_embd;      /* token_embd.weight */
     const GGUFTensor *output_norm;     /* token_embd_norm.weight or output_norm.weight */
     const GGUFTensor *output;          /* output.weight (falls back to token_embd) */
+    const GGUFTensor *rope_freqs;      /* rope_freqs.weight [rope_dim/2] (LFM3 partial RoPE) */
 
     /* Hybrid Layer Stack */
     LFM2Layer   layers[LFM2_MAX_LAYERS];
@@ -289,8 +308,14 @@ static bool read_gguf_u32_flexible(ByteCursor *c, uint32_t val_type, uint32_t *o
     return false;
 }
 
+static bool lfm2_key_has_suffix(const char *key, const char *suffix) {
+    size_t klen = strlen(key);
+    size_t slen = strlen(suffix);
+    return (klen >= slen) && (strcmp(key + (klen - slen), suffix) == 0);
+}
+
 /* ============================================================================
- * 5. Metadata Extractor for LFM2 / LFM2.5 Hyperparameters
+ * 5. Metadata Extractor for LFM2 / LFM2.5 / LFM3 Hyperparameters
  * ============================================================================ */
 static bool parse_lfm2_metadata_kv(ByteCursor *c, LFM2Config *cfg) {
     char key[128];
@@ -300,44 +325,81 @@ static bool parse_lfm2_metadata_kv(ByteCursor *c, LFM2Config *cfg) {
     if (!cursor_read_u32(c, &val_type)) return false;
 
     if (strcmp(key, "general.architecture") == 0 && val_type == GGUF_TYPE_STRING) {
-        return cursor_read_gguf_str(c, cfg->arch, sizeof(cfg->arch), NULL);
+        if (!cursor_read_gguf_str(c, cfg->arch, sizeof(cfg->arch), NULL)) return false;
+        cfg->is_lfm3 = (strcmp(cfg->arch, "lfm3") == 0);
+        return true;
     }
     if (strcmp(key, "general.alignment") == 0) {
         return read_gguf_u32_flexible(c, val_type, &cfg->alignment);
     }
-    if (strstr(key, ".block_count") != NULL) {
+    if (strcmp(key, "tokenizer.ggml.add_bos_token") == 0 && val_type == GGUF_TYPE_BOOL) {
+        uint8_t b = 0;
+        if (!cursor_read_bytes(c, &b, 1)) return false;
+        cfg->add_bos_token = b ? 1 : 0;
+        return true;
+    }
+    if (lfm2_key_has_suffix(key, ".block_count")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_layers);
     }
-    if (strstr(key, ".embedding_length") != NULL && strstr(key, "_out") == NULL) {
+    if (lfm2_key_has_suffix(key, ".embedding_length")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_embd);
     }
-    if (strstr(key, ".feed_forward_length") != NULL && val_type != GGUF_TYPE_ARRAY) {
+    if (lfm2_key_has_suffix(key, ".feed_forward_length") && val_type != GGUF_TYPE_ARRAY) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_ff);
     }
-    if (strstr(key, ".context_length") != NULL) {
+    if (lfm2_key_has_suffix(key, ".context_length")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_ctx);
     }
-    if (strstr(key, ".vocab_size") != NULL) {
+    if (lfm2_key_has_suffix(key, ".vocab_size")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_vocab);
     }
-    if (strstr(key, ".shortconv.l_cache") != NULL) {
+    if (lfm2_key_has_suffix(key, ".shortconv.l_cache")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->shortconv_l_cache);
     }
-    if (strstr(key, ".expert_count") != NULL) {
+    if (lfm2_key_has_suffix(key, ".expert_count")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_experts);
     }
-    if (strstr(key, ".expert_used_count") != NULL) {
+    if (lfm2_key_has_suffix(key, ".expert_used_count")) {
         return read_gguf_u32_flexible(c, val_type, &cfg->n_experts_used);
     }
-    if (strstr(key, ".attention.layer_norm_rms_epsilon") != NULL && val_type == GGUF_TYPE_FLOAT32) {
+    if (lfm2_key_has_suffix(key, ".attention.layer_norm_rms_epsilon") && val_type == GGUF_TYPE_FLOAT32) {
         return cursor_read_f32(c, &cfg->rms_norm_eps);
     }
-    if (strstr(key, ".rope.freq_base") != NULL && val_type == GGUF_TYPE_FLOAT32) {
+    if (lfm2_key_has_suffix(key, ".attention.key_length")) {
+        return read_gguf_u32_flexible(c, val_type, &cfg->head_dim);
+    }
+    if (lfm2_key_has_suffix(key, ".attention.sliding_window")) {
+        return read_gguf_u32_flexible(c, val_type, &cfg->sliding_window);
+    }
+    if (lfm2_key_has_suffix(key, ".attention.sliding_window_pattern") && val_type == GGUF_TYPE_ARRAY) {
+        uint32_t elem_type = 0;
+        uint64_t count = 0;
+        if (!cursor_read_u32(c, &elem_type) || !cursor_read_u64(c, &count)) return false;
+        for (uint64_t i = 0; i < count; ++i) {
+            uint8_t b = 0;
+            if (elem_type == GGUF_TYPE_BOOL) {
+                if (!cursor_read_bytes(c, &b, 1)) return false;
+            } else {
+                uint32_t v = 0;
+                if (!read_gguf_u32_flexible(c, elem_type, &v)) return false;
+                b = (v != 0);
+            }
+            if (i < LFM2_MAX_LAYERS) cfg->is_swa_layer[i] = (b != 0);
+        }
+        return true;
+    }
+    if (lfm2_key_has_suffix(key, ".rope.dimension_count")) {
+        return read_gguf_u32_flexible(c, val_type, &cfg->rope_dim);
+    }
+    if (lfm2_key_has_suffix(key, ".rope.freq_base_swa") && val_type == GGUF_TYPE_FLOAT32) {
+        return cursor_read_f32(c, &cfg->rope_freq_base_swa);
+    }
+    if (lfm2_key_has_suffix(key, ".rope.freq_base") && val_type == GGUF_TYPE_FLOAT32) {
         return cursor_read_f32(c, &cfg->rope_freq_base);
     }
 
-    /* lfm2.attention.head_count can be a scalar uint32 or an array */
-    if (strstr(key, ".attention.head_count") != NULL && strstr(key, "_kv") == NULL) {
+    /* lfm2/lfm3.attention.head_count can be a scalar uint32 or an array */
+    if (lfm2_key_has_suffix(key, ".attention.head_count")) {
         if (val_type == GGUF_TYPE_UINT32) {
             return cursor_read_u32(c, &cfg->n_head_q);
         } else if (val_type == GGUF_TYPE_ARRAY) {
@@ -353,8 +415,8 @@ static bool parse_lfm2_metadata_kv(ByteCursor *c, LFM2Config *cfg) {
         }
     }
 
-    /* lfm2.attention.head_count_kv is an array [0, 0, 8, 0, 0, 8...] defining hybrid blocks */
-    if (strstr(key, ".attention.head_count_kv") != NULL) {
+    /* lfm2/lfm3.attention.head_count_kv is an array [0, 0, 8, ...] defining hybrid blocks */
+    if (lfm2_key_has_suffix(key, ".attention.head_count_kv")) {
         if (val_type == GGUF_TYPE_UINT32) {
             uint32_t v = 0;
             if (!cursor_read_u32(c, &v)) return false;
@@ -406,7 +468,83 @@ static const GGUFTensor *find_layer_tensor(const LFM2Model *m, uint32_t l, const
     return find_tensor(m, buf);
 }
 
+static bool bind_lfm3_tensors(LFM2Model *m) {
+    m->cfg.is_lfm3 = true;
+    if (m->cfg.head_dim == 0 && m->cfg.n_head_q > 0) {
+        m->cfg.head_dim = m->cfg.n_embd / m->cfg.n_head_q;
+    }
+    if (m->cfg.rope_dim == 0) {
+        m->cfg.rope_dim = m->cfg.head_dim;
+    }
+
+    m->token_embd = find_tensor(m, "token_embd.weight");
+    m->output_norm = find_tensor(m, "token_embd_norm.weight");
+    if (!m->output_norm) {
+        m->output_norm = find_tensor(m, "output_norm.weight");
+    }
+    m->output = find_tensor(m, "output.weight");
+    if (!m->output) {
+        m->output = m->token_embd;
+    }
+    m->rope_freqs = find_tensor(m, "rope_freqs.weight");
+
+    if (!m->token_embd || !m->output_norm) {
+        fprintf(stderr, "[ERROR] LFM3 missing global token_embd or output_norm tensor.\n");
+        return false;
+    }
+
+    for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
+        LFM2Layer *layer = &m->layers[l];
+        layer->layer_idx      = l;
+        layer->attn_norm      = find_layer_tensor(m, l, "attn_norm.weight");
+        layer->post_attn_norm = find_layer_tensor(m, l, "post_attention_norm.weight");
+        layer->ffn_norm       = find_layer_tensor(m, l, "ffn_norm.weight");
+        layer->post_ffn_norm  = find_layer_tensor(m, l, "post_ffw_norm.weight");
+        layer->ffn_gate       = find_layer_tensor(m, l, "ffn_gate.weight");
+        layer->ffn_up         = find_layer_tensor(m, l, "ffn_up.weight");
+        layer->ffn_down       = find_layer_tensor(m, l, "ffn_down.weight");
+
+        const GGUFTensor *sc_conv = find_layer_tensor(m, l, "shortconv.conv.weight");
+        if (sc_conv != NULL || m->cfg.n_head_kv[l] == 0) {
+            layer->block_type         = LFM2_BLOCK_SHORTCONV;
+            layer->shortconv.in_proj  = find_layer_tensor(m, l, "shortconv.in_proj.weight");
+            layer->shortconv.conv     = sc_conv;
+            layer->shortconv.out_proj = find_layer_tensor(m, l, "shortconv.out_proj.weight");
+
+            if (!layer->shortconv.in_proj || !layer->shortconv.conv || !layer->shortconv.out_proj) {
+                fprintf(stderr, "[ERROR] LFM3 layer %u missing shortconv tensors.\n", l);
+                return false;
+            }
+        } else {
+            layer->block_type  = m->cfg.is_swa_layer[l] ? LFM2_BLOCK_SWA_ATTN : LFM2_BLOCK_GQA_ATTN;
+            layer->attn.wq     = find_layer_tensor(m, l, "attn_q.weight");
+            layer->attn.wk     = find_layer_tensor(m, l, "attn_k.weight");
+            layer->attn.wv     = find_layer_tensor(m, l, "attn_v.weight");
+            layer->attn.q_norm = find_layer_tensor(m, l, "attn_q_norm.weight");
+            layer->attn.k_norm = find_layer_tensor(m, l, "attn_k_norm.weight");
+            layer->attn.gate   = find_layer_tensor(m, l, "attn_gate.weight");
+            layer->attn.wo     = find_layer_tensor(m, l, "attn_output.weight");
+
+            if (!layer->attn.wq || !layer->attn.wk || !layer->attn.wv || !layer->attn.wo) {
+                fprintf(stderr, "[ERROR] LFM3 layer %u missing attention tensors.\n", l);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool bind_lfm2_tensors(LFM2Model *m) {
+    if (strcmp(m->cfg.arch, "lfm3") == 0) {
+        return bind_lfm3_tensors(m);
+    }
+    if (m->cfg.head_dim == 0 && m->cfg.n_head_q > 0) {
+        m->cfg.head_dim = m->cfg.n_embd / m->cfg.n_head_q;
+    }
+    if (m->cfg.rope_dim == 0) {
+        m->cfg.rope_dim = m->cfg.head_dim;
+    }
+
     m->token_embd = find_tensor(m, "token_embd.weight");
     /* LFM2 uses token_embd_norm.weight for final RMSNorm; check both names */
     m->output_norm = find_tensor(m, "token_embd_norm.weight");
@@ -474,6 +612,8 @@ bool lfm2_load_gguf_from_fd(int fd, size_t file_size, LFM2Model *m) {
     m->cfg.shortconv_l_cache = 3;
     m->cfg.rms_norm_eps      = 1e-5f;
     m->cfg.rope_freq_base    = 1e6f;
+    m->cfg.rope_freq_base_swa = 10000.0f;
+    m->cfg.add_bos_token     = -1;
 
     if (file_size < 24) {
         struct stat st;
@@ -643,7 +783,7 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    printf("=== Liquid AI LFM2 / LFM2.5 GGUF Engine Inspector ===\n");
+    printf("=== Liquid AI LFM2 / LFM2.5 / LFM3 GGUF Engine Inspector ===\n");
     printf("Architecture      : %s\n", model.cfg.arch);
     printf("File Size (mmap)  : %.2f MB\n", (double)model.file_size / (1024.0 * 1024.0));
     printf("Layers            : %u\n", model.cfg.n_layers);
@@ -651,15 +791,19 @@ int main(int argc, char **argv) {
     printf("FFN Hidden Dim    : %u\n", model.cfg.n_ff);
     printf("Vocab Size        : %u\n", model.cfg.n_vocab);
     printf("Context Length    : %u\n", model.cfg.n_ctx);
-    printf("Query Heads       : %u\n", model.cfg.n_head_q);
+    printf("Query Heads       : %u (head_dim=%u)\n", model.cfg.n_head_q, model.cfg.head_dim);
     printf("ShortConv L-Cache : %u (ring buffer steps = %u)\n",
            model.cfg.shortconv_l_cache, model.cfg.shortconv_l_cache - 1);
     printf("RMSNorm Epsilon   : %g\n", model.cfg.rms_norm_eps);
-    printf("RoPE Freq Base    : %.1f\n", model.cfg.rope_freq_base);
+    printf("RoPE Freq Base    : %.1f (SWA=%.1f, rope_dim=%u)\n",
+           model.cfg.rope_freq_base, model.cfg.rope_freq_base_swa, model.cfg.rope_dim);
+    if (model.cfg.sliding_window > 0) {
+        printf("Sliding Window    : %u\n", model.cfg.sliding_window);
+    }
     printf("Output Weight Tied: %s\n\n",
            (model.output == model.token_embd) ? "YES (tied to token_embd.weight)" : "NO");
 
-    uint32_t n_conv = 0, n_attn = 0;
+    uint32_t n_conv = 0, n_attn = 0, n_swa = 0;
     printf("--- Hybrid Layer Routing Table ---\n");
     for (uint32_t l = 0; l < model.cfg.n_layers; ++l) {
         const LFM2Layer *ly = &model.layers[l];
@@ -676,22 +820,25 @@ int main(int argc, char **argv) {
                    (unsigned long long)ly->shortconv.conv->ne[1],
                    ly->shortconv.in_proj->data);
         } else {
-            n_attn++;
+            if (ly->block_type == LFM2_BLOCK_SWA_ATTN) n_swa++;
+            else n_attn++;
             ggml_type_traits_t tr;
             get_ggml_type_traits(ly->attn.wq->type, &tr);
-            printf("Layer %2u : [GQA_ATTN ] kv_heads=%u | wq=[%llu, %llu] (%s) | q_norm=[%llu] | ptr=%p\n",
+            printf("Layer %2u : [%s] kv_heads=%u | wq=[%llu, %llu] (%s) | q_norm=[%llu] | gate=%s | ptr=%p\n",
                    l,
+                   (ly->block_type == LFM2_BLOCK_SWA_ATTN) ? "GQA_SWA  " : "GQA_FULL ",
                    model.cfg.n_head_kv[l],
                    (unsigned long long)ly->attn.wq->ne[0],
                    (unsigned long long)ly->attn.wq->ne[1],
                    tr.name,
                    (unsigned long long)(ly->attn.q_norm ? ly->attn.q_norm->ne[0] : 0),
+                   ly->attn.gate ? "YES" : "NO",
                    ly->attn.wq->data);
         }
     }
 
-    printf("\nSummary: %u ShortConv layers + %u GQA Attention layers = %u total layers.\n",
-           n_conv, n_attn, model.cfg.n_layers);
+    printf("\nSummary: %u ShortConv + %u SWA + %u Full Attention = %u total layers.\n",
+           n_conv, n_swa, n_attn, model.cfg.n_layers);
 
     lfm2_free_model(&model);
     return EXIT_SUCCESS;

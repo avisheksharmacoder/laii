@@ -9,7 +9,14 @@ from pathlib import Path
 # Add python directory to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-from lfm2 import LFM2GrammarType, LFM2Model, LFM2PoolingType, LFM2Status  # noqa: E402
+from lfm2 import (  # noqa: E402
+    LFM2GrammarType,
+    LFM2Model,
+    LFM2PoolingType,
+    LFM2Status,
+    LFM3Model,
+    load_lfm3_model,
+)
 
 TOY_MODEL_PATH = "tests/lfm2_toy.gguf"
 LIB_PATH = "./lib/liblfm2.so"
@@ -130,8 +137,44 @@ def test_python_sdk() -> None:
     finally:
         os.close(raw_fd)
 
+    # 8. LFM3 Strict Loader Validation & Real LFM3 End-to-End Test (if model present)
+    print("[Test 8/8] Verifying LFM3Model strict guard & LFM3 inference dispatch...")
+    try:
+        LFM3Model(TOY_MODEL_PATH, lib_path=LIB_PATH, warmup_pages=False)
+        raise AssertionError("Expected LFM3Model to reject non-lfm3 GGUF!")
+    except ValueError:
+        print("  Strict LFM3Model guard correctly rejected LFM2 GGUF with ValueError.")
+
+    lfm3_path = "models/LFM3-1.7B-Q4_K_M.gguf"
+    if os.path.exists(lfm3_path):
+        with LFM2Model(lfm3_path, lib_path=LIB_PATH, warmup_pages=False) as auto_m:
+            assert auto_m.info.arch == "lfm3"
+            assert auto_m.info.n_layers == 24
+            assert auto_m.info.n_shortconv_layers == 13
+            assert auto_m.info.n_gqa_layers == 11
+            assert auto_m.info.n_vocab == 128000
+
+        with load_lfm3_model(lfm3_path, lib_path=LIB_PATH, warmup_pages=False) as lfm3_m:
+            assert lfm3_m.info.arch == "lfm3"
+            with lfm3_m.create_context(max_seq_len=512) as ctx3:
+                reply3 = ctx3.chat("What is 2+2? Answer concisely.", temperature=0.0, max_tokens=48)
+                assert len(reply3) > 0
+                decode_tps = ctx3.stats.decode_tok_per_sec
+                assert decode_tps > 0
+                base_pos = ctx3.pos
+                with ctx3.branch():
+                    _ = ctx3.chat("Hello", temperature=0.0, max_tokens=8)
+                    assert ctx3.pos > base_pos
+                assert ctx3.pos == base_pos
+                emb3 = ctx3.embed("Liquid LFM3 test", pooling=LFM2PoolingType.LAST_TOKEN)
+                assert len(emb3) == lfm3_m.info.n_embd
+                assert abs(sum(x * x for x in emb3) ** 0.5 - 1.0) < 1e-3
+                print(f"  LFM3 SDK verified: reply={repr(reply3[:60])} | decode={decode_tps:.1f} tok/s")
+    else:
+        print(f"  NOTE: {lfm3_path} not present; skipping real LFM3 SDK test.")
+
     print("=======================================================")
-    print("ALL 7 PYTHON SDK TESTS PASSED WITH 100% SUCCESS!       ")
+    print("ALL 8 PYTHON SDK TESTS PASSED WITH 100% SUCCESS!       ")
     print("=======================================================")
 
 

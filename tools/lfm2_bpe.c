@@ -76,9 +76,15 @@ typedef struct {
     /* Fast O(1) raw byte (0..255) -> initial BPE symbol token_id */
     uint32_t      byte_to_id[256];
 
-    /* Special control tokens (<|startoftext|>, <|im_start|>, <|im_end|>, etc.) */
+    /* Special control tokens (<|startoftext|>, <|im_start|>, <|im_end|>, <think>, etc.) */
     SpecialToken  specials[64];
     uint32_t      n_specials;
+    SpecialToken *extra_specials;
+    uint32_t      n_extra_specials;
+    uint32_t      extra_specials_cap;
+    uint16_t      special_first_byte_max_len[256];
+    bool          special_all_lt;
+    bool          special_index_built;
 
     uint32_t      id_pad;
     uint32_t      id_bos;
@@ -226,10 +232,12 @@ bool lfm2_vocab_load(LFM2Vocab *v, const LFM2Model *m) {
         return false;
     }
 
-    size_t tokens_offset = 0;
-    size_t merges_offset = 0;
+    size_t tokens_offset     = 0;
+    size_t token_type_offset = 0;
+    size_t merges_offset     = 0;
+    uint32_t kv_bos = UINT32_MAX, kv_eos = UINT32_MAX, kv_pad = UINT32_MAX;
 
-    /* Pass 1: Locate offsets of tokenizer.ggml.tokens and tokenizer.ggml.merges */
+    /* Pass 1: Locate offsets of tokenizer arrays & special token IDs */
     for (uint64_t i = 0; i < n_kv; ++i) {
         char key[128];
         uint32_t val_type = 0;
@@ -238,8 +246,19 @@ bool lfm2_vocab_load(LFM2Vocab *v, const LFM2Model *m) {
 
         if (strcmp(key, "tokenizer.ggml.tokens") == 0 && val_type == GGUF_TYPE_ARRAY) {
             tokens_offset = cur.pos;
+        } else if (strcmp(key, "tokenizer.ggml.token_type") == 0 && val_type == GGUF_TYPE_ARRAY) {
+            token_type_offset = cur.pos;
         } else if (strcmp(key, "tokenizer.ggml.merges") == 0 && val_type == GGUF_TYPE_ARRAY) {
             merges_offset = cur.pos;
+        } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
+            if (!read_gguf_u32_flexible(&cur, val_type, &kv_bos)) return false;
+            continue;
+        } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
+            if (!read_gguf_u32_flexible(&cur, val_type, &kv_eos)) return false;
+            continue;
+        } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
+            if (!read_gguf_u32_flexible(&cur, val_type, &kv_pad)) return false;
+            continue;
         }
         if (!cursor_skip_gguf_value(&cur, val_type)) return false;
     }
@@ -249,12 +268,37 @@ bool lfm2_vocab_load(LFM2Vocab *v, const LFM2Model *m) {
         return false;
     }
 
+    /* Optional Pass 1b: Parse tokenizer.ggml.token_type array (3=CONTROL, 4=USER_DEFINED) */
+    int32_t *tok_types = NULL;
+    if (token_type_offset != 0) {
+        ByteCursor tt_cur = cur;
+        tt_cur.pos = token_type_offset;
+        uint32_t tt_elem = 0;
+        uint64_t tt_cnt  = 0;
+        if (cursor_read_u32(&tt_cur, &tt_elem) && cursor_read_u64(&tt_cur, &tt_cnt) &&
+            (tt_elem == GGUF_TYPE_INT32 || tt_elem == GGUF_TYPE_UINT32) && tt_cnt > 0) {
+            tok_types = (int32_t *)malloc((size_t)tt_cnt * sizeof(int32_t));
+            if (tok_types) {
+                for (uint64_t i = 0; i < tt_cnt; ++i) {
+                    uint32_t val = 0;
+                    if (!cursor_read_u32(&tt_cur, &val)) {
+                        free(tok_types);
+                        tok_types = NULL;
+                        break;
+                    }
+                    tok_types[i] = (int32_t)val;
+                }
+            }
+        }
+    }
+
     /* Pass 2: Load all token strings and populate TokenStrHash */
     cur.pos = tokens_offset;
     uint32_t tok_elem_type = 0;
     uint64_t tok_count = 0;
     if (!cursor_read_u32(&cur, &tok_elem_type) || !cursor_read_u64(&cur, &tok_count) ||
         tok_elem_type != GGUF_TYPE_STRING) {
+        free(tok_types);
         return false;
     }
 
@@ -263,18 +307,30 @@ bool lfm2_vocab_load(LFM2Vocab *v, const LFM2Model *m) {
     v->token_lens = (uint32_t *)calloc(v->n_vocab, sizeof(uint32_t));
     v->str_ht_cap = next_pow2_u32(v->n_vocab * 2);
     v->str_ht     = (TokenStrSlot *)malloc((size_t)v->str_ht_cap * sizeof(TokenStrSlot));
-    if (!v->tokens || !v->token_lens || !v->str_ht) return false;
+    if (!v->tokens || !v->token_lens || !v->str_ht) {
+        free(tok_types);
+        return false;
+    }
 
     for (uint32_t i = 0; i < v->str_ht_cap; ++i) {
         v->str_ht[i].token_id = UINT32_MAX;
     }
 
+    v->special_all_lt      = true;
+    v->special_index_built = true;
+
     for (uint32_t tid = 0; tid < v->n_vocab; ++tid) {
         uint64_t slen = 0;
-        if (!cursor_read_u64(&cur, &slen) || cur.pos + slen > cur.size) return false;
+        if (!cursor_read_u64(&cur, &slen) || cur.pos + slen > cur.size) {
+            free(tok_types);
+            return false;
+        }
 
         v->tokens[tid] = (char *)malloc((size_t)slen + 1);
-        if (!v->tokens[tid]) return false;
+        if (!v->tokens[tid]) {
+            free(tok_types);
+            return false;
+        }
         memcpy(v->tokens[tid], cur.base + cur.pos, (size_t)slen);
         v->tokens[tid][slen] = '\0';
         v->token_lens[tid]   = (uint32_t)slen;
@@ -282,20 +338,47 @@ bool lfm2_vocab_load(LFM2Vocab *v, const LFM2Model *m) {
 
         vocab_str_ht_insert(v, v->tokens[tid], (uint32_t)slen, tid);
 
-        /* Register special tokens for exact pre-splitting */
+        /* Register special tokens for exact pre-splitting:
+         * - GGUF token_type 3 (CONTROL) or 4 (USER_DEFINED), ignoring unused (5)
+         * - Fallback patterns <|...|>, <s>, </s>, <unk>, <think>, </think> */
         const char *tok = v->tokens[tid];
         bool is_special = false;
-        if (slen >= 5 && tok[0] == '<' && tok[1] == '|' &&
-            tok[slen - 2] == '|' && tok[slen - 1] == '>') {
+        if (tok_types != NULL && (tok_types[tid] == 3 || tok_types[tid] == 4)) {
             is_special = true;
-        } else if (strcmp(tok, "<s>") == 0 || strcmp(tok, "</s>") == 0 || strcmp(tok, "<unk>") == 0) {
+        } else if (slen >= 5 && tok[0] == '<' && tok[1] == '|' &&
+                   tok[slen - 2] == '|' && tok[slen - 1] == '>') {
+            is_special = true;
+        } else if (strcmp(tok, "<s>") == 0 || strcmp(tok, "</s>") == 0 ||
+                   strcmp(tok, "<unk>") == 0 || strcmp(tok, "<think>") == 0 ||
+                   strcmp(tok, "</think>") == 0) {
             is_special = true;
         }
 
-        if (is_special && v->n_specials < 64) {
-            v->specials[v->n_specials++] = (SpecialToken){
-                .str = v->tokens[tid], .len = (uint32_t)slen, .id = tid
-            };
+        if (is_special && slen > 0) {
+            SpecialToken st = { .str = v->tokens[tid], .len = (uint32_t)slen, .id = tid };
+            if (v->n_specials < 64) {
+                v->specials[v->n_specials++] = st;
+            } else {
+                if (v->n_extra_specials >= v->extra_specials_cap) {
+                    uint32_t new_cap = v->extra_specials_cap ? (v->extra_specials_cap * 2) : 128;
+                    SpecialToken *grown = (SpecialToken *)realloc(
+                        v->extra_specials, (size_t)new_cap * sizeof(SpecialToken));
+                    if (!grown) {
+                        free(tok_types);
+                        return false;
+                    }
+                    v->extra_specials     = grown;
+                    v->extra_specials_cap = new_cap;
+                }
+                v->extra_specials[v->n_extra_specials++] = st;
+            }
+            const uint8_t b0 = (uint8_t)tok[0];
+            if (slen < 65535 && (uint16_t)slen > v->special_first_byte_max_len[b0]) {
+                v->special_first_byte_max_len[b0] = (uint16_t)slen;
+            }
+            if (tok[0] != '<') {
+                v->special_all_lt = false;
+            }
         }
 
         if (strcmp(tok, "<|pad|>") == 0)                   v->id_pad        = tid;
@@ -307,6 +390,11 @@ bool lfm2_vocab_load(LFM2Vocab *v, const LFM2Model *m) {
         else if (strcmp(tok, "<|tool_call_start|>") == 0)  v->id_tool_start = tid;
         else if (strcmp(tok, "<|tool_call_end|>") == 0)    v->id_tool_end   = tid;
     }
+    free(tok_types);
+
+    if (kv_bos < v->n_vocab) v->id_bos = kv_bos;
+    if (kv_eos < v->n_vocab) v->id_im_end = kv_eos;
+    if (kv_pad < v->n_vocab) v->id_pad = kv_pad;
 
     /* Populate O(1) raw byte -> initial token_id lookup table */
     for (int b = 0; b < 256; ++b) {
@@ -374,6 +462,7 @@ void lfm2_vocab_free(LFM2Vocab *v) {
     free(v->token_lens);
     free(v->str_ht);
     free(v->merge_ht);
+    free(v->extra_specials);
     memset(v, 0, sizeof(*v));
 }
 
@@ -616,13 +705,9 @@ static size_t next_gpt2_pretoken_len(const uint8_t *s, size_t len) {
     return (i > 0) ? i : 1;
 }
 
-uint32_t lfm2_tokenize(const LFM2Vocab *v, const char *text,
-                       uint32_t *out_ids, uint32_t max_ids) {
-    uint32_t n_out = 0;
-    const char *p = text;
-
-    while (*p && n_out < max_ids) {
-        /* 1. Check if cursor begins with any registered special token */
+static inline bool vocab_match_special_at(const LFM2Vocab *v, const char *p,
+                                          uint32_t *out_id, uint32_t *out_len) {
+    if (!v->special_index_built) {
         int64_t matched_id = -1;
         uint32_t matched_len = 0;
         for (uint32_t sp = 0; sp < v->n_specials; ++sp) {
@@ -633,17 +718,87 @@ uint32_t lfm2_tokenize(const LFM2Vocab *v, const char *text,
             }
         }
         if (matched_id >= 0) {
-            out_ids[n_out++] = (uint32_t)matched_id;
+            *out_id  = (uint32_t)matched_id;
+            *out_len = matched_len;
+            return true;
+        }
+        return false;
+    }
+
+    const uint16_t max_l = v->special_first_byte_max_len[(uint8_t)*p];
+    if (max_l == 0) return false;
+
+    int64_t matched_id = -1;
+    uint32_t matched_len = 0;
+    for (uint32_t sp = 0; sp < v->n_specials; ++sp) {
+        if ((uint8_t)v->specials[sp].str[0] != (uint8_t)*p) continue;
+        const uint32_t slen = v->specials[sp].len;
+        if (slen > matched_len && strncmp(p, v->specials[sp].str, slen) == 0) {
+            matched_id  = (int64_t)v->specials[sp].id;
+            matched_len = slen;
+        }
+    }
+    for (uint32_t sp = 0; sp < v->n_extra_specials; ++sp) {
+        if ((uint8_t)v->extra_specials[sp].str[0] != (uint8_t)*p) continue;
+        const uint32_t slen = v->extra_specials[sp].len;
+        if (slen > matched_len && strncmp(p, v->extra_specials[sp].str, slen) == 0) {
+            matched_id  = (int64_t)v->extra_specials[sp].id;
+            matched_len = slen;
+        }
+    }
+    if (matched_id >= 0) {
+        *out_id  = (uint32_t)matched_id;
+        *out_len = matched_len;
+        return true;
+    }
+    return false;
+}
+
+uint32_t lfm2_tokenize(const LFM2Vocab *v, const char *text,
+                       uint32_t *out_ids, uint32_t max_ids) {
+    uint32_t n_out = 0;
+    const char *p = text;
+
+    while (*p && n_out < max_ids) {
+        /* 1. Check if cursor begins with any registered special token */
+        uint32_t matched_id = 0, matched_len = 0;
+        if (vocab_match_special_at(v, p, &matched_id, &matched_len)) {
+            out_ids[n_out++] = matched_id;
             p += matched_len;
             continue;
         }
 
         /* 2. Find the end of the current plain-text span (up to next special token) */
-        size_t span_len = strlen(p);
-        for (uint32_t sp = 0; sp < v->n_specials; ++sp) {
-            const char *pos = strstr(p, v->specials[sp].str);
-            if (pos && (size_t)(pos - p) < span_len) {
-                span_len = (size_t)(pos - p);
+        size_t span_len = 0;
+        if (v->special_index_built && v->special_all_lt) {
+            const char *scan = p + 1;
+            const char *found = NULL;
+            while ((scan = strchr(scan, '<')) != NULL) {
+                uint32_t tmp_id = 0, tmp_len = 0;
+                if (vocab_match_special_at(v, scan, &tmp_id, &tmp_len)) {
+                    found = scan;
+                    break;
+                }
+                scan++;
+            }
+            span_len = found ? (size_t)(found - p) : strlen(p);
+        } else if (v->special_index_built) {
+            const char *scan = p + 1;
+            while (*scan) {
+                if (v->special_first_byte_max_len[(uint8_t)*scan] > 0) {
+                    uint32_t tmp_id = 0, tmp_len = 0;
+                    if (vocab_match_special_at(v, scan, &tmp_id, &tmp_len)) break;
+                }
+                scan++;
+            }
+            span_len = (size_t)(scan - p);
+        } else {
+            span_len = strlen(p);
+            for (uint32_t sp = 0; sp < v->n_specials; ++sp) {
+                const char *pos = strstr(p, v->specials[sp].str);
+                if (pos && (size_t)(pos - p) < span_len) {
+                    span_len = (size_t)(pos - p);
+                }
             }
         }
         if (span_len == 0) {

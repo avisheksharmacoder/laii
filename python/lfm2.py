@@ -318,23 +318,13 @@ class LFM2Checkpoint:
 
 
 class LFM2Model:
-    """Zero-copy mmap'd LFM2 / LFM2.5 GGUF model."""
+    """Zero-copy mmap'd LFM2 / LFM2.5 / LFM3 GGUF model."""
 
-    def __init__(
-        self,
-        gguf_path: str | Path,
-        lib_path: str | Path | None = None,
-        warmup_pages: bool = True,
-    ) -> None:
-        self._lib = _bind_liblfm2(lib_path)
-        encoded_path = str(gguf_path).encode("utf-8")
-        self._ptr = self._lib.lfm2_model_load(encoded_path, int(warmup_pages))
-        if not self._ptr:
-            raise RuntimeError(f"Failed to load GGUF model: {gguf_path}")
-
+    @staticmethod
+    def _read_info(lib: ctypes.CDLL, ptr: int) -> ModelInfo:
         c_info = _CModelInfo()
-        self._lib.lfm2_model_get_info(self._ptr, ctypes.byref(c_info))
-        self.info = ModelInfo(
+        lib.lfm2_model_get_info(ptr, ctypes.byref(c_info))
+        return ModelInfo(
             arch=c_info.arch.decode("utf-8", errors="replace"),
             active_isa=c_info.active_isa.decode("utf-8", errors="replace"),
             n_layers=c_info.n_layers,
@@ -348,6 +338,19 @@ class LFM2Model:
             n_experts_used=c_info.n_experts_used,
             file_size_mb=c_info.file_size_bytes / (1024.0 * 1024.0),
         )
+
+    def __init__(
+        self,
+        gguf_path: str | Path,
+        lib_path: str | Path | None = None,
+        warmup_pages: bool = True,
+    ) -> None:
+        self._lib = _bind_liblfm2(lib_path)
+        encoded_path = str(gguf_path).encode("utf-8")
+        self._ptr = self._lib.lfm2_model_load(encoded_path, int(warmup_pages))
+        if not self._ptr:
+            raise RuntimeError(f"Failed to load GGUF model: {gguf_path}")
+        self.info = self._read_info(self._lib, self._ptr)
 
     @classmethod
     def from_fd(
@@ -367,23 +370,7 @@ class LFM2Model:
         instance._ptr = instance._lib.lfm2_model_load_from_fd(fd, file_size, int(warmup_pages))
         if not instance._ptr:
             raise RuntimeError(f"Failed to load GGUF model from file descriptor: {fd}")
-
-        c_info = _CModelInfo()
-        instance._lib.lfm2_model_get_info(instance._ptr, ctypes.byref(c_info))
-        instance.info = ModelInfo(
-            arch=c_info.arch.decode("utf-8", errors="replace"),
-            active_isa=c_info.active_isa.decode("utf-8", errors="replace"),
-            n_layers=c_info.n_layers,
-            n_shortconv_layers=c_info.n_shortconv_layers,
-            n_gqa_layers=c_info.n_gqa_layers,
-            n_embd=c_info.n_embd,
-            n_ff=c_info.n_ff,
-            n_vocab=c_info.n_vocab,
-            n_ctx_train=c_info.n_ctx_train,
-            n_experts=c_info.n_experts,
-            n_experts_used=c_info.n_experts_used,
-            file_size_mb=c_info.file_size_bytes / (1024.0 * 1024.0),
-        )
+        instance.info = cls._read_info(instance._lib, instance._ptr)
         return instance
 
     def release_page_cache(self) -> None:
@@ -673,5 +660,56 @@ def run_server(
 ) -> int:
     """Runs the single-threaded zero-dependency Linux epoll OpenAI HTTP/SSE server."""
     return model.run_server(ctx=ctx, bind_ip=bind_ip, port=port)
+
+
+class LFM3Model(LFM2Model):
+    """Dedicated strict loader for LFM3 (`general.architecture == 'lfm3'`) GGUF models."""
+
+    def __init__(
+        self,
+        gguf_path: str | Path,
+        lib_path: str | Path | None = None,
+        warmup_pages: bool = True,
+    ) -> None:
+        super().__init__(gguf_path, lib_path=lib_path, warmup_pages=warmup_pages)
+        if self.info.arch != "lfm3":
+            arch = self.info.arch
+            self.close()
+            raise ValueError(
+                f"Expected GGUF architecture 'lfm3' for LFM3Model, got {arch!r}. "
+                "Use LFM2Model(...) for LFM2 / LFM2.5 / LFM2-MoE models."
+            )
+
+    @classmethod
+    def from_fd(
+        cls,
+        fd: int,
+        file_size: int = 0,
+        warmup_pages: bool = False,
+        lib_path: str | Path | None = None,
+    ) -> LFM3Model:
+        """Loads and validates an LFM3 model directly from an open UNIX file descriptor."""
+        instance = super().from_fd(
+            fd, file_size=file_size, warmup_pages=warmup_pages, lib_path=lib_path
+        )
+        if instance.info.arch != "lfm3":
+            arch = instance.info.arch
+            instance.close()
+            raise ValueError(
+                f"Expected GGUF architecture 'lfm3' for LFM3Model, got {arch!r}."
+            )
+        return instance
+
+
+LFM3Context = LFM2Context
+
+
+def load_lfm3_model(
+    gguf_path: str | Path,
+    lib_path: str | Path | None = None,
+    warmup_pages: bool = True,
+) -> LFM3Model:
+    """Typed helper function to load an LFM3 GGUF model exclusively."""
+    return LFM3Model(gguf_path, lib_path=lib_path, warmup_pages=warmup_pages)
 
 

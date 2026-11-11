@@ -1018,6 +1018,165 @@ static inline void lfm2_kv_cache_shift_sinks(uint16_t *k_cache_f16[LFM2_MAX_LAYE
     lfm2_kv_cache_shift_sinks_scalar(k_cache_f16, v_cache_f16, m, rope_lut, inout_pos, n_sink, n_discard);
 }
 
+/* ============================================================================
+ * 4B. LFM3 Sink-Shift Dispatcher (Global Partial-RoPE 128-Dim + SWA Ring)
+ * ============================================================================ */
+static inline void lfm3_counter_rotate_key_head_scalar(uint16_t * restrict kh,
+                                                       uint32_t head_dim,
+                                                       const float * restrict cos_d,
+                                                       const float * restrict sin_d) {
+    const uint32_t half_dim = head_dim / 2U;
+    for (uint32_t i = 0; i < half_dim; ++i) {
+        const float c  = cos_d[i];
+        const float s  = sin_d[i];
+        if (s == 0.0f && c == 1.0f) continue; /* Partial RoPE unrotated dims preserved identically */
+        const float lo = fp16_to_fp32(kh[i]);
+        const float hi = fp16_to_fp32(kh[i + half_dim]);
+        kh[i]            = fp32_to_fp16(lo * c + hi * s);
+        kh[i + half_dim] = fp32_to_fp16(hi * c - lo * s);
+    }
+}
+
+#if LFM2_HAS_AVX2
+LFM2_TARGET_AVX2
+static inline void lfm3_counter_rotate_key_head_avx2(uint16_t * restrict kh,
+                                                     uint32_t head_dim,
+                                                     const float * restrict cos_d,
+                                                     const float * restrict sin_d) {
+    const uint32_t half_dim = head_dim / 2U;
+    uint32_t i = 0;
+    for (; i + 8U <= half_dim; i += 8U) {
+        const __m256 c  = _mm256_loadu_ps(cos_d + i);
+        const __m256 s  = _mm256_loadu_ps(sin_d + i);
+        const __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(kh + i)));
+        const __m256 hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(kh + i + half_dim)));
+        const __m256 nlo = _mm256_fmadd_ps(lo, c, _mm256_mul_ps(hi, s));
+        const __m256 nhi = _mm256_fmsub_ps(hi, c, _mm256_mul_ps(lo, s));
+        _mm_storeu_si128((__m128i *)(kh + i),            _mm256_cvtps_ph(nlo, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        _mm_storeu_si128((__m128i *)(kh + i + half_dim), _mm256_cvtps_ph(nhi, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+    for (; i < half_dim; ++i) {
+        const float c = cos_d[i], s = sin_d[i];
+        const float lo = fp16_to_fp32(kh[i]);
+        const float hi = fp16_to_fp32(kh[i + half_dim]);
+        kh[i]            = fp32_to_fp16(lo * c + hi * s);
+        kh[i + half_dim] = fp32_to_fp16(hi * c - lo * s);
+    }
+}
+#endif
+
+static inline void lfm3_kv_cache_shift_sinks(uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
+                                             uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
+                                             const LFM2Model * restrict m,
+                                             const LFM2RoPELUT * restrict rope_lut_full,
+                                             const LFM2RoPELUT * restrict rope_lut_swa,
+                                             uint32_t swa_cap,
+                                             uint32_t * restrict inout_pos,
+                                             uint32_t n_sink,
+                                             uint32_t n_discard) {
+    if (!m || !inout_pos || !rope_lut_full || !rope_lut_swa) return;
+    const uint32_t cur_pos = *inout_pos;
+    if (n_discard == 0U || cur_pos <= n_sink + n_discard) return;
+    if (n_discard >= rope_lut_full->max_seq_len || n_discard >= rope_lut_swa->max_seq_len) return;
+
+    const uint32_t head_dim = (m->cfg.head_dim > 0U) ? m->cfg.head_dim
+                              : (m->cfg.n_head_q > 0U ? (m->cfg.n_embd / m->cfg.n_head_q) : 128U);
+    if ((head_dim % 2U) != 0U) return;
+    const uint32_t half_dim = head_dim / 2U;
+    const uint32_t n_keep   = cur_pos - (n_sink + n_discard);
+    const uint32_t new_pos  = n_sink + n_keep;
+    const uint32_t swa_win  = (m->cfg.sliding_window > 0U) ? m->cfg.sliding_window : 256U;
+    const uint32_t eff_cap  = (swa_cap > 0U) ? swa_cap : (swa_win + 8U);
+
+    bool use_avx2 = false;
+#if LFM2_HAS_AVX2
+    {
+        const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
+        const char *force_isa = getenv("LFM2_FORCE_ISA");
+        use_avx2 = kt->has_avx2 && kt->has_fma && kt->has_f16c &&
+                   (!force_isa || strcmp(force_isa, "scalar") != 0);
+    }
+#endif
+
+    const float *cos_full = rope_lut_full->cos_lut + (size_t)n_discard * half_dim;
+    const float *sin_full = rope_lut_full->sin_lut + (size_t)n_discard * half_dim;
+    const float *cos_swa  = rope_lut_swa->cos_lut  + (size_t)n_discard * half_dim;
+    const float *sin_swa  = rope_lut_swa->sin_lut  + (size_t)n_discard * half_dim;
+
+    for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
+        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV) continue;
+        uint16_t *kc = k_cache_f16[l];
+        uint16_t *vc = v_cache_f16[l];
+        if (!kc || !vc) continue;
+
+        const uint32_t n_head_kv = m->cfg.n_head_kv[l];
+        const size_t   kv_dim    = (size_t)n_head_kv * head_dim;
+
+        if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN) {
+            /* Repack valid SWA window [max(0, new_pos - swa_win) .. new_pos - 1] into new ring slots */
+            const uint32_t t_new_start = (new_pos > swa_win) ? (new_pos - swa_win) : 0U;
+            const uint32_t n_valid     = new_pos - t_new_start;
+            const size_t   tmp_bytes   = (size_t)n_valid * kv_dim * sizeof(uint16_t);
+            uint16_t *tmp_k = (uint16_t *)malloc(tmp_bytes);
+            uint16_t *tmp_v = (uint16_t *)malloc(tmp_bytes);
+            if (!tmp_k || !tmp_v) {
+                free(tmp_k); free(tmp_v);
+                continue;
+            }
+            for (uint32_t idx = 0; idx < n_valid; ++idx) {
+                const uint32_t t_new   = t_new_start + idx;
+                const bool     is_kept = (t_new >= n_sink);
+                const uint32_t t_old   = is_kept ? (t_new + n_discard) : t_new;
+                const uint32_t s_old   = t_old % eff_cap;
+                uint16_t *dk = tmp_k + (size_t)idx * kv_dim;
+                uint16_t *dv = tmp_v + (size_t)idx * kv_dim;
+                memcpy(dk, kc + (size_t)s_old * kv_dim, kv_dim * sizeof(uint16_t));
+                memcpy(dv, vc + (size_t)s_old * kv_dim, kv_dim * sizeof(uint16_t));
+                if (is_kept) {
+                    for (uint32_t h = 0; h < n_head_kv; ++h) {
+#if LFM2_HAS_AVX2
+                        if (use_avx2) {
+                            lfm3_counter_rotate_key_head_avx2(dk + (size_t)h * head_dim, head_dim, cos_swa, sin_swa);
+                            continue;
+                        }
+#endif
+                        lfm3_counter_rotate_key_head_scalar(dk + (size_t)h * head_dim, head_dim, cos_swa, sin_swa);
+                    }
+                }
+            }
+            for (uint32_t idx = 0; idx < n_valid; ++idx) {
+                const uint32_t s_new = (t_new_start + idx) % eff_cap;
+                memcpy(kc + (size_t)s_new * kv_dim, tmp_k + (size_t)idx * kv_dim, kv_dim * sizeof(uint16_t));
+                memcpy(vc + (size_t)s_new * kv_dim, tmp_v + (size_t)idx * kv_dim, kv_dim * sizeof(uint16_t));
+            }
+            free(tmp_k);
+            free(tmp_v);
+        } else {
+            memmove(vc + (size_t)n_sink * kv_dim,
+                    vc + (size_t)(n_sink + n_discard) * kv_dim,
+                    (size_t)n_keep * kv_dim * sizeof(uint16_t));
+            memmove(kc + (size_t)n_sink * kv_dim,
+                    kc + (size_t)(n_sink + n_discard) * kv_dim,
+                    (size_t)n_keep * kv_dim * sizeof(uint16_t));
+
+            for (uint32_t t = n_sink; t < n_sink + n_keep; ++t) {
+                uint16_t *k_step = kc + (size_t)t * kv_dim;
+                for (uint32_t h = 0; h < n_head_kv; ++h) {
+#if LFM2_HAS_AVX2
+                    if (use_avx2) {
+                        lfm3_counter_rotate_key_head_avx2(k_step + (size_t)h * head_dim, head_dim, cos_full, sin_full);
+                        continue;
+                    }
+#endif
+                    lfm3_counter_rotate_key_head_scalar(k_step + (size_t)h * head_dim, head_dim, cos_full, sin_full);
+                }
+            }
+        }
+    }
+
+    *inout_pos = new_pos;
+}
+
 #endif /* LFM2_RUNTIME_FEATURES_INCLUDED */
 
 /* ============================================================================

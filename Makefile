@@ -23,11 +23,11 @@ endif
 SRC_CORE = src/arena.c src/gguf.c src/lfm_model.c src/lfm_simd.c src/lfm_fused.c src/lfm_threadpool.c src/lfm_forward.c src/lfm_tokenizer.c src/lfm_engine.c src/lfm_c_api.c src/lfm_server.c
 OBJ_CORE = $(SRC_CORE:src/%.c=build/%.o)
 
-TEST_BINS = bin/test_arena bin/test_math bin/test_simd_avx2 bin/test_quants bin/test_simd_kquants bin/test_fused_conv bin/test_threads bin/test_tokenizer bin/test_bpe bin/test_gguf bin/test_conv1d bin/test_attention bin/test_forward bin/test_c_api bin/test_lfm2_threadpool bin/test_optimizations bin/test_prefill_batch bin/test_decode_1x4 bin/test_kernels_fast bin/test_cpuid_quants bin/test_runtime_features bin/test_moe_checkpoint bin/test_cli_stream bin/test_sys_cache bin/test_lfm2_api bin/test_lfm2_server bin/test_hardening bin/test_simd_arm64 bin/test_android_io bin/test_speculative_pld
+TEST_BINS = bin/test_arena bin/test_math bin/test_simd_avx2 bin/test_quants bin/test_simd_kquants bin/test_fused_conv bin/test_threads bin/test_tokenizer bin/test_bpe bin/test_gguf bin/test_conv1d bin/test_attention bin/test_forward bin/test_c_api bin/test_lfm2_threadpool bin/test_optimizations bin/test_prefill_batch bin/test_decode_1x4 bin/test_kernels_fast bin/test_cpuid_quants bin/test_runtime_features bin/test_moe_checkpoint bin/test_cli_stream bin/test_sys_cache bin/test_lfm2_api bin/test_lfm2_server bin/test_hardening bin/test_simd_arm64 bin/test_android_io bin/test_speculative_pld bin/test_lfm3
 
 .PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-jni test-kotlin-app run-kotlin-app test-parity cli server shared android python-wheel asan tsan parity help
 
-all: dirs lib lfm-run lfm-server bin/lfm2 bin/lfm2-server bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld $(TEST_BINS)
+all: dirs lib lfm-run lfm-server bin/lfm2 bin/lfm2-server bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld bin/lfm3_engine $(TEST_BINS)
 
 dirs:
 	@mkdir -p build bin lib
@@ -43,7 +43,7 @@ lib/liblfm.a: $(OBJ_CORE)
 lib/liblfm.so: $(OBJ_CORE)
 	$(CC) -shared $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-lib/liblfm2.so: src/lfm2_api.c src/lfm2_jni.c include/lfm2.h | dirs
+lib/liblfm2.so: src/lfm2_api.c src/lfm2_jni.c include/lfm2.h $(wildcard tools/lfm*.c tools/lfm*.h) | dirs
 	$(CC) -shared -fPIC -fvisibility=hidden $(CFLAGS) -Wl,-soname,liblfm2.so -Wl,-z,max-page-size=16384 $< -o $@ $(LDFLAGS)
 	@cp -f $@ ./liblfm2.so
 
@@ -62,7 +62,7 @@ bin/lfm2_bpe: tools/lfm2_bpe.c tools/lfm2_loader.c | dirs
 bin/lfm2_forward: tools/lfm2_forward.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-bin/lfm2: tools/lfm2_chat.c tools/lfm2_bpe.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c | dirs
+bin/lfm2: tools/lfm2_chat.c tools/lfm2_bpe.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c tools/lfm3_engine.c | dirs
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 bin/lfm2_chat: bin/lfm2
@@ -111,6 +111,9 @@ bin/lfm2_simd_arm64: tools/lfm2_simd_arm64.c | dirs
 bin/lfm2_speculative_pld: tools/lfm2_speculative_pld.c tools/lfm2_prefill_batch.c tools/lfm2_forward.c tools/lfm2_threadpool.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
 
+bin/lfm3_engine: tools/lfm3_engine.c tools/lfm2_speculative_pld.c tools/lfm2_kernels_fast.c tools/lfm2_decode_1x4.c tools/lfm2_prefill_batch.c tools/lfm2_forward.c tools/lfm2_threadpool.c tools/lfm2_loader.c | dirs
+	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
+
 bin/lfm_gpu_infer_test: src/lfm_gpu/lfm_vulkan.c src/lfm_gpu/lfm_gpu_engine.c src/lfm_gpu/lfm_gpu_infer_test.c | dirs
 	$(CC) $(CFLAGS) -Isrc/lfm_gpu -I. $^ -o $@ $(LDFLAGS) -ldl
 
@@ -148,7 +151,7 @@ bin/lfm2-threadpool-static: tools/lfm2_threadpool.c | dirs
 bin/lfm2-forward-static: tools/lfm2_forward.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) -static $< -o $@ $(LDFLAGS)
 
-bin/lfm2-chat-static: tools/lfm2_chat.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c | dirs
+bin/lfm2-chat-static: tools/lfm2_chat.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c tools/lfm3_engine.c | dirs
 	$(CC) $(CFLAGS) -static $< -o $@ $(LDFLAGS)
 
 bin/lfm2-prefill-static: tools/lfm2_prefill_batch.c tools/lfm2_forward.c tools/lfm2_threadpool.c tools/lfm2_loader.c | dirs
@@ -274,6 +277,9 @@ bin/test_android_io: tests/test_android_io.c lib/liblfm2.so | dirs
 bin/test_speculative_pld: tests/test_speculative_pld.c tools/lfm2_speculative_pld.c tools/lfm2_prefill_batch.c tools/lfm2_forward.c tools/lfm2_threadpool.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
 
+bin/test_lfm3: tests/test_lfm3.c tools/lfm3_engine.c tools/lfm2_speculative_pld.c tools/lfm2_kernels_fast.c tools/lfm2_decode_1x4.c tools/lfm2_prefill_batch.c tools/lfm2_forward.c tools/lfm2_threadpool.c tools/lfm2_loader.c | dirs
+	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
+
 fixtures:
 	@if [ ! -f tests/lfm2_toy.gguf ] || [ ! -f tests/fixtures_attention.bin ]; then \
 		$(PYTHON) tools/generate_reference_tensors.py && \
@@ -396,6 +402,8 @@ test-c-bins: $(TEST_BINS) fixtures
 	@echo "-------------------------------------------------------"
 	@./bin/test_speculative_pld
 	@echo "-------------------------------------------------------"
+	@./bin/test_lfm3
+	@echo "-------------------------------------------------------"
 	@echo "[Test] Verifying Standalone Zero-Copy C11 LFM2 GGUF Inspector..."
 	@./bin/lfm2_loader tests/lfm2_toy.gguf > /dev/null && echo "PASSED: lfm2_loader verified on hybrid GGUF checkpoint!"
 	@echo "-------------------------------------------------------"
@@ -491,7 +499,7 @@ test: test-core static-test
 
 
 # ThreadSanitizer data race detection test suite
-bin/lfm2-tsan: tools/lfm2_chat.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c | dirs
+bin/lfm2-tsan: tools/lfm2_chat.c tools/lfm2_forward.c tools/lfm2_loader.c tools/lfm2_prefill_batch.c tools/lfm2_threadpool.c tools/lfm3_engine.c | dirs
 	$(CC) -std=c11 -O1 -g -fsanitize=thread -fPIC -Wall -Wextra -Wno-unused-function -Iinclude -D_GNU_SOURCE $(if $(filter 1,$(HAS_AVX2)),-mavx2 -mfma -mf16c) $< -o $@ $(LDFLAGS)
 
 test-tsan: lib fixtures bin/lfm2-tsan

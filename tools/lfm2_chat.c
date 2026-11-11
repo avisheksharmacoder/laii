@@ -22,9 +22,11 @@
 #define LFM2_PREFILL_BATCH_NO_MAIN 1
 #define LFM2_CLI_STREAM_NO_MAIN 1
 #define LFM2_SYS_CACHE_NO_MAIN 1
+#define LFM3_ENGINE_NO_MAIN 1
 #include "lfm2_prefill_batch.c"
 #include "lfm2_cli_stream.c"
 #include "lfm2_sys_cache.c"
+#include "lfm3_engine.c"
 
 /* ============================================================================
  * 1. LFM2 Token Sampler (Repetition Penalty + Logit-Space Min-P + Top-K + Temp)
@@ -230,11 +232,14 @@ typedef struct {
     char system_prompt[1024];
     char tool_json_list[2048]; /* Optional JSON tool definitions */
     bool has_tools;
+    bool is_lfm3;
 } LFM2ChatFormatter;
 
 void lfm2_chat_formatter_init(LFM2ChatFormatter *fmt, const char *system_prompt,
                               const char *optional_tools_json) {
+    const bool keep_lfm3 = fmt->is_lfm3;
     memset(fmt, 0, sizeof(*fmt));
+    fmt->is_lfm3 = keep_lfm3;
     snprintf(fmt->system_prompt, sizeof(fmt->system_prompt), "%s",
              (system_prompt && system_prompt[0])
                  ? system_prompt
@@ -250,27 +255,28 @@ void lfm2_chat_formatter_init(LFM2ChatFormatter *fmt, const char *system_prompt,
  * If `is_first_turn` is false (pos > 0), emits only the incremental user/assistant turn delta. */
 int lfm2_format_chatml_turn(const LFM2ChatFormatter *fmt, const char *user_msg,
                             bool is_first_turn, char *out_buf, size_t out_cap) {
+    const char *think_prefix = fmt->is_lfm3 ? "<think>" : "";
     if (is_first_turn) {
         if (fmt->has_tools) {
             return snprintf(out_buf, out_cap,
                 "<|startoftext|><|im_start|>system\n%s\n"
                 "<|tool_list_start|>%s<|tool_list_end|><|im_end|>\n"
                 "<|im_start|>user\n%s<|im_end|>\n"
-                "<|im_start|>assistant\n",
-                fmt->system_prompt, fmt->tool_json_list, user_msg);
+                "<|im_start|>assistant\n%s",
+                fmt->system_prompt, fmt->tool_json_list, user_msg, think_prefix);
         } else {
             return snprintf(out_buf, out_cap,
                 "<|startoftext|><|im_start|>system\n%s<|im_end|>\n"
                 "<|im_start|>user\n%s<|im_end|>\n"
-                "<|im_start|>assistant\n",
-                fmt->system_prompt, user_msg);
+                "<|im_start|>assistant\n%s",
+                fmt->system_prompt, user_msg, think_prefix);
         }
     } else {
         /* Incremental continuation right after the assistant's previous <|im_end|> token */
         return snprintf(out_buf, out_cap,
             "\n<|im_start|>user\n%s<|im_end|>\n"
-            "<|im_start|>assistant\n",
-            user_msg);
+            "<|im_start|>assistant\n%s",
+            user_msg, think_prefix);
     }
 }
 
@@ -286,6 +292,28 @@ static double time_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static float *chat_prefill_prompt(const LFM2Model *m, LFM2BatchState *st, LFM3State *lfm3,
+                                  const uint32_t *tokens, uint32_t n_prompt, uint32_t *inout_pos) {
+    if (!lfm3) return lfm2_prefill_prompt(m, st, tokens, n_prompt, inout_pos);
+    float *logits = NULL;
+    uint32_t i = 0;
+    while (i < n_prompt) {
+        uint32_t chunk = n_prompt - i;
+        if (chunk > LFM2_MAX_BATCH) chunk = LFM2_MAX_BATCH;
+        const bool is_last = (i + chunk == n_prompt);
+        logits = lfm3_forward_batch(m, lfm3, tokens + i, chunk, *inout_pos, is_last);
+        *inout_pos += chunk;
+        i += chunk;
+    }
+    return logits;
+}
+
+static inline float *chat_forward_one(const LFM2Model *m, LFM2BatchState *st, LFM3State *lfm3,
+                                      uint32_t tok, uint32_t pos, bool compute_logits) {
+    return lfm3 ? lfm3_forward_batch(m, lfm3, &tok, 1U, pos, compute_logits)
+                : lfm2_forward_batch(m, st,   &tok, 1U, pos, compute_logits);
 }
 
 int main(int argc, char **argv) {
@@ -349,16 +377,34 @@ int main(int argc, char **argv) {
     }
 
     LFM2BatchState state;
-    if (!lfm2_batch_state_init(&state, &model, 4096, 0)) {
-        fprintf(stderr, "[ERROR] Failed to allocate LFM2 batch state arena.\n");
-        return EXIT_FAILURE;
-    }
+    memset(&state, 0, sizeof(state));
+    LFM3State *lfm3 = NULL;
+    uint32_t state_max_seq = 4096U;
 
     /* Linux /proc/meminfo OOM guard and context verification */
-    LFM2MemoryPlan plan = lfm2_plan_memory_and_guard_oom(&model, state.max_seq_len, 512);
+    LFM2MemoryPlan plan = lfm2_plan_memory_and_guard_oom(&model, state_max_seq, 512);
     if (plan.was_clamped) {
+        state_max_seq = plan.safe_clamped_ctx;
         fprintf(term.log_stream, "[OOM Guard: Clamped context from %u to %u to prevent out-of-memory kill]\n",
                 plan.requested_ctx, plan.safe_clamped_ctx);
+    }
+
+    if (model.cfg.is_lfm3) {
+        lfm3 = (LFM3State *)calloc(1, sizeof(LFM3State));
+        if (!lfm3 || !lfm3_state_init(lfm3, &model, state_max_seq, 0)) {
+            fprintf(stderr, "[ERROR] Failed to allocate LFM3 state arena.\n");
+            lfm3_state_free(lfm3); free(lfm3);
+            lfm2_vocab_free(&vocab); lfm2_free_model(&model);
+            return EXIT_FAILURE;
+        }
+        state_max_seq = lfm3->max_seq_len;
+    } else {
+        if (!lfm2_batch_state_init(&state, &model, state_max_seq, 0)) {
+            fprintf(stderr, "[ERROR] Failed to allocate LFM2 batch state arena.\n");
+            lfm2_vocab_free(&vocab); lfm2_free_model(&model);
+            return EXIT_FAILURE;
+        }
+        state_max_seq = state.max_seq_len;
     }
 
     /* Sequential mmap page warmup if requested */
@@ -372,6 +418,8 @@ int main(int argc, char **argv) {
     lfm2_sampler_init(&sampler, model.cfg.n_vocab, 0.30f, 0.15f, 50, 1.05f, 64, 0);
 
     LFM2ChatFormatter formatter;
+    memset(&formatter, 0, sizeof(formatter));
+    formatter.is_lfm3 = model.cfg.is_lfm3;
     lfm2_chat_formatter_init(&formatter, system_prompt, NULL);
 
     LFM2StreamFilter stream_filter;
@@ -386,9 +434,9 @@ int main(int argc, char **argv) {
     if (!single_prompt) {
         FILE *out = term.log_stream;
         fprintf(out, "================================================================\n");
-        fprintf(out, " Liquid AI LFM2 / LFM2.5 Zero-Dependency C11 Terminal Chat\n");
+        fprintf(out, " Liquid AI LFM2 / LFM2.5 / LFM3 Zero-Dependency C11 Terminal Chat\n");
         fprintf(out, " Model   : %s (%u layers, %u vocab, max_seq=%u)\n",
-                model.cfg.arch, model.cfg.n_layers, model.cfg.n_vocab, state.max_seq_len);
+                model.cfg.arch, model.cfg.n_layers, model.cfg.n_vocab, state_max_seq);
         fprintf(out, " Tokens  : BOS=%u (<|startoftext|>) | IM_START=%u | IM_END=%u\n",
                 vocab.id_bos, vocab.id_im_start, vocab.id_im_end);
         fprintf(out, " Sampler : temp=%.2f | min_p=%.2f | top_k=%u | rep_penalty=%.2f\n",
@@ -410,9 +458,14 @@ int main(int argc, char **argv) {
         uint32_t n_sys = lfm2_tokenize(&vocab, sys_text, sys_tokens, 2048);
         if (n_sys > 0) {
             uint32_t matched = 0;
-            if (lfm2_prompt_cache_try_load_prefix(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                  state.max_seq_len, state.conv_state,
-                                                  state.k_cache_f16, state.v_cache_f16, &matched)) {
+            bool loaded = lfm3
+                ? lfm2_prompt_cache_try_load_prefix_ex(prompt_cache_path, &model, sys_tokens, n_sys,
+                                                       lfm3->max_seq_len, lfm3->conv_ring, lfm3->conv_ring_head,
+                                                       lfm3->k_cache_f16, lfm3->v_cache_f16, lfm3->swa_cap, &matched)
+                : lfm2_prompt_cache_try_load_prefix(prompt_cache_path, &model, sys_tokens, n_sys,
+                                                    state.max_seq_len, state.conv_state,
+                                                    state.k_cache_f16, state.v_cache_f16, &matched);
+            if (loaded) {
                 pos = matched;
                 for (uint32_t i = 0; i < pos; ++i) {
                     lfm2_sampler_accept(&sampler, sys_tokens[i]);
@@ -424,9 +477,15 @@ int main(int argc, char **argv) {
                 for (uint32_t i = 0; i < n_sys; ++i) {
                     lfm2_sampler_accept(&sampler, sys_tokens[i]);
                 }
-                lfm2_prefill_prompt(&model, &state, sys_tokens, n_sys, &pos);
-                if (lfm2_prompt_cache_save(prompt_cache_path, &model, sys_tokens, n_sys,
-                                           state.conv_state, state.k_cache_f16, state.v_cache_f16)) {
+                chat_prefill_prompt(&model, &state, lfm3, sys_tokens, n_sys, &pos);
+                bool saved = lfm3
+                    ? lfm2_prompt_cache_save_ex(prompt_cache_path, &model, sys_tokens, n_sys,
+                                                (float * const *)lfm3->conv_ring, lfm3->conv_ring_head,
+                                                (uint16_t * const *)lfm3->k_cache_f16,
+                                                (uint16_t * const *)lfm3->v_cache_f16, lfm3->swa_cap)
+                    : lfm2_prompt_cache_save(prompt_cache_path, &model, sys_tokens, n_sys,
+                                             state.conv_state, state.k_cache_f16, state.v_cache_f16);
+                if (saved) {
                     fprintf(term.log_stream, "[Prompt Cache: Cached %u system prefix tokens to %s]\n",
                             n_sys, prompt_cache_path);
                     cache_restored = true;
@@ -444,11 +503,11 @@ int main(int argc, char **argv) {
         lfm2_format_chatml_turn(&formatter, single_prompt, (pos == 0),
                                 formatted_prompt, sizeof(formatted_prompt));
         uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, 2048);
-        if (n_prompt == 0 || pos + n_prompt >= state.max_seq_len) {
+        if (n_prompt == 0 || pos + n_prompt >= state_max_seq) {
             fprintf(stderr, "[ERROR] Prompt empty or exceeds max context length (%u >= %u)\n",
-                    pos + n_prompt, state.max_seq_len);
+                    pos + n_prompt, state_max_seq);
             lfm2_sampler_free(&sampler);
-            lfm2_batch_state_free(&state);
+            if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
             lfm2_vocab_free(&vocab);
             lfm2_free_model(&model);
             return EXIT_FAILURE;
@@ -458,14 +517,14 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < n_prompt; ++i) {
             lfm2_sampler_accept(&sampler, prompt_ids[i]);
         }
-        float *logits = lfm2_prefill_prompt(&model, &state, prompt_ids, n_prompt, &pos);
+        float *logits = chat_prefill_prompt(&model, &state, lfm3, prompt_ids, n_prompt, &pos);
         double prefill_ms = time_now_ms() - t_prefill_start;
 
         double t_decode_start = time_now_ms();
         uint32_t gen_tokens = 0;
         lfm2_stream_filter_reset(&stream_filter);
 
-        while (pos < state.max_seq_len && gen_tokens < max_turn_tokens) {
+        while (pos < state_max_seq && gen_tokens < max_turn_tokens) {
             uint32_t next_id = lfm2_sample_token(&sampler, logits);
             gen_tokens++;
 
@@ -480,7 +539,7 @@ int main(int argc, char **argv) {
                 break;
             }
 
-            logits = lfm2_forward_batch(&model, &state, &next_id, 1, pos++, true);
+            logits = chat_forward_one(&model, &state, lfm3, next_id, pos++, true);
         }
 
         lfm2_stream_filter_flush(&stream_filter);
@@ -494,7 +553,7 @@ int main(int argc, char **argv) {
                 gen_tokens, decode_ms, (gen_tokens * 1000.0) / (decode_ms + 1e-6), pos);
 
         lfm2_sampler_free(&sampler);
-        lfm2_batch_state_free(&state);
+        if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
         lfm2_vocab_free(&vocab);
         lfm2_free_model(&model);
         return EXIT_SUCCESS;
@@ -530,8 +589,12 @@ int main(int argc, char **argv) {
         /* Handle REPL slash commands */
         if (strcmp(user_input, "/exit") == 0 || strcmp(user_input, "/quit") == 0) break;
         if (strcmp(user_input, "/reset") == 0) {
-            lfm2_batch_state_free(&state);
-            lfm2_batch_state_init(&state, &model, 4096, 0);
+            if (lfm3) {
+                lfm3_state_reset(lfm3, &model);
+            } else {
+                lfm2_batch_state_free(&state);
+                lfm2_batch_state_init(&state, &model, state_max_seq, 0);
+            }
             lfm2_sampler_reset(&sampler);
             pos = 0;
             if (prompt_cache_path && cache_restored) {
@@ -541,9 +604,14 @@ int main(int argc, char **argv) {
                          system_prompt ? system_prompt : "You are a helpful assistant.");
                 uint32_t n_sys = lfm2_tokenize(&vocab, sys_text, sys_tokens, 2048);
                 uint32_t matched = 0;
-                if (lfm2_prompt_cache_try_load_prefix(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                      state.max_seq_len, state.conv_state,
-                                                      state.k_cache_f16, state.v_cache_f16, &matched)) {
+                bool ok = lfm3
+                    ? lfm2_prompt_cache_try_load_prefix_ex(prompt_cache_path, &model, sys_tokens, n_sys,
+                                                           lfm3->max_seq_len, lfm3->conv_ring, lfm3->conv_ring_head,
+                                                           lfm3->k_cache_f16, lfm3->v_cache_f16, lfm3->swa_cap, &matched)
+                    : lfm2_prompt_cache_try_load_prefix(prompt_cache_path, &model, sys_tokens, n_sys,
+                                                        state.max_seq_len, state.conv_state,
+                                                        state.k_cache_f16, state.v_cache_f16, &matched);
+                if (ok) {
                     pos = matched;
                     for (uint32_t i = 0; i < pos; ++i) lfm2_sampler_accept(&sampler, sys_tokens[i]);
                     printf("[State reset: Reloaded system prefix from cache (%u tokens).]\n", pos);
@@ -575,7 +643,7 @@ int main(int argc, char **argv) {
 
         /* 2. Tokenize Formatted Prompt */
         uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, 2048);
-        if (n_prompt == 0 || pos + n_prompt >= state.max_seq_len) {
+        if (n_prompt == 0 || pos + n_prompt >= state_max_seq) {
             fprintf(stderr, "[WARN] Context window full or empty prompt. Type /reset.\n");
             continue;
         }
@@ -585,14 +653,14 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < n_prompt; ++i) {
             lfm2_sampler_accept(&sampler, prompt_ids[i]);
         }
-        float *logits = lfm2_prefill_prompt(&model, &state, prompt_ids, n_prompt, &pos);
+        float *logits = chat_prefill_prompt(&model, &state, lfm3, prompt_ids, n_prompt, &pos);
         double prefill_ms = time_now_ms() - t_prefill_start;
 
         /* 4. Autoregressive Decode Loop until <|im_end|> or max_turn_tokens */
         if (term.use_ansi_colors) {
-            printf("\033[1;36mLFM2 >\033[0m ");
+            printf("\033[1;36m%s >\033[0m ", lfm3 ? "LFM3" : "LFM2");
         } else {
-            printf("LFM2 > ");
+            printf("%s > ", lfm3 ? "LFM3" : "LFM2");
         }
         fflush(stdout);
 
@@ -603,7 +671,7 @@ int main(int argc, char **argv) {
         lfm2_stream_filter_reset(&stream_filter);
         lfm2_sigint_begin_generation();
 
-        while (pos < state.max_seq_len && gen_tokens < max_turn_tokens) {
+        while (pos < state_max_seq && gen_tokens < max_turn_tokens) {
             /* Check if user pressed Ctrl+C during token decode */
             if (lfm2_sigint_should_abort()) {
                 cancelled = true;
@@ -614,14 +682,14 @@ int main(int argc, char **argv) {
                     fprintf(term.log_stream, "\n[Generation interrupted by Ctrl+C]\n");
                 }
                 /* Close turn in state so state remains consistent */
-                lfm2_forward_batch(&model, &state, &vocab.id_im_end, 1, pos++, false);
+                chat_forward_one(&model, &state, lfm3, vocab.id_im_end, pos++, false);
                 break;
             }
 
             uint32_t next_id = lfm2_sample_token(&sampler, logits);
             gen_tokens++;
 
-            /* Stop generation cleanly when LFM2 emits <|im_end|> or EOS */
+            /* Stop generation cleanly when LFM2/LFM3 emits <|im_end|> or EOS */
             if (next_id == vocab.id_im_end || next_id == vocab.id_bos) {
                 break;
             }
@@ -632,11 +700,11 @@ int main(int argc, char **argv) {
             lfm2_stream_status_t s_st = lfm2_stream_filter_feed(&stream_filter, tok_buf, tok_len);
             if (s_st == LFM2_STREAM_STOPPED) {
                 /* Multi-token stop string matched! Close turn in state */
-                lfm2_forward_batch(&model, &state, &vocab.id_im_end, 1, pos++, false);
+                chat_forward_one(&model, &state, lfm3, vocab.id_im_end, pos++, false);
                 break;
             }
 
-            logits = lfm2_forward_batch(&model, &state, &next_id, 1, pos++, true);
+            logits = chat_forward_one(&model, &state, lfm3, next_id, pos++, true);
         }
 
         lfm2_stream_filter_flush(&stream_filter);
@@ -661,7 +729,7 @@ int main(int argc, char **argv) {
     }
 
     lfm2_sampler_free(&sampler);
-    lfm2_batch_state_free(&state);
+    if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
     lfm2_vocab_free(&vocab);
     lfm2_free_model(&model);
     return EXIT_SUCCESS;

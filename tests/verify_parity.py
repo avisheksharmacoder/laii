@@ -290,6 +290,12 @@ def run_verification_suite(
             if info.n_vocab <= 256:
                 # Toy synthetic test fixture
                 t1_ok = len(c_tokens) > 0
+            elif info.arch == "lfm3":
+                # LFM3 128K vocab control IDs: <|startoftext|>=124894, <|im_start|>=124899, <|im_end|>=124900
+                has_bos = c_tokens[0] == 124894
+                has_im_start = 124899 in c_tokens
+                has_im_end = 124900 in c_tokens
+                t1_ok = has_bos and has_im_start and has_im_end and len(c_tokens) > 15
             else:
                 has_bos = c_tokens[0] == 1  # <|startoftext|>
                 has_im_start = 6 in c_tokens

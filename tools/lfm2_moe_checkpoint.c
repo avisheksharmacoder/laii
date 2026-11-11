@@ -378,9 +378,16 @@ typedef struct {
     bool      is_valid;
     uint32_t  saved_pos;             /* Exact GQA KV-cache position cursor     */
     uint32_t  n_layers;
-    uint32_t  conv_floats_per_layer; /* (l_cache - 1) * n_embd (typically 2*D) */
+    uint32_t  conv_floats_per_layer; /* (l_cache - 1) * n_embd (typically 2*D or 6*D) */
     uint32_t  n_conv_layers;
     float    *conv_slab;             /* Contiguous snapshot of all ShortConv states */
+    uint32_t  conv_ring_head[LFM2_MAX_LAYERS]; /* Circular ring cursors (LFM3) */
+
+    /* SWA ring-buffer snapshot (allocated ONLY when n_swa_layers > 0, NULL for LFM2) */
+    uint32_t  n_swa_layers;
+    uint32_t  swa_cap;               /* sliding_window + 8 */
+    size_t    swa_total_u16;         /* Total uint16_t elements across all SWA K+V rings */
+    uint16_t *swa_kv_slab;
 
     /* Optional Sampler / Repetition-Penalty Ring State for Exact Rollbacks */
     uint64_t  saved_rng_state;
@@ -392,16 +399,28 @@ typedef struct {
 bool lfm2_checkpoint_init(LFM2Checkpoint *cp, const LFM2Model *m, uint32_t rep_window) {
     memset(cp, 0, sizeof(*cp));
     const uint32_t hist_len = (m->cfg.shortconv_l_cache > 1) ? (m->cfg.shortconv_l_cache - 1) : 2;
+    const uint32_t head_dim = (m->cfg.head_dim > 0) ? m->cfg.head_dim
+                              : (m->cfg.n_head_q > 0 ? (m->cfg.n_embd / m->cfg.n_head_q) : 64);
+    const uint32_t swa_win  = (m->cfg.sliding_window > 0) ? m->cfg.sliding_window : 256U;
     cp->n_layers              = m->cfg.n_layers;
     cp->conv_floats_per_layer = hist_len * m->cfg.n_embd;
+    cp->swa_cap               = swa_win + 8U;
 
     uint32_t n_conv = 0;
+    uint32_t n_swa  = 0;
+    size_t   swa_elems = 0;
     for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
         if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV) {
             n_conv++;
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN) {
+            n_swa++;
+            const size_t kv_dim = (size_t)m->cfg.n_head_kv[l] * head_dim;
+            swa_elems += (size_t)cp->swa_cap * kv_dim * 2U;
         }
     }
     cp->n_conv_layers = n_conv;
+    cp->n_swa_layers  = n_swa;
+    cp->swa_total_u16 = swa_elems;
 
     if (n_conv > 0) {
         const size_t bytes = (size_t)n_conv * cp->conv_floats_per_layer * sizeof(float);
@@ -409,12 +428,25 @@ bool lfm2_checkpoint_init(LFM2Checkpoint *cp, const LFM2Model *m, uint32_t rep_w
         if (!cp->conv_slab) return false;
     }
 
+    if (swa_elems > 0) {
+        const size_t swa_bytes = swa_elems * sizeof(uint16_t);
+        cp->swa_kv_slab = (uint16_t *)aligned_alloc(64, (swa_bytes + 63) & ~63ULL);
+        if (!cp->swa_kv_slab) {
+            free(cp->conv_slab);
+            cp->conv_slab = NULL;
+            return false;
+        }
+        memset(cp->swa_kv_slab, 0, swa_bytes);
+    }
+
     cp->rep_window = rep_window;
     if (rep_window > 0) {
         cp->saved_history_ring = (uint32_t *)calloc(rep_window, sizeof(uint32_t));
         if (!cp->saved_history_ring) {
             free(cp->conv_slab);
+            free(cp->swa_kv_slab);
             cp->conv_slab = NULL;
+            cp->swa_kv_slab = NULL;
             return false;
         }
     }
@@ -424,6 +456,7 @@ bool lfm2_checkpoint_init(LFM2Checkpoint *cp, const LFM2Model *m, uint32_t rep_w
 void lfm2_checkpoint_destroy(LFM2Checkpoint *cp) {
     if (cp) {
         free(cp->conv_slab);
+        free(cp->swa_kv_slab);
         free(cp->saved_history_ring);
         memset(cp, 0, sizeof(*cp));
     }
@@ -435,6 +468,52 @@ void lfm2_checkpoint_free(LFM2Checkpoint *cp) {
 }
 #endif
 
+/* Extended snapshot supporting LFM3 circular ShortConv ring heads & SWA KV ring slabs */
+void lfm2_checkpoint_save_ex(LFM2Checkpoint * restrict cp,
+                             const LFM2Model * restrict m,
+                             float * const conv_state[LFM2_MAX_LAYERS],
+                             const uint32_t * restrict conv_ring_heads,
+                             uint16_t * const k_cache_f16[LFM2_MAX_LAYERS],
+                             uint16_t * const v_cache_f16[LFM2_MAX_LAYERS],
+                             uint32_t current_pos,
+                             uint64_t rng_state,
+                             const uint32_t * restrict history_ring,
+                             uint32_t history_count) {
+    cp->saved_pos           = current_pos;
+    cp->saved_rng_state     = rng_state;
+    cp->saved_history_count = history_count;
+
+    uint32_t conv_idx = 0;
+    const size_t layer_bytes = (size_t)cp->conv_floats_per_layer * sizeof(float);
+    const uint32_t head_dim = (m->cfg.head_dim > 0) ? m->cfg.head_dim
+                              : (m->cfg.n_head_q > 0 ? (m->cfg.n_embd / m->cfg.n_head_q) : 64);
+    size_t swa_off = 0;
+
+    for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
+        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && conv_state && conv_state[l] != NULL) {
+            memcpy(cp->conv_slab + (size_t)conv_idx * cp->conv_floats_per_layer,
+                   conv_state[l],
+                   layer_bytes);
+            cp->conv_ring_head[l] = conv_ring_heads ? conv_ring_heads[l] : 0U;
+            conv_idx++;
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN &&
+                   cp->swa_kv_slab != NULL && k_cache_f16 && v_cache_f16 &&
+                   k_cache_f16[l] && v_cache_f16[l]) {
+            const size_t kv_dim   = (size_t)m->cfg.n_head_kv[l] * head_dim;
+            const size_t ring_u16 = (size_t)cp->swa_cap * kv_dim;
+            memcpy(cp->swa_kv_slab + swa_off, k_cache_f16[l], ring_u16 * sizeof(uint16_t));
+            swa_off += ring_u16;
+            memcpy(cp->swa_kv_slab + swa_off, v_cache_f16[l], ring_u16 * sizeof(uint16_t));
+            swa_off += ring_u16;
+        }
+    }
+
+    if (cp->rep_window > 0 && history_ring != NULL && cp->saved_history_ring != NULL) {
+        memcpy(cp->saved_history_ring, history_ring, cp->rep_window * sizeof(uint32_t));
+    }
+    cp->is_valid = true;
+}
+
 /* Takes a zero-allocation snapshot of all ShortConv states + GQA `pos` cursor */
 void lfm2_checkpoint_save(LFM2Checkpoint * restrict cp,
                           const LFM2Model * restrict m,
@@ -443,26 +522,56 @@ void lfm2_checkpoint_save(LFM2Checkpoint * restrict cp,
                           uint64_t rng_state,
                           const uint32_t * restrict history_ring,
                           uint32_t history_count) {
-    cp->saved_pos           = current_pos;
-    cp->saved_rng_state     = rng_state;
-    cp->saved_history_count = history_count;
+    lfm2_checkpoint_save_ex(cp, m, conv_state, NULL, NULL, NULL,
+                            current_pos, rng_state, history_ring, history_count);
+}
+
+/* Extended restore supporting LFM3 circular ShortConv ring heads & SWA KV ring slabs */
+bool lfm2_checkpoint_restore_ex(const LFM2Checkpoint * restrict cp,
+                                const LFM2Model * restrict m,
+                                float * conv_state[LFM2_MAX_LAYERS],
+                                uint32_t * restrict out_conv_heads,
+                                uint16_t *k_cache_f16[LFM2_MAX_LAYERS],
+                                uint16_t *v_cache_f16[LFM2_MAX_LAYERS],
+                                uint32_t * restrict out_pos,
+                                uint64_t * restrict out_rng_state,
+                                uint32_t * restrict out_history_ring,
+                                uint32_t * restrict out_history_count) {
+    if (!cp || !cp->is_valid) return false;
+
+    if (out_pos)           *out_pos           = cp->saved_pos;
+    if (out_rng_state)     *out_rng_state     = cp->saved_rng_state;
+    if (out_history_count) *out_history_count = cp->saved_history_count;
 
     uint32_t conv_idx = 0;
     const size_t layer_bytes = (size_t)cp->conv_floats_per_layer * sizeof(float);
+    const uint32_t head_dim = (m->cfg.head_dim > 0) ? m->cfg.head_dim
+                              : (m->cfg.n_head_q > 0 ? (m->cfg.n_embd / m->cfg.n_head_q) : 64);
+    size_t swa_off = 0;
 
     for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
-        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && conv_state[l] != NULL) {
-            memcpy(cp->conv_slab + (size_t)conv_idx * cp->conv_floats_per_layer,
-                   conv_state[l],
+        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && conv_state && conv_state[l] != NULL) {
+            memcpy(conv_state[l],
+                   cp->conv_slab + (size_t)conv_idx * cp->conv_floats_per_layer,
                    layer_bytes);
+            if (out_conv_heads) out_conv_heads[l] = cp->conv_ring_head[l];
             conv_idx++;
+        } else if (m->layers[l].block_type == LFM2_BLOCK_SWA_ATTN &&
+                   cp->swa_kv_slab != NULL && k_cache_f16 && v_cache_f16 &&
+                   k_cache_f16[l] && v_cache_f16[l]) {
+            const size_t kv_dim   = (size_t)m->cfg.n_head_kv[l] * head_dim;
+            const size_t ring_u16 = (size_t)cp->swa_cap * kv_dim;
+            memcpy(k_cache_f16[l], cp->swa_kv_slab + swa_off, ring_u16 * sizeof(uint16_t));
+            swa_off += ring_u16;
+            memcpy(v_cache_f16[l], cp->swa_kv_slab + swa_off, ring_u16 * sizeof(uint16_t));
+            swa_off += ring_u16;
         }
     }
 
-    if (cp->rep_window > 0 && history_ring != NULL && cp->saved_history_ring != NULL) {
-        memcpy(cp->saved_history_ring, history_ring, cp->rep_window * sizeof(uint32_t));
+    if (cp->rep_window > 0 && out_history_ring != NULL && cp->saved_history_ring != NULL) {
+        memcpy(out_history_ring, cp->saved_history_ring, cp->rep_window * sizeof(uint32_t));
     }
-    cp->is_valid = true;
+    return true;
 }
 
 /* Restores all ShortConv rolling buffers and rewinds the GQA KV-cache `pos` cursor */
@@ -473,28 +582,8 @@ bool lfm2_checkpoint_restore(const LFM2Checkpoint * restrict cp,
                              uint64_t * restrict out_rng_state,
                              uint32_t * restrict out_history_ring,
                              uint32_t * restrict out_history_count) {
-    if (!cp || !cp->is_valid) return false;
-
-    if (out_pos)           *out_pos           = cp->saved_pos;
-    if (out_rng_state)     *out_rng_state     = cp->saved_rng_state;
-    if (out_history_count) *out_history_count = cp->saved_history_count;
-
-    uint32_t conv_idx = 0;
-    const size_t layer_bytes = (size_t)cp->conv_floats_per_layer * sizeof(float);
-
-    for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
-        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && conv_state[l] != NULL) {
-            memcpy(conv_state[l],
-                   cp->conv_slab + (size_t)conv_idx * cp->conv_floats_per_layer,
-                   layer_bytes);
-            conv_idx++;
-        }
-    }
-
-    if (cp->rep_window > 0 && out_history_ring != NULL && cp->saved_history_ring != NULL) {
-        memcpy(out_history_ring, cp->saved_history_ring, cp->rep_window * sizeof(uint32_t));
-    }
-    return true;
+    return lfm2_checkpoint_restore_ex(cp, m, conv_state, NULL, NULL, NULL,
+                                      out_pos, out_rng_state, out_history_ring, out_history_count);
 }
 
 /* High-level state wrapper saving directly from LFM2State */

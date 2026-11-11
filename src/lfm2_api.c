@@ -35,6 +35,7 @@
 #define LFM2_MOE_CHECKPOINT_NO_MAIN 1
 #define LFM2_SERVER_NO_MAIN 1
 #define LFM2_SPECULATIVE_PLD_NO_MAIN 1
+#define LFM3_ENGINE_NO_MAIN 1
 
 #include "../tools/lfm2_prefill_batch.c"
 #include "../tools/lfm2_bpe.c"
@@ -43,6 +44,7 @@
 #include "../tools/lfm2_moe_checkpoint.c"
 #include "../tools/lfm2_sys_cache.c"
 #include "../tools/lfm2_speculative_pld.c"
+#include "../tools/lfm3_engine.c"
 
 /* ============================================================================
  * 1. Sampler & Token Candidate Buffer (Matches LFM2 Official Spec)
@@ -219,11 +221,14 @@ typedef struct {
     char system_prompt[1024];
     char tool_json_list[2048];
     bool has_tools;
+    bool is_lfm3;
 } LFM2ChatFormatter;
 
 static void lfm2_chat_formatter_init(LFM2ChatFormatter *fmt, const char *system_prompt,
                                     const char *optional_tools_json) {
+    const bool keep_lfm3 = fmt->is_lfm3;
     memset(fmt, 0, sizeof(*fmt));
+    fmt->is_lfm3 = keep_lfm3;
     snprintf(fmt->system_prompt, sizeof(fmt->system_prompt), "%s",
              (system_prompt && system_prompt[0])
                  ? system_prompt
@@ -236,26 +241,27 @@ static void lfm2_chat_formatter_init(LFM2ChatFormatter *fmt, const char *system_
 
 static int lfm2_format_chatml_turn(const LFM2ChatFormatter *fmt, const char *user_msg,
                                    bool is_first_turn, char *out_buf, size_t out_cap) {
+    const char *think_prefix = fmt->is_lfm3 ? "<think>" : "";
     if (is_first_turn) {
         if (fmt->has_tools) {
             return snprintf(out_buf, out_cap,
                 "<|startoftext|><|im_start|>system\n%s\n"
                 "<|tool_list_start|>%s<|tool_list_end|><|im_end|>\n"
                 "<|im_start|>user\n%s<|im_end|>\n"
-                "<|im_start|>assistant\n",
-                fmt->system_prompt, fmt->tool_json_list, user_msg);
+                "<|im_start|>assistant\n%s",
+                fmt->system_prompt, fmt->tool_json_list, user_msg, think_prefix);
         } else {
             return snprintf(out_buf, out_cap,
                 "<|startoftext|><|im_start|>system\n%s<|im_end|>\n"
                 "<|im_start|>user\n%s<|im_end|>\n"
-                "<|im_start|>assistant\n",
-                fmt->system_prompt, user_msg);
+                "<|im_start|>assistant\n%s",
+                fmt->system_prompt, user_msg, think_prefix);
         }
     } else {
         return snprintf(out_buf, out_cap,
             "\n<|im_start|>user\n%s<|im_end|>\n"
-            "<|im_start|>assistant\n",
-            user_msg);
+            "<|im_start|>assistant\n%s",
+            user_msg, think_prefix);
     }
 }
 
@@ -287,6 +293,7 @@ struct lfm2_context {
     const lfm2_model_t *model;
     lfm2_context_params_t params;
     LFM2SpecState       spec_state;     /* Holds LFM2BatchState base + conv_trace[8][L] + logits_batch */
+    LFM3State          *lfm3;           /* Non-NULL ONLY for LFM3 models (isolated SWA + Conv7 + Sandwich arena) */
     LFM2RoPELUT         rope_lut;
     LFM2Sampler         sampler;
     LFM2Grammar         grammar;
@@ -391,7 +398,8 @@ LFM2_API lfm2_model_t *lfm2_model_load_from_fd(int fd, uint64_t file_size, int32
 
     /* Populate model info */
     const LFM2Config *c = &m->core.cfg;
-    snprintf(m->info.arch, sizeof(m->info.arch), "%s", (c->n_experts > 0) ? "lfm2moe" : "lfm2");
+    snprintf(m->info.arch, sizeof(m->info.arch), "%s",
+             c->is_lfm3 ? "lfm3" : ((c->n_experts > 0) ? "lfm2moe" : "lfm2"));
     const LFM2KernelTable *kt = lfm2_get_cpu_kernel_table();
     const char *isa_str = "SCALAR";
     if (kt && kt->isa_name) {
@@ -525,20 +533,33 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
         }
     }
 
-    if (!lfm2_spec_state_init(&ctx->spec_state, &model->core, ctx->params.max_seq_len, ctx->params.n_threads)) {
-        free(ctx);
-        return NULL;
+    if (model->core.cfg.is_lfm3) {
+        ctx->lfm3 = (LFM3State *)calloc(1, sizeof(LFM3State));
+        if (!ctx->lfm3 || !lfm3_state_init(ctx->lfm3, &model->core, ctx->params.max_seq_len, ctx->params.n_threads)) {
+            lfm3_state_free(ctx->lfm3);
+            free(ctx->lfm3);
+            free(ctx);
+            return NULL;
+        }
+        ctx->params.max_seq_len = ctx->lfm3->max_seq_len;
+    } else {
+        if (!lfm2_spec_state_init(&ctx->spec_state, &model->core, ctx->params.max_seq_len, ctx->params.n_threads)) {
+            free(ctx);
+            return NULL;
+        }
     }
 
     if (!lfm2_ngram_index_init(&ctx->ngram_idx, ctx->params.max_seq_len, 6, model->vocab.id_im_end)) {
-        lfm2_spec_state_free(&ctx->spec_state);
+        if (ctx->lfm3) { lfm3_state_free(ctx->lfm3); free(ctx->lfm3); }
+        else { lfm2_spec_state_free(&ctx->spec_state); }
         free(ctx);
         return NULL;
     }
 
     if (!lfm2_sampler_init(&ctx->sampler, model->core.cfg.n_vocab, 0.30f, 0.15f, 50, 1.05f, 64, 0)) {
         lfm2_ngram_index_free(&ctx->ngram_idx);
-        lfm2_spec_state_free(&ctx->spec_state);
+        if (ctx->lfm3) { lfm3_state_free(ctx->lfm3); free(ctx->lfm3); }
+        else { lfm2_spec_state_free(&ctx->spec_state); }
         free(ctx);
         return NULL;
     }
@@ -547,8 +568,11 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
     lfm2_think_controller_init(&ctx->think_ctrl, 0, NULL, 0);
     lfm2_stream_filter_init(&ctx->stream_filter, NULL, NULL);
 
-    const float freq_base = (model->core.cfg.rope_freq_base > 0.0f) ? model->core.cfg.rope_freq_base : 10000.0f;
-    lfm2_rope_lut_init(&ctx->rope_lut, ctx->params.max_seq_len, 64, freq_base);
+    if (!ctx->lfm3) {
+        const float freq_base = (model->core.cfg.rope_freq_base > 0.0f) ? model->core.cfg.rope_freq_base : 10000.0f;
+        lfm2_rope_lut_init(&ctx->rope_lut, ctx->params.max_seq_len, 64, freq_base);
+    }
+    ctx->chat_fmt.is_lfm3 = model->core.cfg.is_lfm3;
     lfm2_chat_formatter_init(&ctx->chat_fmt, NULL, NULL);
 
     ctx->n_sink_tokens = ctx->params.n_sink_tokens ? ctx->params.n_sink_tokens : 64;
@@ -558,7 +582,8 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
         lfm2_rope_lut_free(&ctx->rope_lut);
         lfm2_sampler_free(&ctx->sampler);
         lfm2_ngram_index_free(&ctx->ngram_idx);
-        lfm2_spec_state_free(&ctx->spec_state);
+        if (ctx->lfm3) { lfm3_state_free(ctx->lfm3); free(ctx->lfm3); }
+        else { lfm2_spec_state_free(&ctx->spec_state); }
         free(ctx);
         return NULL;
     }
@@ -578,7 +603,13 @@ LFM2_API void lfm2_context_free(lfm2_context_t *ctx) {
     lfm2_rope_lut_free(&ctx->rope_lut);
     lfm2_sampler_free(&ctx->sampler);
     lfm2_ngram_index_free(&ctx->ngram_idx);
-    lfm2_spec_state_free(&ctx->spec_state);
+    if (ctx->lfm3) {
+        lfm3_state_free(ctx->lfm3);
+        free(ctx->lfm3);
+        ctx->lfm3 = NULL;
+    } else {
+        lfm2_spec_state_free(&ctx->spec_state);
+    }
     free(ctx);
 }
 
@@ -597,10 +628,14 @@ LFM2_API void lfm2_context_reset(lfm2_context_t *ctx) {
     lfm2_think_controller_init(&ctx->think_ctrl, 0, NULL, 0);
 
     const LFM2Model *m = &ctx->model->core;
-    const uint32_t hist_len = (m->cfg.shortconv_l_cache > 1) ? (m->cfg.shortconv_l_cache - 1) : 2;
-    for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
-        if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && ctx->spec_state.base.conv_state[l]) {
-            memset(ctx->spec_state.base.conv_state[l], 0, hist_len * m->cfg.n_embd * sizeof(float));
+    if (ctx->lfm3) {
+        lfm3_state_reset(ctx->lfm3, m);
+    } else {
+        const uint32_t hist_len = (m->cfg.shortconv_l_cache > 1) ? (m->cfg.shortconv_l_cache - 1) : 2;
+        for (uint32_t l = 0; l < m->cfg.n_layers; ++l) {
+            if (m->layers[l].block_type == LFM2_BLOCK_SHORTCONV && ctx->spec_state.base.conv_state[l]) {
+                memset(ctx->spec_state.base.conv_state[l], 0, hist_len * m->cfg.n_embd * sizeof(float));
+            }
         }
     }
     memset(&ctx->stats, 0, sizeof(ctx->stats));
@@ -644,12 +679,16 @@ LFM2_API int32_t lfm2_tokenize_text(const lfm2_model_t *model,
     return (int32_t)lfm2_tokenize(&model->vocab, text, out_ids, max_ids);
 }
 
+static inline uint32_t api_ctx_max_seq_len(const lfm2_context_t *ctx) {
+    return ctx->lfm3 ? ctx->lfm3->max_seq_len : ctx->spec_state.base.max_seq_len;
+}
+
 LFM2_API lfm2_status_t lfm2_prefill_tokens(lfm2_context_t *ctx,
                                            const uint32_t *tokens,
                                            uint32_t n_tokens,
                                            bool compute_last_logits) {
     if (!ctx || !tokens || n_tokens == 0) return LFM2_ERR_INVALID_ARG;
-    if (ctx->pos + n_tokens > ctx->spec_state.base.max_seq_len) return LFM2_ERR_CTX_FULL;
+    if (ctx->pos + n_tokens > api_ctx_max_seq_len(ctx)) return LFM2_ERR_CTX_FULL;
 
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -661,7 +700,11 @@ LFM2_API lfm2_status_t lfm2_prefill_tokens(lfm2_context_t *ctx,
         if (chunk > LFM2_MAX_BATCH) chunk = LFM2_MAX_BATCH;
         bool is_last = (i + chunk == n_tokens) && compute_last_logits;
 
-        lfm2_forward_batch(m, &ctx->spec_state.base, tokens + i, chunk, ctx->pos, is_last);
+        if (ctx->lfm3) {
+            lfm3_forward_batch(m, ctx->lfm3, tokens + i, chunk, ctx->pos, is_last);
+        } else {
+            lfm2_forward_batch(m, &ctx->spec_state.base, tokens + i, chunk, ctx->pos, is_last);
+        }
 
         for (uint32_t t = 0; t < chunk; ++t) {
             lfm2_sampler_accept(&ctx->sampler, tokens[i + t]);
@@ -686,7 +729,8 @@ LFM2_API lfm2_status_t lfm2_prefill_tokens(lfm2_context_t *ctx,
 }
 
 LFM2_API const float *lfm2_context_get_logits_ptr(const lfm2_context_t *ctx) {
-    return ctx ? ctx->spec_state.base.logits : NULL;
+    if (!ctx) return NULL;
+    return ctx->lfm3 ? ctx->lfm3->logits : ctx->spec_state.base.logits;
 }
 
 /* ============================================================================
@@ -756,6 +800,9 @@ LFM2_API lfm2_status_t lfm2_begin_chat_turn(lfm2_context_t *ctx,
     lfm2_think_controller_init(&ctx->think_ctrl, sp->max_think_tokens,
                                (ctx->model->n_close_think_ids > 0) ? ctx->model->close_think_ids : NULL,
                                ctx->model->n_close_think_ids);
+    if (ctx->chat_fmt.is_lfm3) {
+        ctx->think_ctrl.phase = LFM2_THINK_ACTIVE;
+    }
 
     /* Format ChatML turn & tokenize into `turn_ids[]` */
     uint32_t turn_ids[8192];
@@ -793,11 +840,13 @@ LFM2_API lfm2_status_t lfm2_context_next_utf8(lfm2_context_t *ctx,
     while (chunk.written == 0) {
         /* 1. If the 8-token speculative FIFO is empty, run one B <= 8 speculative batch */
         if (ctx->fifo_head >= ctx->fifo_tail) {
+            float *cur_logits = ctx->lfm3 ? ctx->lfm3->logits : ctx->spec_state.base.logits;
+            const uint32_t max_seq = api_ctx_max_seq_len(ctx);
             if (!ctx->has_pending) {
-                if (ctx->pos > 0 && ctx->spec_state.base.logits) {
-                    lfm2_think_apply_budget_mask(&ctx->think_ctrl, ctx->spec_state.base.logits, ctx->model->core.cfg.n_vocab);
-                    lfm2_grammar_mask_logits(&ctx->grammar, &ctx->model->decoded_vocab, ctx->spec_state.base.logits);
-                    const uint32_t sampled_first = lfm2_sample_token(&ctx->sampler, ctx->spec_state.base.logits);
+                if (ctx->pos > 0 && cur_logits) {
+                    lfm2_think_apply_budget_mask(&ctx->think_ctrl, cur_logits, ctx->model->core.cfg.n_vocab);
+                    lfm2_grammar_mask_logits(&ctx->grammar, &ctx->model->decoded_vocab, cur_logits);
+                    const uint32_t sampled_first = lfm2_sample_token(&ctx->sampler, cur_logits);
                     lfm2_think_commit_token(&ctx->think_ctrl, &ctx->model->decoded_vocab, sampled_first);
                     lfm2_grammar_commit_token(&ctx->grammar, &ctx->model->decoded_vocab, sampled_first);
 
@@ -818,19 +867,27 @@ LFM2_API lfm2_status_t lfm2_context_next_utf8(lfm2_context_t *ctx,
                 }
             } else {
                 /* Auto-shift GQA KV-cache with Attention Sinks if within 8 tokens of max_seq_len */
-                if (ctx->pos + LFM2_MAX_BATCH >= ctx->spec_state.base.max_seq_len) {
-                    const uint32_t head_dim = ctx->model->core.cfg.n_head_q
-                                              ? (ctx->model->core.cfg.n_embd / ctx->model->core.cfg.n_head_q)
-                                              : 64;
-                    if (head_dim == 64) {
-                        lfm2_kv_cache_shift_sinks(
-                            ctx->spec_state.base.k_cache_f16,
-                            ctx->spec_state.base.v_cache_f16,
-                            &ctx->model->core, &ctx->rope_lut, &ctx->pos,
-                            ctx->n_sink_tokens, ctx->spec_state.base.max_seq_len / 2);
+                if (ctx->pos + LFM2_MAX_BATCH >= max_seq) {
+                    if (ctx->lfm3) {
+                        lfm3_kv_cache_shift_sinks(
+                            ctx->lfm3->k_cache_f16, ctx->lfm3->v_cache_f16,
+                            &ctx->model->core, &ctx->lfm3->rope_lut_full,
+                            &ctx->lfm3->rope_lut_swa, ctx->lfm3->swa_cap,
+                            &ctx->pos, ctx->n_sink_tokens, max_seq / 2U);
+                    } else {
+                        const uint32_t head_dim = ctx->model->core.cfg.n_head_q
+                                                  ? (ctx->model->core.cfg.n_embd / ctx->model->core.cfg.n_head_q)
+                                                  : 64;
+                        if (head_dim == 64) {
+                            lfm2_kv_cache_shift_sinks(
+                                ctx->spec_state.base.k_cache_f16,
+                                ctx->spec_state.base.v_cache_f16,
+                                &ctx->model->core, &ctx->rope_lut, &ctx->pos,
+                                ctx->n_sink_tokens, max_seq / 2);
+                        }
                     }
                 }
-                if (ctx->pos + LFM2_MAX_BATCH >= ctx->spec_state.base.max_seq_len) {
+                if (ctx->pos + LFM2_MAX_BATCH >= max_seq) {
                     lfm2_stream_filter_flush(&ctx->stream_filter);
                     *out_bytes_written = chunk.written;
                     ctx->stream_filter.user_data = NULL;
@@ -846,15 +903,25 @@ LFM2_API lfm2_status_t lfm2_context_next_utf8(lfm2_context_t *ctx,
                     ctx->ngram_idx.cur_draft_k = 0;
                 }
 
-                const uint32_t n_emitted = lfm2_speculative_decode_step(
-                    &ctx->model->core,
-                    &ctx->spec_state,
-                    &ctx->ngram_idx,
-                    &ctx->pending_token,
-                    &ctx->pos,
-                    api_spec_verify_sample_cb,
-                    ctx,
-                    emitted_ids);
+                const uint32_t n_emitted = ctx->lfm3
+                    ? lfm3_speculative_decode_step(
+                        &ctx->model->core,
+                        ctx->lfm3,
+                        &ctx->ngram_idx,
+                        &ctx->pending_token,
+                        &ctx->pos,
+                        api_spec_verify_sample_cb,
+                        ctx,
+                        emitted_ids)
+                    : lfm2_speculative_decode_step(
+                        &ctx->model->core,
+                        &ctx->spec_state,
+                        &ctx->ngram_idx,
+                        &ctx->pending_token,
+                        &ctx->pos,
+                        api_spec_verify_sample_cb,
+                        ctx,
+                        emitted_ids);
 
                 if (ctx->think_ctrl.phase == LFM2_THINK_FORCING_CLOSE) {
                     ctx->ngram_idx.cur_draft_k = saved_k;
@@ -910,9 +977,11 @@ LFM2_API lfm2_status_t lfm2_context_next_utf8(lfm2_context_t *ctx,
              * state to `item.batch_slot` and rewind `ctx->pos` to match! */
             const uint32_t unpopped = ctx->fifo_tail - ctx->fifo_head;
             if (unpopped > 0) {
-                lfm2_restore_shortconv_trace_slot(&ctx->spec_state,
-                                                  &ctx->model->core,
-                                                  item.batch_slot);
+                if (ctx->lfm3) {
+                    lfm3_restore_shortconv_trace_slot(ctx->lfm3, &ctx->model->core, item.batch_slot);
+                } else {
+                    lfm2_restore_shortconv_trace_slot(&ctx->spec_state, &ctx->model->core, item.batch_slot);
+                }
                 ctx->pos -= unpopped;
             }
             ctx->fifo_head   = ctx->fifo_tail;
@@ -920,8 +989,12 @@ LFM2_API lfm2_status_t lfm2_context_next_utf8(lfm2_context_t *ctx,
 
             /* Append <|im_end|> to close the assistant turn cleanly in state */
             const uint32_t im_end = ctx->model->vocab.id_im_end;
-            lfm2_forward_batch(&ctx->model->core, &ctx->spec_state.base,
-                               &im_end, 1, ctx->pos++, false);
+            if (ctx->lfm3) {
+                lfm3_forward_batch(&ctx->model->core, ctx->lfm3, &im_end, 1, ctx->pos++, false);
+            } else {
+                lfm2_forward_batch(&ctx->model->core, &ctx->spec_state.base,
+                                   &im_end, 1, ctx->pos++, false);
+            }
             *out_bytes_written = chunk.written;
             ctx->stream_filter.user_data = NULL;
             return LFM2_DONE;
@@ -953,18 +1026,22 @@ LFM2_API lfm2_status_t lfm2_embed_text(lfm2_context_t *ctx,
         n_tok = 1;
     }
 
+    float *x_buf  = ctx->lfm3 ? ctx->lfm3->x  : ctx->spec_state.base.x;
+    float *xb_buf = ctx->lfm3 ? ctx->lfm3->xb : ctx->spec_state.base.xb;
+
     if (pooling_type == LFM2_POOL_MEAN) {
         memset(out_embd, 0, D * sizeof(float));
         uint32_t i = 0;
         while (i < (uint32_t)n_tok) {
             uint32_t B = ((uint32_t)n_tok - i > LFM2_MAX_BATCH) ? LFM2_MAX_BATCH : ((uint32_t)n_tok - i);
-            lfm2_forward_batch(m, &ctx->spec_state.base, token_ids + i, B, ctx->pos, false);
+            if (ctx->lfm3) lfm3_forward_batch(m, ctx->lfm3, token_ids + i, B, ctx->pos, false);
+            else lfm2_forward_batch(m, &ctx->spec_state.base, token_ids + i, B, ctx->pos, false);
             ctx->pos += B;
 
             /* Normalize each token state in the batch and accumulate into out_embd */
-            lfm2_rmsnorm_batch(ctx->spec_state.base.xb, ctx->spec_state.base.x, m->output_norm, B, D, m->cfg.rms_norm_eps);
+            lfm2_rmsnorm_batch(xb_buf, x_buf, m->output_norm, B, D, m->cfg.rms_norm_eps);
             for (uint32_t b = 0; b < B; ++b) {
-                const float *vec = ctx->spec_state.base.xb + (size_t)b * D;
+                const float *vec = xb_buf + (size_t)b * D;
                 for (uint32_t d = 0; d < D; ++d) out_embd[d] += vec[d];
             }
             i += B;
@@ -975,11 +1052,12 @@ LFM2_API lfm2_status_t lfm2_embed_text(lfm2_context_t *ctx,
         uint32_t last_B = 1;
         while (i < (uint32_t)n_tok) {
             last_B = ((uint32_t)n_tok - i > LFM2_MAX_BATCH) ? LFM2_MAX_BATCH : ((uint32_t)n_tok - i);
-            lfm2_forward_batch(m, &ctx->spec_state.base, token_ids + i, last_B, ctx->pos, false);
+            if (ctx->lfm3) lfm3_forward_batch(m, ctx->lfm3, token_ids + i, last_B, ctx->pos, false);
+            else lfm2_forward_batch(m, &ctx->spec_state.base, token_ids + i, last_B, ctx->pos, false);
             ctx->pos += last_B;
             i += last_B;
         }
-        const float *last_x = ctx->spec_state.base.x + (size_t)(last_B - 1) * D;
+        const float *last_x = x_buf + (size_t)(last_B - 1) * D;
         lfm2_rmsnorm(out_embd, last_x, m->output_norm, D, m->cfg.rms_norm_eps);
     }
 
@@ -1022,7 +1100,7 @@ LFM2_API lfm2_status_t lfm2_forward_embeddings(lfm2_context_t *ctx,
                                                uint32_t n_tokens,
                                                bool compute_last_logits) {
     if (!ctx || !embd_batch || n_tokens == 0) return LFM2_ERR_INVALID_ARG;
-    if (ctx->pos + n_tokens > ctx->spec_state.base.max_seq_len) return LFM2_ERR_CTX_FULL;
+    if (ctx->pos + n_tokens > api_ctx_max_seq_len(ctx)) return LFM2_ERR_CTX_FULL;
 
     const uint32_t D = ctx->model->core.cfg.n_embd;
     uint32_t i = 0;
@@ -1030,9 +1108,15 @@ LFM2_API lfm2_status_t lfm2_forward_embeddings(lfm2_context_t *ctx,
         uint32_t chunk = n_tokens - i;
         if (chunk > LFM2_MAX_BATCH) chunk = LFM2_MAX_BATCH;
         bool is_last = (i + chunk == n_tokens) && compute_last_logits;
-        lfm2_forward_embd_chunk(&ctx->model->core, &ctx->spec_state.base,
-                                embd_batch + (size_t)i * D,
-                                chunk, ctx->pos, is_last);
+        if (ctx->lfm3) {
+            lfm3_forward_embd_batch(&ctx->model->core, ctx->lfm3,
+                                    embd_batch + (size_t)i * D,
+                                    chunk, ctx->pos, is_last);
+        } else {
+            lfm2_forward_embd_chunk(&ctx->model->core, &ctx->spec_state.base,
+                                    embd_batch + (size_t)i * D,
+                                    chunk, ctx->pos, is_last);
+        }
         ctx->pos += chunk;
         i += chunk;
     }
@@ -1063,24 +1147,47 @@ LFM2_API void lfm2_checkpoint_free(lfm2_checkpoint_t *ckpt) {
 LFM2_API lfm2_status_t lfm2_context_save_checkpoint(const lfm2_context_t *ctx,
                                                     lfm2_checkpoint_t *ckpt) {
     if (!ctx || !ckpt) return LFM2_ERR_INVALID_ARG;
-    lfm2_checkpoint_save(&ckpt->ckpt, &ctx->model->core,
-                         (float * const *)ctx->spec_state.base.conv_state,
-                         ctx->pos,
-                         ctx->sampler.rng_state,
-                         ctx->sampler.history_ring,
-                         ctx->sampler.history_count);
+    if (ctx->lfm3) {
+        lfm2_checkpoint_save_ex(&ckpt->ckpt, &ctx->model->core,
+                                (float * const *)ctx->lfm3->conv_ring,
+                                ctx->lfm3->conv_ring_head,
+                                (uint16_t * const *)ctx->lfm3->k_cache_f16,
+                                (uint16_t * const *)ctx->lfm3->v_cache_f16,
+                                ctx->pos,
+                                ctx->sampler.rng_state,
+                                ctx->sampler.history_ring,
+                                ctx->sampler.history_count);
+    } else {
+        lfm2_checkpoint_save(&ckpt->ckpt, &ctx->model->core,
+                             (float * const *)ctx->spec_state.base.conv_state,
+                             ctx->pos,
+                             ctx->sampler.rng_state,
+                             ctx->sampler.history_ring,
+                             ctx->sampler.history_count);
+    }
     return LFM2_OK;
 }
 
 LFM2_API lfm2_status_t lfm2_context_restore_checkpoint(lfm2_context_t *ctx,
                                                        const lfm2_checkpoint_t *ckpt) {
     if (!ctx || !ckpt) return LFM2_ERR_INVALID_ARG;
-    if (!lfm2_checkpoint_restore(&ckpt->ckpt, &ctx->model->core,
-                                 ctx->spec_state.base.conv_state,
-                                 &ctx->pos,
-                                 &ctx->sampler.rng_state,
-                                 ctx->sampler.history_ring,
-                                 &ctx->sampler.history_count)) {
+    bool ok = ctx->lfm3
+        ? lfm2_checkpoint_restore_ex(&ckpt->ckpt, &ctx->model->core,
+                                     ctx->lfm3->conv_ring,
+                                     ctx->lfm3->conv_ring_head,
+                                     ctx->lfm3->k_cache_f16,
+                                     ctx->lfm3->v_cache_f16,
+                                     &ctx->pos,
+                                     &ctx->sampler.rng_state,
+                                     ctx->sampler.history_ring,
+                                     &ctx->sampler.history_count)
+        : lfm2_checkpoint_restore(&ckpt->ckpt, &ctx->model->core,
+                                  ctx->spec_state.base.conv_state,
+                                  &ctx->pos,
+                                  &ctx->sampler.rng_state,
+                                  ctx->sampler.history_ring,
+                                  &ctx->sampler.history_count);
+    if (!ok) {
         return LFM2_ERR_CHECKPOINT;
     }
     ctx->n_history = ctx->pos;
@@ -1096,13 +1203,23 @@ LFM2_API lfm2_status_t lfm2_context_save_prompt_cache(const lfm2_context_t *ctx,
     if (!ctx || !cache_filepath) return LFM2_ERR_INVALID_ARG;
     if (ctx->pos == 0) return LFM2_ERR_INVALID_ARG;
 
-    bool ok = lfm2_prompt_cache_save(cache_filepath,
-                                     &ctx->model->core,
-                                     ctx->history_tokens,
-                                     ctx->pos,
-                                     (float * const *)ctx->spec_state.base.conv_state,
-                                     ctx->spec_state.base.k_cache_f16,
-                                     ctx->spec_state.base.v_cache_f16);
+    bool ok = ctx->lfm3
+        ? lfm2_prompt_cache_save_ex(cache_filepath,
+                                    &ctx->model->core,
+                                    ctx->history_tokens,
+                                    ctx->pos,
+                                    (float * const *)ctx->lfm3->conv_ring,
+                                    ctx->lfm3->conv_ring_head,
+                                    (uint16_t * const *)ctx->lfm3->k_cache_f16,
+                                    (uint16_t * const *)ctx->lfm3->v_cache_f16,
+                                    ctx->lfm3->swa_cap)
+        : lfm2_prompt_cache_save(cache_filepath,
+                                 &ctx->model->core,
+                                 ctx->history_tokens,
+                                 ctx->pos,
+                                 (float * const *)ctx->spec_state.base.conv_state,
+                                 ctx->spec_state.base.k_cache_f16,
+                                 ctx->spec_state.base.v_cache_f16);
     return ok ? LFM2_OK : LFM2_ERR_IO;
 }
 
@@ -1114,15 +1231,27 @@ LFM2_API lfm2_status_t lfm2_context_load_prompt_cache(lfm2_context_t *ctx,
     if (!ctx || !cache_filepath || !prompt_tokens) return LFM2_ERR_INVALID_ARG;
 
     uint32_t matched = 0;
-    bool ok = lfm2_prompt_cache_try_load_prefix(cache_filepath,
-                                                &ctx->model->core,
-                                                prompt_tokens,
-                                                n_prompt,
-                                                ctx->spec_state.base.max_seq_len,
-                                                ctx->spec_state.base.conv_state,
-                                                ctx->spec_state.base.k_cache_f16,
-                                                ctx->spec_state.base.v_cache_f16,
-                                                &matched);
+    bool ok = ctx->lfm3
+        ? lfm2_prompt_cache_try_load_prefix_ex(cache_filepath,
+                                               &ctx->model->core,
+                                               prompt_tokens,
+                                               n_prompt,
+                                               ctx->lfm3->max_seq_len,
+                                               ctx->lfm3->conv_ring,
+                                               ctx->lfm3->conv_ring_head,
+                                               ctx->lfm3->k_cache_f16,
+                                               ctx->lfm3->v_cache_f16,
+                                               ctx->lfm3->swa_cap,
+                                               &matched)
+        : lfm2_prompt_cache_try_load_prefix(cache_filepath,
+                                            &ctx->model->core,
+                                            prompt_tokens,
+                                            n_prompt,
+                                            ctx->spec_state.base.max_seq_len,
+                                            ctx->spec_state.base.conv_state,
+                                            ctx->spec_state.base.k_cache_f16,
+                                            ctx->spec_state.base.v_cache_f16,
+                                            &matched);
     if (!ok) {
         if (out_matched_len) *out_matched_len = 0;
         return LFM2_ERR_IO;
