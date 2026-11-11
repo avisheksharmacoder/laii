@@ -114,7 +114,6 @@ laii/
 │   ├── lfm2_server.c        # Non-blocking Linux epoll OpenAI HTTP/SSE server
 │   ├── generate_reference_tensors.py # PyTorch golden tensor generator
 │   └── create_toy_gguf.py   # Synthetic LFM2 GGUF model builder
-├── lfm2_server.c            # Root forwarding stub for tools/lfm2_server.c
 └── Makefile                 # Master build system
 ```
 

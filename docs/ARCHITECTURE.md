@@ -31,7 +31,7 @@
   * [§20 Disk-Backed Hybrid Prompt Cache (`--prompt-cache`, `.lfmcache` v1)](#20-disk-backed-hybrid-prompt-cache---prompt-cache-lfmcache-v1)
 * **Part V — C11 Public ABI, Python SDK & Linux `epoll` HTTP/SSE Server**
   * [§21 Public C11 ABI & High-Performance Language Bindings](#21-public-c11-abi--high-performance-language-bindings-includelfm2h-srclfm2_apic-pythonlfm2py)
-  * [§22 Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server](#22-non-blocking-linux-epoll-openai-httpsse-server-toolslfm2_serverc-lfm2_serverc)
+  * [§22 Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server](#22-non-blocking-linux-epoll-openai-httpsse-server-toolslfm2_serverc)
 * **Part VI — Mobile Android Integration & Speculative Decoding**
   * [§23 Mobile Edge & Android Scoped Storage Integration](#23-mobile-edge--android-scoped-storage-integration-lfm2_loaderc-srclfm2_apic-pythonlfm2py)
   * [§24 Unified Cross-Platform Asymmetric `big.LITTLE` Thread Pool](#24-unified-cross-platform-asymmetric-biglittle-thread-pool-toolslfm2_threadpoolc)
@@ -654,7 +654,7 @@ Vectorized using AVX2 FMA for instant semantic similarity indexing.
 
 ---
 
-## 22. Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server (`tools/lfm2_server.c`, `lfm2_server.c`)
+## 22. Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server (`tools/lfm2_server.c`)
 
 To serve high-concurrency local inference without the multi-threading overhead or memory footprint of multi-worker Python web frameworks (such as FastAPI/Uvicorn), the engine incorporates a zero-dependency C11 server utilizing Linux edge-triggered I/O event multiplexing (`sys/epoll.h`).
 

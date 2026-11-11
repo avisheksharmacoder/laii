@@ -128,7 +128,7 @@ This document outlines the five-phase engineering trajectory for building the sp
     - Zero-overhead hybrid context branching context manager (`ctx.branch()`) restoring ShortConv recurrent states and GQA `pos` in $< 15\ \mu\text{s}$ for tree search and speculative decoding.
     - High-throughput L2-normalized text embedding generation (`lfm2_embed_text`) supporting both causal `LAST_TOKEN` and sequence `MEAN` pooling.
     - Zero-copy raw logit vector distribution accessor (`lfm2_context_get_logits_ptr` / `ctx.get_logits()`) and 5-tier numerical parity & golden oracle verification suite (`tests/verify_parity.py` / `make test-parity`).
-  - [x] **Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server (`tools/lfm2_server.c`, `lfm2_server.c`, `bin/lfm2_server`, `bin/lfm2-server-static`):**
+  - [x] **Non-Blocking Linux `epoll` OpenAI HTTP/SSE Server (`tools/lfm2_server.c`, `bin/lfm2_server`, `bin/lfm2-server-static`):**
     - Zero-stall cooperative event loop (`epoll_wait` + single-token stepping with `lfm2_context_next_utf8()` and timeout = 0 during active SSE generation).
     - Instant client-disconnect cancellation (`EPOLLRDHUP | EPOLLHUP | EPOLLERR`) aborting generation on the very next token boundary to free CPU cores.
     - Pre-allocated 32-connection pool with 64 KB request and 128 KB response buffers and anti-Slowloris monotonic deadlines (zero dynamic allocations).
