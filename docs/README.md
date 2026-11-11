@@ -1,6 +1,6 @@
 # LFM2.c Documentation Hub
 
-Welcome to the documentation for **LFM2.c (`laii`)** — a zero-dependency C11 inference engine for Liquid AI's hybrid **LFM2** and **LFM2.5** model family (`x86_64` AVX2/AVX-VNNI and `aarch64` NEON/DotProd/FP16).
+Welcome to the documentation for **LFM2.c (`laii`)** — a zero-dependency C11 inference engine for Liquid AI's hybrid **LFM2**, **LFM2.5**, and **LFM3** model families (`x86_64` AVX2/AVX-VNNI and `aarch64` NEON/DotProd/FP16).
 
 ---
 
@@ -37,7 +37,7 @@ Welcome to the documentation for **LFM2.c (`laii`)** — a zero-dependency C11 i
 ## Codebase Entry Points at a Glance
 
 - **Public C11 ABI & JNI Bridge:** [`include/lfm2.h`](../include/lfm2.h), [`src/lfm2_api.c`](../src/lfm2_api.c), [`src/lfm2_jni.c`](../src/lfm2_jni.c)
-- **Core Kernels, CLI & HTTP/SSE Server:** [`tools/`](../tools) (`lfm2_loader.c`, `lfm2_bpe.c`, `lfm2_forward.c`, `lfm2_decode_1x4.c`, `lfm2_prefill_batch.c`, `lfm2_kernels_fast.c`, `lfm2_cpuid_quants.c`, `lfm2_simd_arm64.c`, `lfm2_runtime_features.c`, `lfm2_moe_checkpoint.c`, `lfm2_speculative_pld.c`, `lfm2_sys_cache.c`, `lfm2_threadpool.c`, `lfm2_cli_stream.c`, `lfm2_chat.c`, `lfm2_server.c`)
+- **Core Kernels, CLI & HTTP/SSE Server:** [`tools/`](../tools) (`lfm2_loader.c`, `lfm2_bpe.c`, `lfm2_forward.c`, `lfm2_decode_1x4.c`, `lfm2_prefill_batch.c`, `lfm2_kernels_fast.c`, `lfm2_cpuid_quants.c`, `lfm2_simd_arm64.c`, `lfm3_engine.c`, `lfm2_runtime_features.c`, `lfm2_moe_checkpoint.c`, `lfm2_speculative_pld.c`, `lfm2_sys_cache.c`, `lfm2_threadpool.c`, `lfm2_cli_stream.c`, `lfm2_chat.c`, `lfm2_server.c`)
 - **Python SDK & Android Kotlin/Java SDK:** [`python/lfm2.py`](../python/lfm2.py), [`android/`](../android)
 - **Automated Verification:** [`tests/`](../tests) and [`Makefile`](../Makefile)
 

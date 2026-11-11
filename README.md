@@ -1,4 +1,4 @@
-# LFM2.c — Zero-Dependency C11 Inference Engine for Liquid AI LFM2 & LFM2.5
+# LFM2.c — Zero-Dependency C11 Inference Engine for Liquid AI LFM2, LFM2.5 & LFM3
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![Standard](https://img.shields.io/badge/C-C11%20%2F%20POSIX-success.svg)
@@ -6,9 +6,9 @@
 ![Architectures](https://img.shields.io/badge/ISA-x86__64%20AVX2%2FVNNI%20%7C%20ARM64%20NEON%2FDotProd-orange.svg)
 ![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20Android%20(Kivy)-informational.svg)
 
-**LFM2.c** is a from-scratch, zero-dependency C11 inference engine engineered specifically for Liquid AI’s hybrid **LFM2** and **LFM2.5** model family (`350M`, `700M`, `1.2B`, `1.2B-Thinking`, `2.6B`, and Sparse Mixture-of-Experts `8B-A1B` / `24B-A2B`).
+**LFM2.c (`laii`)** is a from-scratch, zero-dependency C11 inference engine engineered specifically for Liquid AI’s hybrid **LFM2**, **LFM2.5** (`230M`, `350M`, `700M`, `1.2B`, `1.2B-Thinking`, `2.6B`, and Sparse Mixture-of-Experts `8B-A1B` / `24B-A2B`), and **LFM3** (`1.7B` tri-hybrid) model families.
 
-Unlike general-purpose Transformer runtimes that treat hybrid models as generic computation graphs, **LFM2.c** exploits the exact structural split of the LFM2 architecture—**63% Gated ShortConv (`LIV`) blocks + 37% Grouped-Query Attention (`GQA`) blocks + Sigmoid Top-$K$ Sparse MoE**—to run at the physical DRAM memory-bandwidth roofline on desktop Linux CPUs (`x86_64`) and Android mobile SoCs (`aarch64`).
+Unlike general-purpose Transformer runtimes that treat hybrid models as generic computation graphs, **LFM2.c** exploits the exact structural split of both architectures—**LFM2/LFM2.5 dual-hybrid** (`Gated ShortConv3` + `Full GQA` + `Sigmoid Top-K MoE`) and an isolated **LFM3 tri-hybrid path** (`7-tap Circular-Ring ShortConv` + `Sliding-Window Attention w=256` + `Full Partial-RoPE GQA-128` + `attn_gate` + `Sandwich Norms`)—to run near the physical DRAM memory-bandwidth roofline on desktop Linux CPUs (`x86_64`) and Android mobile SoCs (`aarch64`).
 
 ---
 
@@ -19,6 +19,7 @@ Unlike general-purpose Transformer runtimes that treat hybrid models as generic 
   * **Planar 3-Tap ShortConv Kernel:** Transposes `[3, D]` depthwise weights at load time into 64-byte-aligned planar arrays (`w0, w1, w2`), fusing `Gate 1 -> 3-Tap FMA Conv1D -> Rolling 2-Token State Shift -> Gate 2 -> L1-Hot Q8_K Quantization` in a single SIMD pass.
   * **Single-Pass Online Softmax (`FlashAttention-CPU`) over `FP16` KV-Cache:** Streams `k_cache_f16` and `v_cache_f16` in one pass while pinning the 64-dim head accumulator in SIMD registers—cutting KV-cache memory bandwidth by **50%** and eliminating `att[n_head, seq_len]` scratch buffers.
   * **Zero-Copy 3D Sparse MoE (`lfm2moe`):** Implements LFM2’s Sigmoid + `exp_probs_b` auxiliary-loss-free router and slices 2D expert views directly out of the 3D `mmap` buffer—touching only the **4 active experts (12.5% of weights)** per token on `LFM2-8B-A1B`.
+* **Isolated LFM3 Tri-Hybrid Compute Path ([`tools/lfm3_engine.c`](tools/lfm3_engine.c)):** Dispatches `general.architecture == "lfm3"` at load time without touching LFM2/LFM2.5 hot loops—adding a **6-slot circular-ring 7-tap ShortConv**, **dual-head online `GQA-128`** over **ring-buffered Sliding-Window Attention (`w = 256`)** and full partial-RoPE layers, fused **`1x4` QKV+Gate** dispatch (`sigmoid(attn_gate)`), **Sandwich Norms**, and **128K BPE / `<think>` ChatML** support.
 * **Runtime Multi-ISA Dispatch (Single Portable Binary):**
   * **`x86_64` Desktop/Server:** Queries `CPUID` at startup to dispatch `AVX-VNNI` (`vpdpbusd`), `AVX2 + FMA + F16C`, or portable scalar C11, paired with `_MM_HINT_NTA` non-temporal weight prefetching to prevent L2/L3 cache pollution.
   * **`aarch64` Android/ARM:** Queries `getauxval(AT_HWCAP)` to dispatch `ARMv8.2-A DotProd` (`vdotq_s32`), `TBL` (`vqtbl1q_s8`), and native `FP16` (`vcvt_f32_f16`) kernels with 16 KB page alignment for Android 15+.
@@ -47,15 +48,15 @@ Unlike general-purpose Transformer runtimes that treat hybrid models as generic 
                                           |
                                           v
 +-----------------------------------------------------------------------------------+
-|                     Hybrid LFM2 / LFM2.5 Forward Stack (L Layers)                 |
+|                 Hybrid LFM2 / LFM2.5 / LFM3 Forward Stack (L Layers)              |
 |                                                                                   |
 |   +-----------------------------------+   +-----------------------------------+   |
-|   |   ShortConv ("LIV") Block (63%)   |   |    GQA Attention Block (37%)      |   |
+|   |   ShortConv ("LIV") Block         |   |    GQA Attention Block            |   |
 |   | - Fused RMSNorm -> Q8_K           |   | - Fused RMSNorm -> Q8_K           |   |
-|   | - 1x4 Unrolled `in_proj` [3*D]    |   | - Single-Barrier 1x4 QKV Proj     |   |
-|   | - Fused Gate1 + Planar 3-Tap FMA  |   | - AVX2/NEON QK-Norm + RoPE LUT    |   |
-|   |   + 2-Token State Shift + Gate2   |   | - Direct FP16 KV-Cache Store      |   |
-|   |   + L1-Hot Q8_K Quantize          |   | - 1-Pass Online Softmax + Q8_K    |   |
+|   | - 1x4 Unrolled `in_proj` [3*D]    |   | - Single-Barrier 1x4 QKV(+Gate)   |   |
+|   | - LFM2: Planar 3-Tap FMA (d=3)    |   | - QK-Norm + RoPE (SWA / Partial)  |   |
+|   | - LFM3: Ring 7-Tap FMA (d=7)      |   | - FP16 KV (Full / w=256 SWA Ring) |   |
+|   |   + Gate1/2 + L1-Hot Q8_K Quant   |   | - Online Softmax + Sandwich Norms |   |
 |   | - 1x4 Unrolled `out_proj` [D]     |   | - Attention-Sink RoPE KV-Shifting |   |
 |   +-----------------+-----------------+   +-----------------+-----------------+   |
 |                     |                                       |                     |
@@ -108,6 +109,8 @@ Because only 6 of the 16 layers in `LFM2.5-1.2B` use GQA attention (with `n_head
 | **`LFM2.5-2.6B`** | `Q4_K_M` | 1.54 GB | 1.54 GB | 80.3 MB | 17 tok/s / **41 tok/s** | 38 tok/s / **89 tok/s** | **12 tok/s** |
 | **`LFM2-8B-A1B` (MoE)** | `Q4_K_M` | 4.82 GB | **~890 MB** (Top-4/32) | 48.3 MB | 27 tok/s / **64 tok/s** | 61 tok/s / **140 tok/s** | — |
 
+*Verified local laptop measurements on **Intel Core i5-10210U** (4C/8T, `AVX2 + FMA + F16C`, auto 3 threads, warmed `mmap`) for **LFM3-1.7B (`Q4_K_M`, 1048.7 MB, 24 layers, `vocab=128000`)**: **25.5–27.4 tok/s** prefill and **11.4–13.4 tok/s** decode (`12.8 tok/s` steady-state 96-token greedy decode; `139.9 tok/s` prefill / `59.2 tok/s` decode on `LFM2.5-350M`; `36.8 tok/s` prefill / `21.5 tok/s` decode on `LFM2.5-1.2B-Instruct` on the same machine).*
+
 *For empirical side-by-side benchmarks against `llama.cpp` (21.6x faster cold startup, ~500 MB less RAM), see [docs/BENCHMARKS.md](docs/BENCHMARKS.md).*
 
 ---
@@ -138,11 +141,14 @@ uv pip install -e .
 ### 1. Interactive CLI, UNIX Pipes & Disk Prompt Caching
 
 ```bash
-# Interactive multi-turn ChatML REPL with sequential mmap page warmup
-./bin/lfm2 -m LFM2.5-1.2B-Instruct-Q4_K_M.gguf --preload
+# Interactive multi-turn ChatML REPL with sequential mmap page warmup (auto-dispatches LFM2 / LFM2.5 / LFM3)
+./bin/lfm2 -m models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf --preload
 
-# Zero-latency system prompt caching (--prompt-cache saves ShortConv + FP16 GQA state)
-./bin/lfm2 -m LFM2.5-1.2B-Instruct-Q4_K_M.gguf \
+# Run LFM3-1.7B with a 512-token turn budget (accommodates its built-in <think>...</think> reasoning block)
+./bin/lfm2 -m models/LFM3-1.7B-Q4_K_M.gguf --warmup -n 512 -p "Write a Python function to reverse a string."
+
+# Zero-latency system prompt caching (--prompt-cache saves ShortConv + FP16 GQA/SWA state)
+./bin/lfm2 -m models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf \
     --prompt-cache sys_agent.lfmcache \
     --system "You are a systems programming assistant."
 
@@ -165,7 +171,9 @@ git diff | ./bin/lfm2 -m LFM2.5-1.2B-Instruct-Q4_K_M.gguf \
 Launch the single-threaded, non-blocking `epoll` server (includes an embedded dark-mode Web UI at `http://127.0.0.1:8080/`):
 
 ```bash
-./bin/lfm2-server -m LFM2.5-1.2B-Instruct-Q4_K_M.gguf --port 8080
+./bin/lfm2-server -m models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf --port 8080
+# Also supports LFM3 checkpoints with identical OpenAI endpoints:
+./bin/lfm2-server -m models/LFM3-1.7B-Q4_K_M.gguf --port 8080
 ```
 
 * **Streaming Chat Completions (`POST /v1/chat/completions`):**
@@ -182,7 +190,7 @@ Launch the single-threaded, non-blocking `epoll` server (includes an embedded da
     }'
   ```
 * **L2-Normalized Embeddings (`POST /v1/embeddings`):**
-  Skips the 65,536-row LM classifier head (`output.weight`) for fast local RAG indexing:
+  Skips the LM classifier head (`output.weight`: 65,536 rows on LFM2/2.5, 128,000 rows on LFM3) for fast local RAG indexing:
   ```bash
   curl http://127.0.0.1:8080/v1/embeddings \
     -H "Content-Type: application/json" \
@@ -219,6 +227,21 @@ with LFM2Model("LFM2.5-1.2B-Instruct-Q4_K_M.gguf") as model:
 
         # 3. Extract L2-normalized embedding vector (float[2048], ||v||_2 = 1.0)
         vec = ctx.embed("Hybrid ShortConv and GQA architecture", LFM2PoolingType.LAST_TOKEN)
+```
+
+For **LFM3 (`general.architecture == "lfm3"`)**, `LFM2Model` auto-dispatches to the isolated LFM3 engine, or you can enforce architecture validation using [`LFM3Model`](python/lfm2.py#L665) / [`load_lfm3_model`](python/lfm2.py#L707) (raises `ValueError` if given a non-LFM3 GGUF):
+
+```python
+from lfm2 import LFM3Model, load_lfm3_model  # or from python.lfm2 import ...
+
+with load_lfm3_model("models/LFM3-1.7B-Q4_K_M.gguf", warmup_pages=True) as model:
+    with model.create_context(max_seq_len=2048) as ctx:
+        reply = ctx.chat(
+            "What is the capital of France?",
+            max_tokens=512,
+            max_think_tokens=128,  # Optional: caps <think> tokens before forcing </think>
+        )
+        print(reply)
 ```
 
 ---
@@ -275,7 +298,11 @@ Before tagging a release or modifying SIMD kernels, run the 5-tier verification 
 
 ```bash
 # Run Tiers 1-4 (BPE Contract, Batched GEMM vs M=1 Parity, 0.0-ULP Checkpoint Rollback, L2 Norm)
-make parity MODEL=LFM2.5-1.2B-Instruct-Q4_K_M.gguf QUANT=Q4_K_M
+make parity MODEL=models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf QUANT=Q4_K_M
+make parity MODEL=models/LFM3-1.7B-Q4_K_M.gguf QUANT=Q4_K_M
+
+# Run dedicated LFM3 unit & real-model engine suite (ShortConv7 ring, SWA w=256, Checkpoint/Cache/SinkShift)
+./bin/test_lfm3 models/LFM3-1.7B-Q4_K_M.gguf
 
 # Generate a Golden Reference Fixture (.lfm_golden) from Q8_0/F16 or Hugging Face FP32
 python3 tests/verify_parity.py \
@@ -299,6 +326,8 @@ Start at the **[Documentation Hub (`docs/README.md`)](docs/README.md)** or jump 
 | Guide | Covers |
 | :--- | :--- |
 | [Engine Architecture](docs/ARCHITECTURE.md) | Hybrid ShortConv + GQA + MoE math, AVX2/AVX-VNNI & ARM64 NEON/DotProd kernels, `.lfmcache`, `epoll` server, Speculative PLD |
+| [LFM3 vs. LFM2/LFM2.5 Guide](docs/LFM3_VS_LFM2_GUIDE.md) | Tri-hybrid SWA + 7-tap ShortConv + Sandwich Norm + `attn_gate` + partial RoPE architectural diff & GGUF inventory |
+| [LFM3 Implementation Plan](docs/LFM3_IMPLEMENTATION_PLAN.md) | Isolated LFM3 engine roadmap (`tools/lfm3_engine.c`), LFM2 vs. LFM3 runtime matrix & parity gates |
 | [Benchmarks & Roofline](docs/BENCHMARKS.md) | Empirical `LFM2.c` vs. `llama.cpp` comparisons, RAM footprint, cold load times, and DRAM roofline math |
 | [Android Studio (Kotlin / Java)](docs/ANDROID_KOTLIN_INTEGRATION.md) | CMake/JNI setup, Kotlin Coroutines `Flow`, Java SDK, SAF Scoped Storage `fd`, and `lmkd` memory hooks |
 | [Android (Python / Kivy)](docs/ANDROID_KIVY_INTEGRATION.md) | NDK cross-compilation, `p4a` / `buildozer` recipe, async 60 FPS UI bridge, and SAF `detachFd()` |
