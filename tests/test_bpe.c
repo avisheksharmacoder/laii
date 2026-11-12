@@ -107,7 +107,12 @@ static void test_exact_bpe_merging(void) {
 
 static void test_gpt2_byte_mapping(void) {
     printf("[Test 2/5] Verifying GPT-2 Byte-to-Unicode mapping and round-trip detokenizer...\n");
-    /* Verify all 256 bytes map to valid 1-byte or 2-byte UTF-8 sequences */
+    /* Verify all 256 bytes map to valid 1-byte or 2-byte UTF-8 sequences and round-trip */
+    char *one_tok = NULL;
+    LFM2Vocab roundtrip_v = {0};
+    roundtrip_v.n_vocab = 1;
+    roundtrip_v.tokens = &one_tok;
+
     for (int b = 0; b < 256; ++b) {
         char u8[4];
         size_t len = gpt2_single_byte_to_utf8((uint8_t)b, u8);
@@ -127,15 +132,24 @@ static void test_gpt2_byte_mapping(void) {
             assert(len == 1);
             assert((uint8_t)u8[0] == (uint8_t)b);
         }
+
+        one_tok = u8;
+        char raw_out[4];
+        size_t rlen = lfm2_detokenize_token(&roundtrip_v, 0, raw_out, sizeof(raw_out));
+        assert(rlen == 1 && (uint8_t)raw_out[0] == (uint8_t)b);
     }
 
-    /* Test detokenize on space and newline */
+    /* Test detokenize on space, newline, and multi-byte UTF-8 sequences */
     LFM2Vocab v;
     memset(&v, 0, sizeof(v));
-    const char *toks[] = { "<pad>", "Ġ", "Ċ", "Hello", "Ġworld" };
-    v.n_vocab = 5;
-    v.tokens = (char **)calloc(5, sizeof(char *));
-    for (int i = 0; i < 5; ++i) v.tokens[i] = strdup(toks[i]);
+    const char *toks[] = {
+        "<pad>", "Ġ", "Ċ", "Hello", "Ġworld",
+        "\xC3\xA2\xC4\xA2\xC4\xB5",         /* âĢĵ -> en-dash "–" (\xE2\x80\x93) */
+        "\xC4\xA0\xC3\xA2\xC4\xA2\xC4\xB5"  /* ĠâĢĵ -> " –" */
+    };
+    v.n_vocab = 7;
+    v.tokens = (char **)calloc(v.n_vocab, sizeof(char *));
+    for (uint32_t i = 0; i < v.n_vocab; ++i) v.tokens[i] = strdup(toks[i]);
 
     char decoded[32];
     /* Token 1: Ġ -> ' ' */
@@ -153,6 +167,14 @@ static void test_gpt2_byte_mapping(void) {
     /* Token 4: Ġworld -> " world" */
     dlen = lfm2_detokenize_token(&v, 4, decoded, sizeof(decoded));
     assert(dlen == 6 && strcmp(decoded, " world") == 0);
+
+    /* Token 5: âĢĵ -> "–" */
+    dlen = lfm2_detokenize_token(&v, 5, decoded, sizeof(decoded));
+    assert(dlen == 3 && strcmp(decoded, "\xE2\x80\x93") == 0);
+
+    /* Token 6: ĠâĢĵ -> " –" */
+    dlen = lfm2_detokenize_token(&v, 6, decoded, sizeof(decoded));
+    assert(dlen == 4 && strcmp(decoded, " \xE2\x80\x93") == 0);
 
     lfm2_vocab_free(&v);
     printf("PASSED: GPT-2 Byte-to-Unicode mapping and detokenization verified.\n");

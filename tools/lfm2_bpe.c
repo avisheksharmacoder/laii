@@ -822,28 +822,12 @@ uint32_t lfm2_tokenize(const LFM2Vocab *v, const char *text,
     return n_out;
 }
 
+#include "../include/lfm2_gpt2_decode.h"
+
 /* Decodes a single token ID back into raw UTF-8 bytes */
 size_t lfm2_detokenize_token(const LFM2Vocab *v, uint32_t tid, char *out_buf, size_t out_cap) {
-    if (tid >= v->n_vocab || out_cap == 0) return 0;
-    const uint8_t *s = (const uint8_t *)v->tokens[tid];
-    size_t pos = 0;
-
-    while (*s && pos + 1 < out_cap) {
-        if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
-            uint16_t cp = ((uint16_t)(s[0] & 0x1F) << 6) | (uint16_t)(s[1] & 0x3F);
-            if (cp >= 256 && cp <= 323) {
-                uint16_t off = cp - 256;
-                uint8_t raw = (off < 33) ? (uint8_t)off :
-                              (off < 67) ? (uint8_t)(off - 33 + 127) : 173;
-                out_buf[pos++] = (char)raw;
-                s += 2;
-                continue;
-            }
-        }
-        out_buf[pos++] = (char)(*s++);
-    }
-    out_buf[pos] = '\0';
-    return pos;
+    if (!v || tid >= v->n_vocab || out_cap == 0) return 0;
+    return lfm2_decode_gpt2_bytes(v->tokens[tid], out_buf, out_cap);
 }
 
 /* Decodes a token and writes to stdout */

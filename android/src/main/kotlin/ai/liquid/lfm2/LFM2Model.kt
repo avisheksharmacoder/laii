@@ -39,11 +39,11 @@ inline fun <R> LFM2Model.withContext(
 fun LFM2Context.generateSequence(
     userMessage: String,
     sampleParams: SampleParams = SampleParams(),
-    maxChunks: Int = Int.MAX_VALUE
+    maxChunks: Int = 2000
 ): Sequence<GenerationChunk> = sequence {
     beginChatTurn(userMessage, sampleParams)
     var emitted = 0
-    while (emitted < maxChunks) {
+    while (maxChunks <= 0 || emitted < maxChunks) {
         val chunk = nextChunk() ?: break
         yield(chunk)
         emitted++

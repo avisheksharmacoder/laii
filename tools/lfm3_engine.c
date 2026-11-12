@@ -21,6 +21,20 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef LFM_DEFAULTS_H
+#if defined(__has_include)
+#  if __has_include("lfm_defaults.h")
+#    include "lfm_defaults.h"
+#  elif __has_include("include/lfm_defaults.h")
+#    include "include/lfm_defaults.h"
+#  elif __has_include("../include/lfm_defaults.h")
+#    include "../include/lfm_defaults.h"
+#  endif
+#else
+#  include "lfm_defaults.h"
+#endif
+#endif
+
 #ifndef LFM3_ENGINE_INCLUDED
 #define LFM3_ENGINE_INCLUDED 1
 
@@ -1654,11 +1668,7 @@ bool lfm3_state_init(LFM3State *s, const LFM2Model *m, uint32_t max_seq_len, uin
     if (!lfm2_threadpool_init(&s->pool, n_threads)) return false;
 
     const LFM2Config *c = &m->cfg;
-    s->max_seq_len    = (max_seq_len > 0U && max_seq_len <= c->n_ctx) ? max_seq_len :
-                        ((c->n_ctx > 0U && c->n_ctx < 4096U) ? c->n_ctx : 4096U);
-    if (max_seq_len > 0U && max_seq_len > c->n_ctx && c->n_ctx > 0U) {
-        s->max_seq_len = c->n_ctx;
-    }
+    s->max_seq_len    = lfm_resolve_ctx_len(max_seq_len, c->n_ctx);
     s->sliding_window = (c->sliding_window > 0U) ? c->sliding_window : 256U;
     s->swa_cap        = s->sliding_window + LFM2_MAX_BATCH;
     s->hist_len       = (c->shortconv_l_cache > 1U) ? (c->shortconv_l_cache - 1U) : LFM3_SHORTCONV_HIST;

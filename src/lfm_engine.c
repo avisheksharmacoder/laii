@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lfm_engine.h"
+#include "lfm_defaults.h"
 #include "lfm_sys_cache.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,7 +205,7 @@ size_t lfm_engine_generate(
     uint32_t top_k = sampler ? sampler->top_k : 50;
     float rep_penalty = sampler && sampler->rep_penalty > 0.0f ? sampler->rep_penalty : 1.0f;
     uint32_t rep_win = sampler && sampler->rep_window > 0 ? sampler->rep_window : 64;
-    uint32_t max_gen = sampler && sampler->max_new_tokens ? sampler->max_new_tokens : 128;
+    uint32_t max_gen = sampler && sampler->max_new_tokens ? sampler->max_new_tokens : (uint32_t)LFM_DEFAULT_MAX_TOKENS;
 
     uint32_t *history = (uint32_t*)calloc(rep_win, sizeof(uint32_t));
     uint32_t hist_count = 0;
@@ -302,7 +303,7 @@ size_t lfm_engine_generate(
     uint32_t cur_hist_len = hist_count < rep_win ? hist_count : rep_win;
     uint32_t next_token = sample_token(logits, cfg->vocab_size, temp, min_p, top_k, rep_penalty, history, cur_hist_len, &rng);
 
-    while (tokens_generated < max_gen) {
+    while ((max_gen == 0 || tokens_generated < max_gen) && engine->state.current_pos < cfg->max_seq_len) {
         if (sampler && sampler->stop_signal && *(sampler->stop_signal)) {
             break;
         }

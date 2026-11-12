@@ -398,7 +398,7 @@ class LFM2Model:
 
     def create_context(
         self,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 10000,
         n_threads: int = 0,
         system_prompt: str | None = None,
         tools_json: str | None = None,
@@ -423,7 +423,7 @@ class LFM2Model:
         with self.create_context() as c:
             return c.run_server(bind_ip=bind_ip, port=port)
 
-    def tokenize(self, text: str, max_tokens: int = 4096) -> list[int]:
+    def tokenize(self, text: str, max_tokens: int = 10000) -> list[int]:
         """Encodes text into a list of BPE token IDs."""
         buf = (ctypes.c_uint32 * max_tokens)()
         n = self._lib.lfm2_tokenize_text(self._ptr, text.encode("utf-8"), buf, max_tokens)
@@ -452,7 +452,7 @@ class LFM2Context:
     def __init__(
         self,
         model: LFM2Model,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 10000,
         n_threads: int = 0,
         system_prompt: str | None = None,
         tools_json: str | None = None,
@@ -539,7 +539,7 @@ class LFM2Context:
         self,
         user_message: str,
         *,
-        max_tokens: int = 0,
+        max_tokens: int = 2000,
         temperature: float = 0.30,
         min_p: float = 0.15,
         top_k: int = 50,

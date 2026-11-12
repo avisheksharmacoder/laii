@@ -25,6 +25,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "../include/lfm2_gpt2_decode.h"
+
 #ifndef LFM2_RUNTIME_FEATURES_INCLUDED
 #define LFM2_RUNTIME_FEATURES_INCLUDED 1
 
@@ -106,24 +108,7 @@ typedef struct {
 
 /* Decodes GPT-2 byte-level UTF-8 string into raw ASCII/UTF-8 bytes */
 static inline uint16_t decode_gpt2_token_bytes(const char *src_utf8, char *dst, size_t dst_cap) {
-    const uint8_t *s = (const uint8_t *)src_utf8;
-    size_t pos = 0;
-    while (*s && pos + 1 < dst_cap) {
-        if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
-            uint16_t cp = ((uint16_t)(s[0] & 0x1F) << 6) | (uint16_t)(s[1] & 0x3F);
-            if (cp >= 256 && cp <= 323) {
-                uint16_t off = cp - 256;
-                uint8_t raw  = (off < 33) ? (uint8_t)off :
-                               (off < 67) ? (uint8_t)(off - 33 + 127) : 173;
-                dst[pos++] = (char)raw;
-                s += 2;
-                continue;
-            }
-        }
-        dst[pos++] = (char)(*s++);
-    }
-    dst[pos] = '\0';
-    return (uint16_t)pos;
+    return (uint16_t)lfm2_decode_gpt2_bytes(src_utf8, dst, dst_cap);
 }
 
 bool lfm2_decoded_vocab_init(LFM2DecodedVocab *dv, char **raw_tokens, uint32_t n_vocab) {

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lfm_c_api.h"
+#include "lfm_defaults.h"
 #include "lfm_engine.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,7 +69,7 @@ int lfm_generate(
     LFMSamplerConfig cfg = {
         .temperature = params ? params->temperature : 0.8f,
         .top_k = params ? params->top_k : 40,
-        .max_new_tokens = params ? params->max_new_tokens : 64,
+        .max_new_tokens = params ? params->max_new_tokens : (uint32_t)LFM_DEFAULT_MAX_TOKENS,
         .seed = params ? params->seed : 42,
         .echo_prompt = params ? params->echo_prompt : false
     };
@@ -90,7 +91,7 @@ int lfm_generate_stream(
     LFMSamplerConfig cfg = {
         .temperature = params ? params->temperature : 0.8f,
         .top_k = params ? params->top_k : 40,
-        .max_new_tokens = params ? params->max_new_tokens : 64,
+        .max_new_tokens = params ? params->max_new_tokens : (uint32_t)LFM_DEFAULT_MAX_TOKENS,
         .seed = params ? params->seed : 42,
         .echo_prompt = params ? params->echo_prompt : false
     };

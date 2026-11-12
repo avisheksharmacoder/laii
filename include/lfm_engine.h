@@ -1,6 +1,8 @@
 #ifndef LFM_ENGINE_H
 #define LFM_ENGINE_H
 
+#include "lfm_defaults.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 #include "lfm_model.h"
@@ -15,7 +17,7 @@ typedef struct {
     uint32_t top_k;          // Top-K cutoff (default 50 for LFM2)
     float rep_penalty;       // Repetition penalty (default 1.05f for LFM2; 1.0 = disabled)
     uint32_t rep_window;     // Window size for repetition penalty (default 64)
-    uint32_t max_new_tokens;
+    uint32_t max_new_tokens; /* 0 = LFM_DEFAULT_MAX_TOKENS (2000), UINT32_MAX = unlimited */
     uint32_t seed;
     bool echo_prompt;
     volatile bool *stop_signal; // Optional early stop signal (SIGINT or stop-string match)

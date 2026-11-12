@@ -157,7 +157,7 @@ public class LFM2Model implements Closeable, AutoCloseable {
      * @return Array of integer token IDs.
      */
     public synchronized int[] tokenize(String text) {
-        return tokenize(text, 4096);
+        return tokenize(text, 10000);
     }
 
     /**

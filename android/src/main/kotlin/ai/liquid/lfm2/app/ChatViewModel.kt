@@ -24,7 +24,7 @@ class ChatViewModel {
     /**
      * Initializes the model and inference context.
      */
-    fun initialize(modelPath: String, maxSeqLen: Int = 2048, numThreads: Int = 4) {
+    fun initialize(modelPath: String, maxSeqLen: Int = 10000, numThreads: Int = 4) {
         val m = LFM2Model.load(modelPath)
         val ctx = m.createContext(contextParams {
             this.maxSeqLen = maxSeqLen
@@ -45,7 +45,7 @@ class ChatViewModel {
     fun sendMessage(
         prompt: String,
         sampleParams: SampleParams = sampleParams { temperature = 0.25f; topK = 40 },
-        maxChunks: Int = Int.MAX_VALUE,
+        maxChunks: Int = 2000,
         onChunk: (GenerationChunk) -> Unit
     ) {
         val ctx = context ?: throw IllegalStateException("ChatViewModel not initialized")

@@ -234,12 +234,13 @@ int lfm_server_start(lfm_engine_t *engine, const LFMServerConfig *config) {
 
             float temp = parse_json_float(body, "temperature", 0.7f);
             int top_k = parse_json_int(body, "top_k", 40);
-            int max_tokens = parse_json_int(body, "max_tokens", 64);
+            int max_tokens = parse_json_int(body, "max_tokens", (int)LFM_DEFAULT_MAX_TOKENS);
+            uint32_t max_new_tokens = (max_tokens <= 0) ? UINT32_MAX : (uint32_t)max_tokens;
 
             lfm_sampler_params_t params = {
                 .temperature = temp,
                 .top_k = (uint32_t)top_k,
-                .max_new_tokens = (uint32_t)max_tokens,
+                .max_new_tokens = max_new_tokens,
                 .seed = 42,
                 .echo_prompt = false
             };
@@ -263,11 +264,12 @@ int lfm_server_start(lfm_engine_t *engine, const LFMServerConfig *config) {
                 "        \"role\": \"assistant\",\n"
                 "        \"content\": \"%s\"\n"
                 "      },\n"
-                "      \"finish_reason\": \"stop\"\n"
+                "      \"finish_reason\": \"%s\"\n"
                 "    }\n"
                 "  ]\n"
                 "}\n",
-                (long)time(NULL), escaped_buf);
+                (long)time(NULL), escaped_buf,
+                (params.max_new_tokens != UINT32_MAX && n_gen >= 0 && (uint32_t)n_gen >= params.max_new_tokens) ? "length" : "stop");
 
             send_http_response(client_fd, 200, "application/json", resp_buf, rlen);
         } else {

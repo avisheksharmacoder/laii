@@ -26,7 +26,7 @@ class MainActivity(private val viewModel: ChatViewModel = ChatViewModel()) {
         return viewModel.onAppBackgrounded()
     }
 
-    fun onUserPrompt(prompt: String, maxChunks: Int = Int.MAX_VALUE, onChunk: (GenerationChunk) -> Unit) {
+    fun onUserPrompt(prompt: String, maxChunks: Int = 2000, onChunk: (GenerationChunk) -> Unit) {
         if (isPaused) {
             onResume()
         }

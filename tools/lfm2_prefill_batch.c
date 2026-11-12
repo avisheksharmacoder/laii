@@ -21,6 +21,20 @@
 #include <time.h>
 #include <assert.h>
 
+#ifndef LFM_DEFAULTS_H
+#if defined(__has_include)
+#  if __has_include("lfm_defaults.h")
+#    include "lfm_defaults.h"
+#  elif __has_include("include/lfm_defaults.h")
+#    include "include/lfm_defaults.h"
+#  elif __has_include("../include/lfm_defaults.h")
+#    include "../include/lfm_defaults.h"
+#  endif
+#else
+#  include "lfm_defaults.h"
+#endif
+#endif
+
 #define LFM2_LOADER_NO_MAIN 1
 #define LFM2_THREADPOOL_NO_MAIN 1
 #define LFM2_FORWARD_NO_MAIN 1
@@ -663,7 +677,7 @@ bool lfm2_batch_state_init(LFM2BatchState *s, const LFM2Model *m,
     lfm2_threadpool_init(&s->pool, n_threads);
 
     const LFM2Config *c = &m->cfg;
-    s->max_seq_len = (max_seq_len > 0 && max_seq_len <= c->n_ctx) ? max_seq_len : 4096;
+    s->max_seq_len = lfm_resolve_ctx_len(max_seq_len, c->n_ctx);
 
     const size_t B        = LFM2_MAX_BATCH;
     const size_t D        = c->n_embd;

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <stdio.h>
+#include "lfm_defaults.h"
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -154,7 +155,7 @@ static uint32_t sample_next_token(float *logits, uint32_t n_vocab, const uint32_
 int main(int argc, char **argv) {
     const char *model_path = (argc >= 2) ? argv[1] : "models/LFM2.5-230M-Q4_K_M.gguf";
     const char *prompt     = (argc >= 3) ? argv[2] : "The sun is shining and the birds are";
-    const uint32_t max_tokens = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 30;
+    const uint32_t max_tokens = (argc >= 4) ? lfm_parse_max_tokens_arg(argv[3]) : (uint32_t)LFM_DEFAULT_MAX_TOKENS;
     const int target_gpu   = (argc >= 5) ? atoi(argv[4]) : -1;
 
     printf("================================================================\n");
@@ -162,7 +163,11 @@ int main(int argc, char **argv) {
     printf("================================================================\n");
     printf("  Model File   : %s\n", model_path);
     printf("  User Prompt  : \"%s\"\n", prompt);
-    printf("  Max Tokens   : %u\n", max_tokens);
+    if (max_tokens == 0) {
+        printf("  Max Tokens   : unlimited (bounded by max_seq)\n");
+    } else {
+        printf("  Max Tokens   : %u\n", max_tokens);
+    }
 
     /* 1. Initialize Vulkan Compute GPU Engine */
     LFMGPUEngine gpu;
@@ -191,7 +196,8 @@ int main(int argc, char **argv) {
 
     /* 4. Allocate Runtime Forward State */
     LFM2State state;
-    if (!lfm2_state_init(&state, &model, 1024)) {
+    uint32_t ctx_limit = lfm_resolve_ctx_len(0U, model.cfg.n_ctx);
+    if (!lfm2_state_init(&state, &model, ctx_limit)) {
         fprintf(stderr, "[FATAL] Failed to initialize state arena.\n");
         lfm2_vocab_free(&vocab);
         lfm2_free_model(&model);
@@ -239,14 +245,15 @@ int main(int argc, char **argv) {
     double t_gen_start = get_time_sec();
     uint32_t generated = 0;
 
-    for (uint32_t step = 0; step < max_tokens; ++step) {
+    for (uint32_t step = 0; (max_tokens == 0 || step < max_tokens) && pos < state.max_seq_len; ++step) {
         float *logits = lfm_gpu_forward_token(&model, &state, curr_token, pos++, &gpu, true);
         if (!logits) break;
 
         uint32_t next_tok = sample_next_token(logits, model.cfg.n_vocab, token_history,
                                               n_hist, 0.30f, 1.10f);
 
-        if (vocab.id_im_end > 0 && next_tok == vocab.id_im_end) {
+        if ((vocab.id_im_end > 0 && next_tok == vocab.id_im_end) ||
+            (vocab.id_bos > 0 && next_tok == vocab.id_bos)) {
             break;
         }
 

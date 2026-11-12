@@ -174,7 +174,7 @@ class LFMEngine:
     def generate(
         self,
         prompt: str,
-        max_tokens: int = 64,
+        max_tokens: int = 2000,
         temperature: float = 0.8,
         top_k: int = 40,
         seed: int = 42,
@@ -182,7 +182,7 @@ class LFMEngine:
         params = _LFMSamplerParams(
             temperature=temperature,
             top_k=top_k,
-            max_new_tokens=max_tokens,
+            max_new_tokens=(0xFFFFFFFF if max_tokens <= 0 else max_tokens),
             seed=seed,
             echo_prompt=False,
         )
@@ -201,7 +201,7 @@ class LFMEngine:
     def generate_stream(
         self,
         prompt: str,
-        max_tokens: int = 64,
+        max_tokens: int = 2000,
         temperature: float = 0.8,
         top_k: int = 40,
         seed: int = 42,
@@ -216,7 +216,7 @@ class LFMEngine:
         params = _LFMSamplerParams(
             temperature=temperature,
             top_k=top_k,
-            max_new_tokens=max_tokens,
+            max_new_tokens=(0xFFFFFFFF if max_tokens <= 0 else max_tokens),
             seed=seed,
             echo_prompt=False,
         )

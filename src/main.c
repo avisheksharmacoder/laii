@@ -15,6 +15,7 @@
 #include <stdbool.h>
 
 #include "lfm_engine.h"
+#include "lfm_defaults.h"
 #include "lfm_simd.h"
 #include "lfm_c_api.h"
 #include "lfm_server.h"
@@ -91,7 +92,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = "Explain why Liquid Foundation Models are faster on edge CPUs:";
     bool prompt_specified = false;
-    uint32_t max_tokens = 128;
+    uint32_t max_tokens = (LFM_DEFAULT_MAX_TOKENS == 0) ? UINT32_MAX : (uint32_t)LFM_DEFAULT_MAX_TOKENS;
     float temp = 0.7f;
     uint32_t top_k = 40;
     uint32_t seed = (uint32_t)time(NULL);
@@ -118,7 +119,8 @@ int main(int argc, char **argv) {
                 i++;
             }
         } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--n-predict") == 0) && i + 1 < argc) {
-            max_tokens = (uint32_t)atoi(argv[++i]);
+            uint32_t parsed = lfm_parse_max_tokens_arg(argv[++i]);
+            max_tokens = (parsed == 0) ? UINT32_MAX : parsed;
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) && i + 1 < argc) {
             temp = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
@@ -143,7 +145,7 @@ int main(int argc, char **argv) {
             printf("  -m, --model <path>       Path to LFM GGUF model file (required)\n");
             printf("  -p, --prompt <string>    Prompt text to generate from\n");
             printf("      --stop <string>      Register stop string (can be specified multiple times)\n");
-            printf("  -n, --n-predict <int>    Maximum number of tokens to generate (default: 128)\n");
+            printf("  -n, --n-predict <int>    Maximum number of tokens to generate (default: %u, 0 = unlimited)\n", (unsigned)LFM_DEFAULT_MAX_TOKENS);
             printf("  -t, --temp <float>       Temperature (default: 0.7, 0 = greedy)\n");
             printf("      --top-k <int>        Top-K filtering (default: 40)\n");
             printf("  -j, --threads <int>      Number of CPU worker threads (default: auto, N-1 physical cores)\n");

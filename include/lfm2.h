@@ -78,7 +78,7 @@ typedef struct {
 } lfm2_model_info_t;
 
 typedef struct {
-    uint32_t max_seq_len;          /* 0 = auto-plan via /proc/meminfo (4096)    */
+    uint32_t max_seq_len;          /* 0 = auto-plan via /proc/meminfo (10000)   */
     uint32_t n_threads;            /* 0 = auto-detect physical CPU cores        */
     uint32_t n_sink_tokens;        /* Attention-sink tokens kept on KV shift(64)*/
     int32_t  auto_clamp_ram;       /* 1 = clamp max_seq_len to prevent Linux OOM*/

@@ -9,8 +9,8 @@ This document details the automated test framework, numerical parity contract, a
 ## 1. Quick Commands
 
 ```bash
-make test                         # Run 30 C test binaries, 16 standalone tools, HTTP/Python checks, and static-test
-make test-c-bins                  # Run the 30 automated C test binaries, 16 standalone tools, and test-http
+make test                         # Run 32 C test binaries, 16 standalone tools, HTTP/Python checks, and static-test
+make test-c-bins                  # Run the 32 automated C test binaries, 16 standalone tools, and test-http
 make test-python                  # Run Python bindings, Python LFM2 SDK, and verify_parity.py
 make test-jni                     # Compile and run Java JNI harness (tests/TestJNI.java)
 make test-kotlin-app              # Compile and run Kotlin Android ViewModel harness (tests/AndroidAppRunner.kt)
@@ -51,7 +51,7 @@ make static-test                  # Verify statically linked ELF binaries and li
 
 ## 3. Automated C Test Binaries (`make test-c-bins`)
 
-`TEST_BINS` in [`Makefile`](../Makefile) comprises **30 C test binaries** executed sequentially by `make test-c-bins`:
+`TEST_BINS` in [`Makefile`](../Makefile) comprises **32 C test binaries** executed sequentially by `make test-c-bins`:
 
 ### 3.1 Core Engine, Tokenizer & PyTorch Numerical Parity
 
@@ -102,6 +102,10 @@ make static-test                  # Verify statically linked ELF binaries and li
 | `bin/test_simd_arm64` | `include/lfm2_simd_arm64.h`, `tools/lfm2_simd_arm64.c` | ARM64 mobile kernel table dispatch, `getauxval(AT_HWCAP)` detection (`HWCAP_ASIMDDP`, `HWCAP_FPHP`), `Q8_K` quant, 1x1 & 1x4 dot products across 6 formats (`Q4_K`, `Q6_K`, `Q5_K`, `IQ4_XS`, `Q4_0`, `Q8_0`), `LFM2_FORCE_ISA=scalar` override |
 | `bin/test_android_io` | `include/lfm2.h`, `src/lfm2_api.c` | `sysconf(_SC_PAGESIZE)` Android 15+ 16 KB page support, `/proc/self/statm` RSS profiler, `dup(fd)` Scoped Storage mapping, dual-layer `MADV_DONTNEED` + `POSIX_FADV_DONTNEED` `lmkd` survival, background warmup |
 | `bin/test_speculative_pld` | `include/lfm2_speculative_pld.h`, `tools/lfm2_speculative_pld.c` | O(1) 3-gram/2-gram lookup, stop-token bounds, `conv_trace[b][l]` rollback, $B=4$ speculative batch forward, 100% bit-exact parity vs. $M=1$ baseline |
+| `bin/test_lfm3` | `tools/lfm3_engine.c`, `tests/test_lfm3.c` | LFM3 tri-hybrid ShortConv7 ring, SWA (`w=256`), Sandwich Norms, `attn_gate`, checkpoint & KV sink shift |
+| `bin/test_lfm2_gui` | `include/lfm_ui.h`, `tools/lfm2_gui_worker.h`, `tests/test_lfm2_gui.c` | Headless GUI suite (no X11 display needed): layout slicing, wrapped UTF-8 + markdown code blocks, multi-line `LfmUiTextEdit` clipboard/submit, SSE JSON delta & `<think>` splitter, `.gguf` dir scanner, and worker `pthread` inference + reset against `tests/lfm2_toy.gguf` |
+
+*For live X11 rendering smoke verification of `bin/lfm2-gui`, run `DISPLAY=:0 ./bin/lfm2-gui --smoke-frames 5 -m tests/lfm2_toy.gguf` (see [DESKTOP_GUI.md](DESKTOP_GUI.md)).*
 
 ---
 
@@ -143,7 +147,7 @@ make static-test                  # Verify statically linked ELF binaries and li
 ## 7. Memory Safety, Concurrency Sanitizers & Distro Portability
 
 ### 7.1 AddressSanitizer & UndefinedBehaviorSanitizer (`make test-asan` / `make asan`)
-* Rebuilds engine objects, tools, and all 30 C test binaries with `-fsanitize=address,undefined -fno-omit-frame-pointer` and executes `make test-c-bins`.
+* Rebuilds engine objects, tools, and all 32 C test binaries with `-fsanitize=address,undefined -fno-omit-frame-pointer` and executes `make test-c-bins`.
 * Also validated in CI against both AVX2 and forced scalar fallback (`LFM2_FORCE_ISA=scalar`) under `LD_PRELOAD` with `verify_parity.py`.
 
 ### 7.2 ThreadSanitizer (`make test-tsan` / `make tsan`)

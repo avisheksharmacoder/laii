@@ -22,6 +22,20 @@
 #define LFM2_PREFILL_BATCH_NO_MAIN 1
 #define LFM2_CLI_STREAM_NO_MAIN 1
 #define LFM2_SYS_CACHE_NO_MAIN 1
+#ifndef LFM_DEFAULTS_H
+#if defined(__has_include)
+#  if __has_include("lfm_defaults.h")
+#    include "lfm_defaults.h"
+#  elif __has_include("include/lfm_defaults.h")
+#    include "include/lfm_defaults.h"
+#  elif __has_include("../include/lfm_defaults.h")
+#    include "../include/lfm_defaults.h"
+#  endif
+#else
+#  include "lfm_defaults.h"
+#endif
+#endif
+
 #define LFM3_ENGINE_NO_MAIN 1
 #include "lfm2_prefill_batch.c"
 #include "lfm2_cli_stream.c"
@@ -316,9 +330,180 @@ static inline float *chat_forward_one(const LFM2Model *m, LFM2BatchState *st, LF
                 : lfm2_forward_batch(m, st,   &tok, 1U, pos, compute_logits);
 }
 
+static void print_chat_usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s -m <path-to-lfm2.gguf> [-p <prompt>] [-n <max_tokens>] [--ctx <tokens>] "
+            "[system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n"
+            "  -n, --n-predict <N>  Max generated tokens per turn (default: %u, 0 = unlimited)\n"
+            "  --ctx <N>            Context window size (default: %u, clamped to model n_ctx)\n",
+            prog, (unsigned)LFM_DEFAULT_MAX_TOKENS, (unsigned)LFM_DEFAULT_CTX_LEN);
+}
+
+static inline void chat_close_turn_im_end(const LFM2Model *model, LFM2BatchState *state,
+                                          LFM3State *lfm3, const LFM2Vocab *vocab,
+                                          uint32_t *inout_pos, uint32_t max_seq) {
+    if (*inout_pos < max_seq) {
+        chat_forward_one(model, state, lfm3, vocab->id_im_end, (*inout_pos)++, false);
+    }
+}
+
+static bool chat_restore_system_prompt_cache(const char *prompt_cache_path,
+                                           const LFM2Model *model, const LFM2Vocab *vocab,
+                                           const LFM2ChatFormatter *formatter,
+                                           LFM2Sampler *sampler, LFM2BatchState *state,
+                                           LFM3State *lfm3, FILE *log_stream,
+                                           bool save_if_missing, uint32_t *out_pos) {
+    char sys_text[4096];
+    uint32_t sys_tokens[2048];
+    snprintf(sys_text, sizeof(sys_text), "<|startoftext|><|im_start|>system\n%s<|im_end|>\n",
+             formatter->system_prompt);
+    uint32_t n_sys = lfm2_tokenize(vocab, sys_text, sys_tokens, 2048);
+    if (n_sys == 0) return false;
+
+    uint32_t matched = 0;
+    bool loaded = lfm3
+        ? lfm2_prompt_cache_try_load_prefix_ex(prompt_cache_path, model, sys_tokens, n_sys,
+                                               lfm3->max_seq_len, lfm3->conv_ring, lfm3->conv_ring_head,
+                                               lfm3->k_cache_f16, lfm3->v_cache_f16, lfm3->swa_cap, &matched)
+        : lfm2_prompt_cache_try_load_prefix(prompt_cache_path, model, sys_tokens, n_sys,
+                                            state->max_seq_len, state->conv_state,
+                                            state->k_cache_f16, state->v_cache_f16, &matched);
+    if (loaded) {
+        *out_pos = matched;
+        for (uint32_t i = 0; i < matched; ++i) {
+            lfm2_sampler_accept(sampler, sys_tokens[i]);
+        }
+        if (log_stream) {
+            fprintf(log_stream, "[Prompt Cache: Restored %u system prefix tokens from %s]\n",
+                    matched, prompt_cache_path);
+        }
+        return true;
+    }
+
+    if (!save_if_missing) return false;
+
+    for (uint32_t i = 0; i < n_sys; ++i) {
+        lfm2_sampler_accept(sampler, sys_tokens[i]);
+    }
+    chat_prefill_prompt(model, state, lfm3, sys_tokens, n_sys, out_pos);
+    bool saved = lfm3
+        ? lfm2_prompt_cache_save_ex(prompt_cache_path, model, sys_tokens, n_sys,
+                                    (float * const *)lfm3->conv_ring, lfm3->conv_ring_head,
+                                    (uint16_t * const *)lfm3->k_cache_f16,
+                                    (uint16_t * const *)lfm3->v_cache_f16, lfm3->swa_cap)
+        : lfm2_prompt_cache_save(prompt_cache_path, model, sys_tokens, n_sys,
+                                 state->conv_state, state->k_cache_f16, state->v_cache_f16);
+    if (saved && log_stream) {
+        fprintf(log_stream, "[Prompt Cache: Cached %u system prefix tokens to %s]\n",
+                n_sys, prompt_cache_path);
+    }
+    return saved;
+}
+
+typedef enum {
+    CHAT_TURN_COMPLETE = 0,
+    CHAT_TURN_CANCELLED = 1,
+    CHAT_TURN_TRUNC_MAX_TOKENS = 2,
+    CHAT_TURN_TRUNC_MAX_SEQ = 3
+} ChatTurnStopReason;
+
+static ChatTurnStopReason chat_run_turn_decode(const LFM2Model *model, LFM2BatchState *state,
+                                               LFM3State *lfm3, const LFM2Vocab *vocab,
+                                               LFM2Sampler *sampler, LFM2StreamFilter *stream_filter,
+                                               const LFM2TerminalEnv *term, float *logits,
+                                               uint32_t *inout_pos, uint32_t max_seq,
+                                               uint32_t max_turn_tokens, bool interactive,
+                                               uint32_t *out_gen_tokens, double *out_decode_ms) {
+    double t_decode_start = time_now_ms();
+    uint32_t gen_tokens = 0;
+    ChatTurnStopReason stop_reason = CHAT_TURN_COMPLETE;
+    bool ended_cleanly = false;
+
+    lfm2_stream_filter_reset(stream_filter);
+    if (interactive) lfm2_sigint_begin_generation();
+
+    while (*inout_pos < max_seq && (max_turn_tokens == 0 || gen_tokens < max_turn_tokens)) {
+        if (interactive && lfm2_sigint_should_abort()) {
+            stop_reason = CHAT_TURN_CANCELLED;
+            ended_cleanly = true;
+            lfm2_stream_filter_flush(stream_filter);
+            if (term->use_ansi_colors) {
+                fprintf(term->log_stream, "\n\033[33m[Generation interrupted by Ctrl+C]\033[0m\n");
+            } else {
+                fprintf(term->log_stream, "\n[Generation interrupted by Ctrl+C]\n");
+            }
+            chat_close_turn_im_end(model, state, lfm3, vocab, inout_pos, max_seq);
+            break;
+        }
+
+        uint32_t next_id = lfm2_sample_token(sampler, logits);
+        gen_tokens++;
+
+        /* Stop generation cleanly when LFM2/LFM3 emits <|im_end|> or EOS */
+        if (next_id == vocab->id_im_end || next_id == vocab->id_bos) {
+            ended_cleanly = true;
+            chat_close_turn_im_end(model, state, lfm3, vocab, inout_pos, max_seq);
+            break;
+        }
+
+        /* Feed token bytes through unified UTF-8 & Stop-String filter */
+        char tok_buf[512];
+        size_t tok_len = lfm2_detokenize_token(vocab, next_id, tok_buf, sizeof(tok_buf));
+        lfm2_stream_status_t s_st = lfm2_stream_filter_feed(stream_filter, tok_buf, tok_len);
+        if (s_st == LFM2_STREAM_STOPPED) {
+            ended_cleanly = true;
+            chat_close_turn_im_end(model, state, lfm3, vocab, inout_pos, max_seq);
+            break;
+        }
+
+        logits = chat_forward_one(model, state, lfm3, next_id, (*inout_pos)++, true);
+    }
+
+    lfm2_stream_filter_flush(stream_filter);
+    if (!ended_cleanly) {
+        stop_reason = (*inout_pos >= max_seq) ? CHAT_TURN_TRUNC_MAX_SEQ : CHAT_TURN_TRUNC_MAX_TOKENS;
+        chat_close_turn_im_end(model, state, lfm3, vocab, inout_pos, max_seq);
+    }
+
+    if (interactive) {
+        lfm2_sigint_end_generation();
+        if (stop_reason == CHAT_TURN_CANCELLED) {
+            lfm2_sigint_clear_abort();
+        }
+    }
+
+    *out_gen_tokens = gen_tokens;
+    *out_decode_ms = time_now_ms() - t_decode_start;
+    return stop_reason;
+}
+
+static void chat_print_truncation_notice(const LFM2TerminalEnv *term, ChatTurnStopReason reason,
+                                         uint32_t max_turn_tokens, uint32_t max_seq,
+                                         bool interactive) {
+    if (reason != CHAT_TURN_TRUNC_MAX_TOKENS && reason != CHAT_TURN_TRUNC_MAX_SEQ) return;
+
+    const char *prefix = interactive ? "\n" : "";
+    const char *color_open = term->use_ansi_colors ? "\033[33m" : "";
+    const char *color_close = term->use_ansi_colors ? "\033[0m" : "";
+
+    if (reason == CHAT_TURN_TRUNC_MAX_SEQ) {
+        fprintf(term->log_stream,
+                "%s%s[Response truncated at max_seq (%u tokens)%s]%s\n",
+                prefix, color_open, max_seq,
+                interactive ? "; use /reset to clear context" : "",
+                color_close);
+    } else {
+        fprintf(term->log_stream,
+                "%s%s[Response truncated at max_tokens=%u; use %s-n <n> to increase]%s\n",
+                prefix, color_open, max_turn_tokens,
+                interactive ? "/max <n> or " : "",
+                color_close);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s -m <path-to-lfm2.gguf> [system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n", argv[0]);
+        print_chat_usage(argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -330,7 +515,8 @@ int main(int argc, char **argv) {
     const char *system_prompt = NULL;
     const char *prompt_cache_path = NULL;
     const char *single_prompt = NULL;
-    uint32_t max_turn_tokens = 256;
+    uint32_t max_turn_tokens = LFM_DEFAULT_MAX_TOKENS;
+    uint32_t requested_ctx = 0U;
     bool do_warmup = false;
     const char *extra_stops[LFM2_MAX_STOP_STRINGS];
     uint32_t n_extra_stops = 0;
@@ -341,7 +527,7 @@ int main(int argc, char **argv) {
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             single_prompt = argv[++i];
         } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--n-predict") == 0) && i + 1 < argc) {
-            max_turn_tokens = (uint32_t)atoi(argv[++i]);
+            max_turn_tokens = lfm_parse_max_tokens_arg(argv[++i]);
         } else if (strcmp(argv[i], "--stop") == 0 && i + 1 < argc) {
             if (n_extra_stops < LFM2_MAX_STOP_STRINGS) {
                 extra_stops[n_extra_stops++] = argv[++i];
@@ -350,6 +536,8 @@ int main(int argc, char **argv) {
             prompt_cache_path = argv[++i];
         } else if (strcmp(argv[i], "--warmup") == 0 || strcmp(argv[i], "--preload") == 0) {
             do_warmup = true;
+        } else if (strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
+            requested_ctx = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
             system_prompt = argv[++i];
         } else if (argv[i][0] != '-') {
@@ -362,7 +550,7 @@ int main(int argc, char **argv) {
     }
 
     if (!model_path) {
-        fprintf(stderr, "Usage: %s -m <path-to-lfm2.gguf> [-p <prompt>] [-n <max_tokens>] [system_prompt] [--warmup] [--preload] [--prompt-cache <file>]\n", argv[0]);
+        print_chat_usage(argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -379,7 +567,7 @@ int main(int argc, char **argv) {
     LFM2BatchState state;
     memset(&state, 0, sizeof(state));
     LFM3State *lfm3 = NULL;
-    uint32_t state_max_seq = 4096U;
+    uint32_t state_max_seq = lfm_resolve_ctx_len(requested_ctx, model.cfg.n_ctx);
 
     /* Linux /proc/meminfo OOM guard and context verification */
     LFM2MemoryPlan plan = lfm2_plan_memory_and_guard_oom(&model, state_max_seq, 512);
@@ -439,8 +627,13 @@ int main(int argc, char **argv) {
                 model.cfg.arch, model.cfg.n_layers, model.cfg.n_vocab, state_max_seq);
         fprintf(out, " Tokens  : BOS=%u (<|startoftext|>) | IM_START=%u | IM_END=%u\n",
                 vocab.id_bos, vocab.id_im_start, vocab.id_im_end);
-        fprintf(out, " Sampler : temp=%.2f | min_p=%.2f | top_k=%u | rep_penalty=%.2f\n",
-                sampler.temperature, sampler.min_p, sampler.top_k, sampler.rep_penalty);
+        if (max_turn_tokens == 0) {
+            fprintf(out, " Sampler : temp=%.2f | min_p=%.2f | top_k=%u | rep_penalty=%.2f | max_tokens=unlimited\n",
+                    sampler.temperature, sampler.min_p, sampler.top_k, sampler.rep_penalty);
+        } else {
+            fprintf(out, " Sampler : temp=%.2f | min_p=%.2f | top_k=%u | rep_penalty=%.2f | max_tokens=%u\n",
+                    sampler.temperature, sampler.min_p, sampler.top_k, sampler.rep_penalty, max_turn_tokens);
+        }
         fprintf(out, " Filter  : UTF-8 boundary buffer active | %u stop strings registered\n",
                 stream_filter.n_stops);
         fprintf(out, " Signals : Two-stage SIGINT active (Ctrl+C cancels turn, 2nd exits)\n");
@@ -451,61 +644,33 @@ int main(int argc, char **argv) {
     uint32_t pos = 0;
     bool cache_restored = false;
     if (prompt_cache_path) {
-        char sys_text[4096];
-        uint32_t sys_tokens[2048];
-        snprintf(sys_text, sizeof(sys_text), "<|startoftext|><|im_start|>system\n%s<|im_end|>\n",
-                 system_prompt ? system_prompt : "You are a helpful assistant.");
-        uint32_t n_sys = lfm2_tokenize(&vocab, sys_text, sys_tokens, 2048);
-        if (n_sys > 0) {
-            uint32_t matched = 0;
-            bool loaded = lfm3
-                ? lfm2_prompt_cache_try_load_prefix_ex(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                       lfm3->max_seq_len, lfm3->conv_ring, lfm3->conv_ring_head,
-                                                       lfm3->k_cache_f16, lfm3->v_cache_f16, lfm3->swa_cap, &matched)
-                : lfm2_prompt_cache_try_load_prefix(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                    state.max_seq_len, state.conv_state,
-                                                    state.k_cache_f16, state.v_cache_f16, &matched);
-            if (loaded) {
-                pos = matched;
-                for (uint32_t i = 0; i < pos; ++i) {
-                    lfm2_sampler_accept(&sampler, sys_tokens[i]);
-                }
-                cache_restored = true;
-                fprintf(term.log_stream, "[Prompt Cache: Restored %u system prefix tokens from %s]\n",
-                        matched, prompt_cache_path);
-            } else {
-                for (uint32_t i = 0; i < n_sys; ++i) {
-                    lfm2_sampler_accept(&sampler, sys_tokens[i]);
-                }
-                chat_prefill_prompt(&model, &state, lfm3, sys_tokens, n_sys, &pos);
-                bool saved = lfm3
-                    ? lfm2_prompt_cache_save_ex(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                (float * const *)lfm3->conv_ring, lfm3->conv_ring_head,
-                                                (uint16_t * const *)lfm3->k_cache_f16,
-                                                (uint16_t * const *)lfm3->v_cache_f16, lfm3->swa_cap)
-                    : lfm2_prompt_cache_save(prompt_cache_path, &model, sys_tokens, n_sys,
-                                             state.conv_state, state.k_cache_f16, state.v_cache_f16);
-                if (saved) {
-                    fprintf(term.log_stream, "[Prompt Cache: Cached %u system prefix tokens to %s]\n",
-                            n_sys, prompt_cache_path);
-                    cache_restored = true;
-                }
-            }
-        }
+        cache_restored = chat_restore_system_prompt_cache(
+            prompt_cache_path, &model, &vocab, &formatter,
+            &sampler, &state, lfm3, term.log_stream, true, &pos);
     }
 
-    char user_input[2048];
-    char formatted_prompt[4096];
-    uint32_t prompt_ids[2048];
+    char user_input[16384];
+    char formatted_prompt[32768];
+    uint32_t prompt_ids_cap = state_max_seq > 0U ? state_max_seq : 1U;
+    uint32_t *prompt_ids = (uint32_t *)calloc(prompt_ids_cap, sizeof(uint32_t));
+    if (!prompt_ids) {
+        fprintf(stderr, "[ERROR] Failed to allocate prompt token buffer.\n");
+        lfm2_sampler_free(&sampler);
+        if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
+        lfm2_vocab_free(&vocab);
+        lfm2_free_model(&model);
+        return EXIT_FAILURE;
+    }
 
     if (single_prompt != NULL) {
         /* Single-shot non-interactive or UNIX pipe mode */
         lfm2_format_chatml_turn(&formatter, single_prompt, (pos == 0),
                                 formatted_prompt, sizeof(formatted_prompt));
-        uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, 2048);
+        uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, prompt_ids_cap);
         if (n_prompt == 0 || pos + n_prompt >= state_max_seq) {
             fprintf(stderr, "[ERROR] Prompt empty or exceeds max context length (%u >= %u)\n",
                     pos + n_prompt, state_max_seq);
+            free(prompt_ids);
             lfm2_sampler_free(&sampler);
             if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
             lfm2_vocab_free(&vocab);
@@ -520,39 +685,24 @@ int main(int argc, char **argv) {
         float *logits = chat_prefill_prompt(&model, &state, lfm3, prompt_ids, n_prompt, &pos);
         double prefill_ms = time_now_ms() - t_prefill_start;
 
-        double t_decode_start = time_now_ms();
         uint32_t gen_tokens = 0;
-        lfm2_stream_filter_reset(&stream_filter);
+        double decode_ms = 0.0;
+        ChatTurnStopReason stop_reason = chat_run_turn_decode(
+            &model, &state, lfm3, &vocab, &sampler, &stream_filter,
+            &term, logits, &pos, state_max_seq, max_turn_tokens, false,
+            &gen_tokens, &decode_ms);
 
-        while (pos < state_max_seq && gen_tokens < max_turn_tokens) {
-            uint32_t next_id = lfm2_sample_token(&sampler, logits);
-            gen_tokens++;
-
-            if (next_id == vocab.id_im_end || next_id == vocab.id_bos) {
-                break;
-            }
-
-            char tok_buf[512];
-            size_t tok_len = lfm2_detokenize_token(&vocab, next_id, tok_buf, sizeof(tok_buf));
-            lfm2_stream_status_t s_st = lfm2_stream_filter_feed(&stream_filter, tok_buf, tok_len);
-            if (s_st == LFM2_STREAM_STOPPED) {
-                break;
-            }
-
-            logits = chat_forward_one(&model, &state, lfm3, next_id, pos++, true);
-        }
-
-        lfm2_stream_filter_flush(&stream_filter);
         printf("\n");
         fflush(stdout);
-        double decode_ms = time_now_ms() - t_decode_start;
+        chat_print_truncation_notice(&term, stop_reason, max_turn_tokens, state_max_seq, false);
 
         fprintf(term.log_stream, "[prefill: %u tok in %.1f ms (%.1f tok/s) | "
                                  "decode: %u tok in %.1f ms (%.2f tok/s) | ctx: %u]\n",
                 n_prompt, prefill_ms, (n_prompt * 1000.0) / (prefill_ms + 1e-6),
                 gen_tokens, decode_ms, (gen_tokens * 1000.0) / (decode_ms + 1e-6), pos);
 
-        lfm2_sampler_free(&sampler);
+        free(prompt_ids);
+    lfm2_sampler_free(&sampler);
         if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
         lfm2_vocab_free(&vocab);
         lfm2_free_model(&model);
@@ -597,26 +747,11 @@ int main(int argc, char **argv) {
             }
             lfm2_sampler_reset(&sampler);
             pos = 0;
-            if (prompt_cache_path && cache_restored) {
-                char sys_text[4096];
-                uint32_t sys_tokens[2048];
-                snprintf(sys_text, sizeof(sys_text), "<|startoftext|><|im_start|>system\n%s<|im_end|>\n",
-                         system_prompt ? system_prompt : "You are a helpful assistant.");
-                uint32_t n_sys = lfm2_tokenize(&vocab, sys_text, sys_tokens, 2048);
-                uint32_t matched = 0;
-                bool ok = lfm3
-                    ? lfm2_prompt_cache_try_load_prefix_ex(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                           lfm3->max_seq_len, lfm3->conv_ring, lfm3->conv_ring_head,
-                                                           lfm3->k_cache_f16, lfm3->v_cache_f16, lfm3->swa_cap, &matched)
-                    : lfm2_prompt_cache_try_load_prefix(prompt_cache_path, &model, sys_tokens, n_sys,
-                                                        state.max_seq_len, state.conv_state,
-                                                        state.k_cache_f16, state.v_cache_f16, &matched);
-                if (ok) {
-                    pos = matched;
-                    for (uint32_t i = 0; i < pos; ++i) lfm2_sampler_accept(&sampler, sys_tokens[i]);
-                    printf("[State reset: Reloaded system prefix from cache (%u tokens).]\n", pos);
-                    continue;
-                }
+            if (prompt_cache_path && cache_restored &&
+                chat_restore_system_prompt_cache(prompt_cache_path, &model, &vocab, &formatter,
+                                                 &sampler, &state, lfm3, NULL, false, &pos)) {
+                printf("[State reset: Reloaded system prefix from cache (%u tokens).]\n", pos);
+                continue;
             }
             printf("[State reset: KV caches and ShortConv ring buffers cleared.]\n");
             continue;
@@ -632,8 +767,12 @@ int main(int argc, char **argv) {
             continue;
         }
         if (strncmp(user_input, "/max ", 5) == 0) {
-            max_turn_tokens = (uint32_t)atoi(user_input + 5);
-            printf("[Max tokens per turn updated to %u]\n", max_turn_tokens);
+            max_turn_tokens = lfm_parse_max_tokens_arg(user_input + 5);
+            if (max_turn_tokens == 0) {
+                printf("[Max tokens per turn updated to unlimited (bounded by max_seq)]\n");
+            } else {
+                printf("[Max tokens per turn updated to %u]\n", max_turn_tokens);
+            }
             continue;
         }
 
@@ -642,7 +781,7 @@ int main(int argc, char **argv) {
                                 formatted_prompt, sizeof(formatted_prompt));
 
         /* 2. Tokenize Formatted Prompt */
-        uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, 2048);
+        uint32_t n_prompt = lfm2_tokenize(&vocab, formatted_prompt, prompt_ids, prompt_ids_cap);
         if (n_prompt == 0 || pos + n_prompt >= state_max_seq) {
             fprintf(stderr, "[WARN] Context window full or empty prompt. Type /reset.\n");
             continue;
@@ -658,62 +797,23 @@ int main(int argc, char **argv) {
 
         /* 4. Autoregressive Decode Loop until <|im_end|> or max_turn_tokens */
         if (term.use_ansi_colors) {
-            printf("\033[1;36m%s >\033[0m ", lfm3 ? "LFM3" : "LFM2");
+            printf("\033[1;36m%s >\033[0m ", formatter.is_lfm3 ? "LFM3" : "LFM2");
         } else {
-            printf("%s > ", lfm3 ? "LFM3" : "LFM2");
+            printf("%s > ", formatter.is_lfm3 ? "LFM3" : "LFM2");
+        }
+        if (formatter.is_lfm3) {
+            printf("<think>");
         }
         fflush(stdout);
 
-        double t_decode_start = time_now_ms();
         uint32_t gen_tokens = 0;
-        bool cancelled = false;
-
-        lfm2_stream_filter_reset(&stream_filter);
-        lfm2_sigint_begin_generation();
-
-        while (pos < state_max_seq && gen_tokens < max_turn_tokens) {
-            /* Check if user pressed Ctrl+C during token decode */
-            if (lfm2_sigint_should_abort()) {
-                cancelled = true;
-                lfm2_stream_filter_flush(&stream_filter);
-                if (term.use_ansi_colors) {
-                    fprintf(term.log_stream, "\n\033[33m[Generation interrupted by Ctrl+C]\033[0m\n");
-                } else {
-                    fprintf(term.log_stream, "\n[Generation interrupted by Ctrl+C]\n");
-                }
-                /* Close turn in state so state remains consistent */
-                chat_forward_one(&model, &state, lfm3, vocab.id_im_end, pos++, false);
-                break;
-            }
-
-            uint32_t next_id = lfm2_sample_token(&sampler, logits);
-            gen_tokens++;
-
-            /* Stop generation cleanly when LFM2/LFM3 emits <|im_end|> or EOS */
-            if (next_id == vocab.id_im_end || next_id == vocab.id_bos) {
-                break;
-            }
-
-            /* Feed token bytes through unified UTF-8 & Stop-String filter */
-            char tok_buf[512];
-            size_t tok_len = lfm2_detokenize_token(&vocab, next_id, tok_buf, sizeof(tok_buf));
-            lfm2_stream_status_t s_st = lfm2_stream_filter_feed(&stream_filter, tok_buf, tok_len);
-            if (s_st == LFM2_STREAM_STOPPED) {
-                /* Multi-token stop string matched! Close turn in state */
-                chat_forward_one(&model, &state, lfm3, vocab.id_im_end, pos++, false);
-                break;
-            }
-
-            logits = chat_forward_one(&model, &state, lfm3, next_id, pos++, true);
-        }
-
-        lfm2_stream_filter_flush(&stream_filter);
-        lfm2_sigint_end_generation();
-        if (cancelled) {
-            lfm2_sigint_clear_abort();
-        }
-
-        double decode_ms = time_now_ms() - t_decode_start;
+        double decode_ms = 0.0;
+        ChatTurnStopReason stop_reason = chat_run_turn_decode(
+            &model, &state, lfm3, &vocab, &sampler, &stream_filter,
+            &term, logits, &pos, state_max_seq, max_turn_tokens, true,
+            &gen_tokens, &decode_ms);
+        fflush(stdout);
+        chat_print_truncation_notice(&term, stop_reason, max_turn_tokens, state_max_seq, true);
 
         if (term.use_ansi_colors) {
             fprintf(term.log_stream, "\n\033[90m[prefill: %u tok in %.1f ms (%.1f tok/s) | "
@@ -728,6 +828,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    free(prompt_ids);
     lfm2_sampler_free(&sampler);
     if (lfm3) { lfm3_state_free(lfm3); free(lfm3); } else { lfm2_batch_state_free(&state); }
     lfm2_vocab_free(&vocab);

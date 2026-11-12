@@ -117,10 +117,13 @@ Because only 6 of the 16 layers in `LFM2.5-1.2B` use GQA attention (with `n_head
 
 ## Quick Start & Building from Source
 
-### 1. Build Native Binaries & Shared Library (`make`)
+### 1. Build Native Binaries, Desktop GUI & Shared Library (`make`)
 ```bash
-# Build CLI (bin/lfm2), epoll HTTP server (bin/lfm2-server), and liblfm2.so
+# Build CLI (bin/lfm2), epoll HTTP server (bin/lfm2-server), desktop GUI (bin/lfm2-gui when X11/Xft present), and liblfm2.so
 make -j$(nproc)
+
+# Build the pure-C11 X11/Xft Desktop GUI explicitly (~97 KB; requires libx11-dev libxft-dev)
+make gui
 
 # Build a single-file portable static Linux binary (uses musl-gcc or gcc -static)
 make static
@@ -166,7 +169,26 @@ git diff | ./bin/lfm2 -m LFM2.5-1.2B-Instruct-Q4_K_M.gguf \
 
 ---
 
-## 2. Zero-Dependency Linux `epoll` OpenAI HTTP/SSE Server
+## 2. Native C11 Desktop GUI (`LFM Studio` / `bin/lfm2-gui`)
+
+Launch a pure C11 + X11/Xft desktop chat client (`~97 KB`, zero Electron/GTK/Qt dependencies) directly after cloning and building (`make gui`):
+
+```bash
+# Local in-process inference (auto-detects models/LFM3-1.7B-Q4_K_M.gguf or first .gguf in ./models)
+./bin/lfm2-gui
+
+# Explicit checkpoint, context window (default 10000), token cap (default 2000; 0 = unlimited), or Light theme
+./bin/lfm2-gui -m models/LFM3-1.7B-Q4_K_M.gguf --ctx 10000 -n 2000 --light
+
+# Or connect to a running bin/lfm2-server over HTTP/SSE:
+./bin/lfm2-gui --server 127.0.0.1:8080
+```
+
+Features an in-app `.gguf` file browser modal, collapsible `<think>` cards, fenced code blocks, live Settings drawer (`temperature`, `min_p`, `top_k`, `max_tokens`, `ctx_len`, `threads`, `mmap` warmup), Dark/Light themes, `XA_CLIPBOARD` copy/paste, and live telemetry (`ctx`, `prefill ms`, `decode tok/s`, `RSS MB`). Full guide: **[`docs/DESKTOP_GUI.md`](docs/DESKTOP_GUI.md)**.
+
+---
+
+## 3. Zero-Dependency Linux `epoll` OpenAI HTTP/SSE Server
 
 Launch the single-threaded, non-blocking `epoll` server (includes an embedded dark-mode Web UI at `http://127.0.0.1:8080/`):
 
@@ -199,7 +221,7 @@ Launch the single-threaded, non-blocking `epoll` server (includes an embedded da
 
 ---
 
-## 3. Zero-Dependency Python SDK (`lfm2`)
+## 4. Zero-Dependency Python SDK (`lfm2`)
 
 The Python package wraps `liblfm2.so` using only Python’s standard-library `ctypes` module (`ctypes.CDLL` releases the GIL on every C call).
 
@@ -246,7 +268,7 @@ with load_lfm3_model("models/LFM3-1.7B-Q4_K_M.gguf", warmup_pages=True) as model
 
 ---
 
-## 4. Android Mobile Deployment (`arm64-v8a`)
+## 5. Android Mobile Deployment (`arm64-v8a`)
 
 **LFM2.c** delivers turnkey mobile support for modern Android smartphone SoCs (Qualcomm Snapdragon, Google Tensor, MediaTek Dimensity, Samsung Exynos) via both **Native Android Studio (Kotlin & Java)** and **Python / Kivy**:
 
@@ -325,13 +347,14 @@ Start at the **[Documentation Hub (`docs/README.md`)](docs/README.md)** or jump 
 
 | Guide | Covers |
 | :--- | :--- |
+| [Desktop GUI (`LFM Studio`)](docs/DESKTOP_GUI.md) | Pure-C11 single-header IMGUI ([`include/lfm_ui.h`](include/lfm_ui.h)), X11/Xft frontend ([`bin/lfm2-gui`](tools/lfm2_gui.c)), Local & Server SSE modes |
 | [Engine Architecture](docs/ARCHITECTURE.md) | Hybrid ShortConv + GQA + MoE math, AVX2/AVX-VNNI & ARM64 NEON/DotProd kernels, `.lfmcache`, `epoll` server, Speculative PLD |
 | [LFM3 vs. LFM2/LFM2.5 Guide](docs/LFM3_VS_LFM2_GUIDE.md) | Tri-hybrid SWA + 7-tap ShortConv + Sandwich Norm + `attn_gate` + partial RoPE architectural diff & GGUF inventory |
 | [LFM3 Implementation Plan](docs/LFM3_IMPLEMENTATION_PLAN.md) | Isolated LFM3 engine roadmap (`tools/lfm3_engine.c`), LFM2 vs. LFM3 runtime matrix & parity gates |
 | [Benchmarks & Roofline](docs/BENCHMARKS.md) | Empirical `LFM2.c` vs. `llama.cpp` comparisons, RAM footprint, cold load times, and DRAM roofline math |
 | [Android Studio (Kotlin / Java)](docs/ANDROID_KOTLIN_INTEGRATION.md) | CMake/JNI setup, Kotlin Coroutines `Flow`, Java SDK, SAF Scoped Storage `fd`, and `lmkd` memory hooks |
 | [Android (Python / Kivy)](docs/ANDROID_KIVY_INTEGRATION.md) | NDK cross-compilation, `p4a` / `buildozer` recipe, async 60 FPS UI bridge, and SAF `detachFd()` |
-| [Test Suite & QA](docs/TEST_SUITE.md) | 30 C test binaries, Python/JNI/Kotlin/HTTP suites, 5-tier parity verification, ASan/TSan, and static ELF packaging |
+| [Test Suite & QA](docs/TEST_SUITE.md) | 32 C test binaries, Python/JNI/Kotlin/HTTP suites, 5-tier parity verification, ASan/TSan, and static ELF packaging |
 | [Engineering Roadmap](docs/ROADMAP.md) | Five-phase `v1.0.0` milestone history and Gen-1 vs. LFM2 module lineage |
 
 ---

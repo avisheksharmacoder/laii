@@ -20,6 +20,20 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef LFM_DEFAULTS_H
+#if defined(__has_include)
+#  if __has_include("lfm_defaults.h")
+#    include "lfm_defaults.h"
+#  elif __has_include("include/lfm_defaults.h")
+#    include "include/lfm_defaults.h"
+#  elif __has_include("../include/lfm_defaults.h")
+#    include "../include/lfm_defaults.h"
+#  endif
+#else
+#  include "lfm_defaults.h"
+#endif
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #elif defined(__aarch64__)
@@ -194,7 +208,7 @@ static inline LFM2MemoryPlan lfm2_plan_memory_and_guard_oom(const LFM2Model *m,
     plan.conv_state_bytes   = (uint64_t)n_conv * hist_len * D * sizeof(float);
     plan.kv_bytes_per_token = kv_per_tok;
 
-    if (requested_ctx == 0) requested_ctx = 4096;
+    if (requested_ctx == 0) requested_ctx = (uint32_t)LFM_DEFAULT_CTX_LEN;
     if (c->n_ctx > 0 && requested_ctx > c->n_ctx) requested_ctx = c->n_ctx;
     plan.requested_ctx    = requested_ctx;
     plan.safe_clamped_ctx = requested_ctx;

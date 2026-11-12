@@ -40,7 +40,7 @@ int main(void) {
      * ------------------------------------------------------------------------ */
     printf("[Test 1/7] Verifying Default Configuration & Sampling PODs...\n");
     lfm2_context_params_t cparams = lfm2_context_default_params();
-    TEST_ASSERT(cparams.max_seq_len == 4096);
+    TEST_ASSERT(cparams.max_seq_len == 10000);
     TEST_ASSERT(cparams.auto_clamp_ram == 1);
     TEST_ASSERT(cparams.n_sink_tokens == 64);
 

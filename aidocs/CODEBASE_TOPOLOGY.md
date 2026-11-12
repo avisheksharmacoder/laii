@@ -40,6 +40,8 @@ laii/
 │   ├── lfm_tokenizer.h      # BPE tokenizer encoding/decoding & byte fallback
 │   ├── lfm_engine.h         # High-level engine lifecycle & autoregressive generation
 │   ├── lfm_c_api.h          # Public C ABI interface for shared/static libraries
+│   ├── lfm_defaults.h       # Shared default max_tokens (2000) & ctx_len (10000) helpers
+│   ├── lfm_ui.h             # Single-header C11 immediate-mode UI library (LfmUiContext)
 │   ├── lfm_server.h         # Embedded HTTP REST server interface
 │   └── lfm_sys_cache.h      # System cache & OOM guard integration header
 ├── src/                     # Core library implementation
@@ -93,6 +95,7 @@ laii/
 │   ├── test_lfm2_api.c      # Public C11 ABI unit tests (streaming, rollback, embeddings)
 │   ├── test_lfm2_server.c   # Non-blocking epoll OpenAI HTTP/SSE server automated test
 │   ├── test_hardening.c     # FTZ/DAZ mode, non-256 divisible dimension & bounds hardening tests
+│   ├── test_lfm2_gui.c      # Headless Desktop GUI unit & worker inference test suite
 │   ├── test_python_bindings.py # Python ctypes bindings automated test
 │   ├── test_python_lfm2.py  # Modern Python SDK test (generator streaming & branch rollback)
 │   ├── verify_parity.py     # 5-tier numerical parity SLA & golden logit verifier
@@ -112,6 +115,8 @@ laii/
 │   ├── lfm2_cli_stream.c    # Streaming UTF-8 boundary buffer & two-stage SIGINT
 │   ├── lfm2_sys_cache.c     # OOM guard, sequential page warmup & prompt cache engine
 │   ├── lfm2_server.c        # Non-blocking Linux epoll OpenAI HTTP/SSE server
+│   ├── lfm2_gui.c           # Native X11 + Xft double-buffered desktop GUI (LFM Studio)
+│   ├── lfm2_gui_worker.h    # Desktop GUI worker pthread, GGUF scanner & SSE client
 │   ├── generate_reference_tensors.py # PyTorch golden tensor generator
 │   └── create_toy_gguf.py   # Synthetic LFM2 GGUF model builder
 └── Makefile                 # Master build system

@@ -9,6 +9,7 @@
 #endif
 
 #include "lfm2.h"
+#include "lfm_defaults.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -338,7 +339,7 @@ static void api_chunk_emit_cb(const char *utf8_bytes, size_t len, void *user_dat
  * ============================================================================ */
 LFM2_API lfm2_context_params_t lfm2_context_default_params(void) {
     return (lfm2_context_params_t){
-        .max_seq_len    = 4096,
+        .max_seq_len    = LFM_DEFAULT_CTX_LEN,
         .n_threads      = 0,
         .n_sink_tokens  = 64,
         .auto_clamp_ram = 1,
@@ -524,7 +525,7 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
 
     ctx->model  = model;
     ctx->params = params ? *params : lfm2_context_default_params();
-    if (ctx->params.max_seq_len == 0) ctx->params.max_seq_len = 4096;
+    ctx->params.max_seq_len = lfm_resolve_ctx_len(ctx->params.max_seq_len, model->core.cfg.n_ctx);
 
     if (ctx->params.auto_clamp_ram) {
         LFM2MemoryPlan plan = lfm2_plan_memory_and_guard_oom(&model->core, ctx->params.max_seq_len, 512);
@@ -547,6 +548,7 @@ LFM2_API lfm2_context_t *lfm2_context_create(const lfm2_model_t *model,
             free(ctx);
             return NULL;
         }
+        ctx->params.max_seq_len = ctx->spec_state.base.max_seq_len;
     }
 
     if (!lfm2_ngram_index_init(&ctx->ngram_idx, ctx->params.max_seq_len, 6, model->vocab.id_im_end)) {

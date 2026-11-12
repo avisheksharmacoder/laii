@@ -4,8 +4,8 @@ package ai.liquid.lfm2;
  * Configuration parameters for creating an {@link LFM2Context}.
  */
 public class ContextParams {
-    /** Maximum sequence length (0 = auto-plan via system RAM / 4096). */
-    public int maxSeqLen = 4096;
+    /** Maximum sequence length (0 = auto-plan via system RAM / 10000). */
+    public int maxSeqLen = 10000;
 
     /** Number of worker threads (0 = auto-detect CPU cores). */
     public int numThreads = 0;

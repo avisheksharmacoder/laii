@@ -11,6 +11,8 @@
 #ifndef LFM_C_API_H
 #define LFM_C_API_H
 
+#include "lfm_defaults.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,7 +38,7 @@ typedef struct LFMEngine lfm_engine_t;
 typedef struct {
     float temperature;
     uint32_t top_k;
-    uint32_t max_new_tokens;
+    uint32_t max_new_tokens; /* 0 = LFM_DEFAULT_MAX_TOKENS (2000), UINT32_MAX = unlimited */
     uint32_t seed;
     bool echo_prompt;
 } lfm_sampler_params_t;

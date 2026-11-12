@@ -40,6 +40,30 @@ static void test_decoded_vocab_bpe_mapping(void) {
     assert(len == 1);
     assert(decoded[0] == '\n');
 
+    /* Multi-byte UTF-8 encoded via GPT-2 Latin-1 + U+0100..U+0143 codepoints:
+     * âĢĵ (\xC3\xA2 \xC4\xA2 \xC4\xB5) -> en-dash "–" (\xE2\x80\x93) */
+    const char endash_tok[] = "\xC3\xA2\xC4\xA2\xC4\xB5";
+    len = decode_gpt2_token_bytes(endash_tok, decoded, sizeof(decoded));
+    assert(len == 3 && strcmp(decoded, "\xE2\x80\x93") == 0);
+
+    /* ĠâĢĵ -> " –" and representative Latin-1 direct bytes [161, 172, 174, 255] */
+    const char spaced_endash_tok[] = "\xC4\xA0\xC3\xA2\xC4\xA2\xC4\xB5";
+    len = decode_gpt2_token_bytes(spaced_endash_tok, decoded, sizeof(decoded));
+    assert(len == 4 && strcmp(decoded, " \xE2\x80\x93") == 0);
+
+    const uint8_t direct_bytes[] = { 161, 172, 174, 255 };
+    for (size_t i = 0; i < sizeof(direct_bytes); ++i) {
+        uint8_t b = direct_bytes[i];
+        char u8[3] = { (char)(0xC0 | (b >> 6)), (char)(0x80 | (b & 0x3F)), '\0' };
+        len = decode_gpt2_token_bytes(u8, decoded, sizeof(decoded));
+        assert(len == 1 && (uint8_t)decoded[0] == b);
+    }
+
+    /* Soft hyphen byte 173 (0xAD) maps to U+0143 (323 -> \xC5\x83) */
+    const char shy_tok[] = "\xC5\x83";
+    len = decode_gpt2_token_bytes(shy_tok, decoded, sizeof(decoded));
+    assert(len == 1 && (uint8_t)decoded[0] == 173);
+
     /* Build sample vocabulary with special and standard tokens */
     const char *mock_tokens[] = {
         "<|startoftext|>", "<|im_start|>", "<|im_end|>",

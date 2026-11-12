@@ -30,6 +30,22 @@
 #endif
 #endif
 
+#ifndef LFM_DEFAULTS_H
+#if defined(__has_include)
+#  if __has_include("lfm_defaults.h")
+#    include "lfm_defaults.h"
+#  elif __has_include("include/lfm_defaults.h")
+#    include "include/lfm_defaults.h"
+#  elif __has_include("../include/lfm_defaults.h")
+#    include "../include/lfm_defaults.h"
+#  endif
+#else
+#  include "lfm_defaults.h"
+#endif
+#endif
+
+static uint32_t g_default_max_tokens = LFM_DEFAULT_MAX_TOKENS;
+
 #define LFM2_MAX_CONNS        32
 #define LFM2_REQ_BUF_CAP      (64 * 1024)  /* 64 KB max request payload */
 #define LFM2_RESP_BUF_CAP     (128 * 1024) /* 128 KB max buffered response (embeddings) */
@@ -515,7 +531,7 @@ static void handle_chat_completions_endpoint(LFM2HttpServer *srv, int slot, cons
     }
 
     LFM2HttpConn *c      = &srv->conns[slot];
-    c->max_tokens        = json_get_u32(body, "max_tokens", 1024);
+    c->max_tokens        = json_get_u32(body, "max_tokens", g_default_max_tokens);
     c->generated_tokens  = 0;
     c->completion_id     = (uint64_t)time(NULL) ^ (uint64_t)slot;
     const bool is_stream = json_get_bool(body, "stream", false);
@@ -539,7 +555,8 @@ static void handle_chat_completions_endpoint(LFM2HttpServer *srv, int slot, cons
         size_t full_len = 0;
         full_reply[0] = '\0';
 
-        while (c->generated_tokens < c->max_tokens) {
+        bool hit_done = false;
+        while (c->max_tokens == 0 || c->generated_tokens < c->max_tokens) {
             char utf8_chunk[512];
             size_t chunk_len = 0;
             int32_t think_phase = 0;
@@ -552,8 +569,10 @@ static void handle_chat_completions_endpoint(LFM2HttpServer *srv, int slot, cons
                 full_len += chunk_len;
                 full_reply[full_len] = '\0';
             }
-            if (st == LFM2_DONE || st < 0) break;
+            if (st == LFM2_DONE || st < 0) { hit_done = true; break; }
         }
+        const char *reason = (!hit_done && c->max_tokens > 0 && c->generated_tokens >= c->max_tokens)
+                             ? "length" : "stop";
 
         char escaped[65536];
         json_escape_utf8(full_reply, full_len, escaped, sizeof(escaped));
@@ -565,10 +584,10 @@ static void handle_chat_completions_endpoint(LFM2HttpServer *srv, int slot, cons
         snprintf(json_resp, sizeof(json_resp),
             "{\"id\":\"chatcmpl-%" PRIx64 "\",\"object\":\"chat.completion\","
             "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-            "\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+            "\"content\":\"%s\"},\"finish_reason\":\"%s\"}],"
             "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u},"
             "\"timings\":{\"prefill_ms\":%.2f,\"decode_ms\":%.2f,\"decode_tok_per_sec\":%.2f}}",
-            c->completion_id, srv->model_info.arch, escaped,
+            c->completion_id, srv->model_info.arch, escaped, reason,
             stats.prompt_tokens, stats.generated_tokens,
             stats.prompt_tokens + stats.generated_tokens,
             stats.prefill_ms, stats.decode_ms, stats.decode_tok_per_sec);
@@ -617,8 +636,9 @@ static void server_step_active_sse(LFM2HttpServer *srv) {
         if (!conn_try_flush_resp(srv, slot)) return;
     }
 
-    if (st == LFM2_DONE || st < 0 || c->generated_tokens >= c->max_tokens) {
-        const char *reason = (c->generated_tokens >= c->max_tokens) ? "length" : "stop";
+    bool hit_max_tokens = (c->max_tokens > 0 && c->generated_tokens >= c->max_tokens);
+    if (st == LFM2_DONE || st < 0 || hit_max_tokens) {
+        const char *reason = (st != LFM2_DONE && hit_max_tokens) ? "length" : "stop";
         lfm2_perf_stats_t stats;
         lfm2_context_get_stats(srv->ctx, &stats);
 
@@ -960,7 +980,7 @@ int main(int argc, char **argv) {
     uint16_t port = 8080;
     const char *bind_ip = "127.0.0.1";
     uint32_t threads = 0;
-    uint32_t max_seq_len = 2048;
+    uint32_t max_seq_len = LFM_DEFAULT_CTX_LEN;
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
@@ -973,6 +993,8 @@ int main(int argc, char **argv) {
             threads = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
             max_seq_len = (uint32_t)atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
+            g_default_max_tokens = lfm_parse_max_tokens_arg(argv[++i]);
         } else if (argv[i][0] != '-') {
             if (!gguf_path) {
                 gguf_path = argv[i];
@@ -983,7 +1005,7 @@ int main(int argc, char **argv) {
     }
 
     if (!gguf_path) {
-        fprintf(stderr, "Usage: %s -m <model.gguf> [--port 8080] [--bind 127.0.0.1] [--threads 0] [--ctx 2048]\n", argv[0]);
+        fprintf(stderr, "Usage: %s -m <model.gguf> [--port 8080] [--bind 127.0.0.1] [--threads 0] [--ctx %u] [-n|--max-tokens %u]\n", argv[0], (unsigned)LFM_DEFAULT_CTX_LEN, (unsigned)LFM_DEFAULT_MAX_TOKENS);
         return 1;
     }
 

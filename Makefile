@@ -23,11 +23,22 @@ endif
 SRC_CORE = src/arena.c src/gguf.c src/lfm_model.c src/lfm_simd.c src/lfm_fused.c src/lfm_threadpool.c src/lfm_forward.c src/lfm_tokenizer.c src/lfm_engine.c src/lfm_c_api.c src/lfm_server.c
 OBJ_CORE = $(SRC_CORE:src/%.c=build/%.o)
 
-TEST_BINS = bin/test_arena bin/test_math bin/test_simd_avx2 bin/test_quants bin/test_simd_kquants bin/test_fused_conv bin/test_threads bin/test_tokenizer bin/test_bpe bin/test_gguf bin/test_conv1d bin/test_attention bin/test_forward bin/test_c_api bin/test_lfm2_threadpool bin/test_optimizations bin/test_prefill_batch bin/test_decode_1x4 bin/test_kernels_fast bin/test_cpuid_quants bin/test_runtime_features bin/test_moe_checkpoint bin/test_cli_stream bin/test_sys_cache bin/test_lfm2_api bin/test_lfm2_server bin/test_hardening bin/test_simd_arm64 bin/test_android_io bin/test_speculative_pld bin/test_lfm3
+TEST_BINS = bin/test_arena bin/test_math bin/test_simd_avx2 bin/test_quants bin/test_simd_kquants bin/test_fused_conv bin/test_threads bin/test_tokenizer bin/test_bpe bin/test_gguf bin/test_conv1d bin/test_attention bin/test_forward bin/test_c_api bin/test_lfm2_threadpool bin/test_optimizations bin/test_prefill_batch bin/test_decode_1x4 bin/test_kernels_fast bin/test_cpuid_quants bin/test_runtime_features bin/test_moe_checkpoint bin/test_cli_stream bin/test_sys_cache bin/test_lfm2_api bin/test_lfm2_server bin/test_hardening bin/test_simd_arm64 bin/test_android_io bin/test_speculative_pld bin/test_lfm3 bin/test_lfm2_gui
 
-.PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-jni test-kotlin-app run-kotlin-app test-parity cli server shared android python-wheel asan tsan parity help
+HAS_X11_XFT := $(shell pkg-config --exists x11 xft 2>/dev/null && echo 1 || echo 0)
+ifeq ($(HAS_X11_XFT), 1)
+    GUI_CFLAGS := $(shell pkg-config --cflags x11 xft)
+    GUI_LIBS   := $(shell pkg-config --libs x11 xft)
+    GUI_ALL_TARGET := bin/lfm2-gui
+else
+    GUI_CFLAGS :=
+    GUI_LIBS   := -lX11 -lXft
+    GUI_ALL_TARGET :=
+endif
 
-all: dirs lib lfm-run lfm-server bin/lfm2 bin/lfm2-server bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld bin/lfm3_engine $(TEST_BINS)
+.PHONY: all clean test test-asan test-tsan dirs fixtures lib static static-musl test-python test-http test-jni test-kotlin-app run-kotlin-app test-parity cli server shared gui android python-wheel asan tsan parity help
+
+all: dirs lib lfm-run lfm-server bin/lfm2 bin/lfm2-server $(GUI_ALL_TARGET) bin/lfm2_loader bin/lfm2_bpe bin/lfm2_threadpool bin/lfm2_forward bin/lfm2_chat bin/lfm2_prefill_bench bin/lfm2_decode_1x4_bench bin/lfm2_kernels_fast_bench bin/lfm2_cpuid_quants bin/lfm2_runtime_features bin/lfm2_moe_checkpoint bin/lfm2_cli_stream bin/lfm2_sys_cache bin/lfm2_server bin/lfm2_simd_arm64 bin/lfm2_speculative_pld bin/lfm3_engine $(TEST_BINS)
 
 dirs:
 	@mkdir -p build bin lib
@@ -104,6 +115,14 @@ bin/lfm2_server: bin/lfm2-server
 cli: bin/lfm2
 server: bin/lfm2-server
 shared: lib/liblfm2.so
+gui: bin/lfm2-gui
+
+bin/lfm2-gui: tools/lfm2_gui.c tools/lfm2_gui_worker.h include/lfm_ui.h include/lfm_defaults.h include/lfm2.h lib/liblfm2.so | dirs
+	@if [ "$(HAS_X11_XFT)" != "1" ]; then \
+		echo "ERROR: X11 and Xft development headers are required for make gui (e.g. sudo apt install libx11-dev libxft-dev libfontconfig1-dev)."; \
+		exit 1; \
+	fi
+	$(CC) $(CFLAGS) $(GUI_CFLAGS) $< -Llib -llfm2 -Wl,-rpath,'$$ORIGIN/../lib' -o $@ $(LDFLAGS) $(GUI_LIBS)
 
 bin/lfm2_simd_arm64: tools/lfm2_simd_arm64.c | dirs
 	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
@@ -280,6 +299,9 @@ bin/test_speculative_pld: tests/test_speculative_pld.c tools/lfm2_speculative_pl
 bin/test_lfm3: tests/test_lfm3.c tools/lfm3_engine.c tools/lfm2_speculative_pld.c tools/lfm2_kernels_fast.c tools/lfm2_decode_1x4.c tools/lfm2_prefill_batch.c tools/lfm2_forward.c tools/lfm2_threadpool.c tools/lfm2_loader.c | dirs
 	$(CC) $(CFLAGS) -I. $< -o $@ $(LDFLAGS)
 
+bin/test_lfm2_gui: tests/test_lfm2_gui.c tools/lfm2_gui_worker.h include/lfm_ui.h include/lfm_defaults.h include/lfm2.h lib/liblfm2.so | dirs
+	$(CC) $(CFLAGS) -Itools $< -Llib -llfm2 -Wl,-rpath,'$$ORIGIN/../lib' -o $@ $(LDFLAGS)
+
 fixtures:
 	@if [ ! -f tests/lfm2_toy.gguf ] || [ ! -f tests/fixtures_attention.bin ]; then \
 		$(PYTHON) tools/generate_reference_tensors.py && \
@@ -403,6 +425,8 @@ test-c-bins: $(TEST_BINS) fixtures
 	@./bin/test_speculative_pld
 	@echo "-------------------------------------------------------"
 	@./bin/test_lfm3
+	@echo "-------------------------------------------------------"
+	@./bin/test_lfm2_gui
 	@echo "-------------------------------------------------------"
 	@echo "[Test] Verifying Standalone Zero-Copy C11 LFM2 GGUF Inspector..."
 	@./bin/lfm2_loader tests/lfm2_toy.gguf > /dev/null && echo "PASSED: lfm2_loader verified on hybrid GGUF checkpoint!"
@@ -578,6 +602,7 @@ help:
 	@echo "  make all                        - Build CLI, epoll HTTP server, static binaries, benchmarks and tests"
 	@echo "  make cli                        - Build interactive terminal CLI (bin/lfm2)"
 	@echo "  make server                     - Build epoll HTTP/SSE server (bin/lfm2-server)"
+	@echo "  make gui                        - Build native C11 X11/Xft desktop GUI (bin/lfm2-gui)"
 	@echo "  make shared                     - Build liblfm2.so shared library"
 	@echo "  make static                     - Build stripped static Linux binaries (musl-gcc / gcc -static)"
 	@echo "  make NATIVE=1                   - Build with -march=native for host CPU"

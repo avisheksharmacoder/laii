@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lfm_model.h"
+#include "lfm_defaults.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,7 +102,7 @@ bool lfm_model_load(LFMModel *model, const char *filepath) {
     if (model->config.conv_L_cache == 0) {
         model->config.conv_L_cache = gguf_get_u32(file, "lfm2.shortconv_l_cache", 3);
     }
-    model->config.max_seq_len = gguf_get_u32(file, "lfm2.context_length", 4096);
+    model->config.max_seq_len = gguf_get_u32(file, "lfm2.context_length", (uint32_t)LFM_DEFAULT_CTX_LEN);
     model->config.norm_eps = gguf_get_f32(file, "lfm2.attention.layer_norm_rms_epsilon", 1e-5f);
     model->config.rope_theta = gguf_get_f32(file, "lfm2.rope.freq_base", 1000000.0f);
 
