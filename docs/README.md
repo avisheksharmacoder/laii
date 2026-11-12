@@ -13,8 +13,9 @@ Welcome to the documentation for **LFM2.c (`laii`)** — a zero-dependency C11 i
 5. **Android Deployment:**
    - Native Android Studio (Kotlin / Java / Jetpack Compose / CMake JNI): [`ANDROID_KOTLIN_INTEGRATION.md`](ANDROID_KOTLIN_INTEGRATION.md)
    - Python / Kivy (`buildozer` / `p4a`): [`ANDROID_KIVY_INTEGRATION.md`](ANDROID_KIVY_INTEGRATION.md)
-6. **Verification & QA:** Read [`TEST_SUITE.md`](TEST_SUITE.md) for all 30 C test binaries, Python SDK tests, Java/Kotlin JNI harnesses, 5-tier parity verification, static binary checks, and ASan/TSan concurrency gates.
-7. **Engineering History:** Read [`ROADMAP.md`](ROADMAP.md) for the five-phase v1.0.0 development milestones and module lineage.
+6. **Verification & QA:** Read [`TEST_SUITE.md`](TEST_SUITE.md) for all 32 C test binaries, Python SDK tests, Java/Kotlin JNI harnesses, 5-tier parity verification, static binary checks, and ASan/TSan concurrency gates.
+7. **Windows 11 & macOS Porting:** Read [`WINDOWS_AND_MAC_PORTING.md`](WINDOWS_AND_MAC_PORTING.md) for the exact Linux/POSIX boundary map (`mmap`, `futex`, `/proc`, `epoll`, `X11`) and the recommended `lfm_pal.h` Win32/Darwin porting guide.
+8. **Engineering History:** Read [`ROADMAP.md`](ROADMAP.md) for the five-phase v1.0.0 development milestones and module lineage.
 
 ---
 
@@ -30,6 +31,7 @@ Welcome to the documentation for **LFM2.c (`laii`)** — a zero-dependency C11 i
 | [`BENCHMARKS.md`](BENCHMARKS.md) | Performance Engineers | Empirical latency, prefill/decode tok/s, RSS comparisons vs. `llama.cpp`, and roofline validation |
 | [`ANDROID_KOTLIN_INTEGRATION.md`](ANDROID_KOTLIN_INTEGRATION.md) | Android Native Developers | CMake/NDK setup, Kotlin Coroutines `Flow`, Java SDK, SAF Scoped Storage `fd`, and `lmkd` memory hooks |
 | [`ANDROID_KIVY_INTEGRATION.md`](ANDROID_KIVY_INTEGRATION.md) | Kivy / Python Mobile Developers | NDK cross-compile, `p4a` recipe, `buildozer.spec`, 60 FPS async UI streaming, and SAF `detachFd()` |
+| [`WINDOWS_AND_MAC_PORTING.md`](WINDOWS_AND_MAC_PORTING.md) | Systems & Platform Porters | Exact Win32 (`MSVC`/`MinGW`) & macOS (`Apple Silicon`/Intel) porting requirements (`mmap`, `futex`/`WaitOnAddress`, `kqueue`/`WSAPoll`, GUI backends) |
 | [`TEST_SUITE.md`](TEST_SUITE.md) | Contributors & CI Maintainers | Automated C/Python/JNI/Kotlin/HTTP suites, `verify_parity.py`, ASan/UBSan, TSan, and static/musl checks |
 | [`ROADMAP.md`](ROADMAP.md) | Maintainers | Phase 1–5 v1.0.0 milestone record and legacy Gen-1 (`src/lfm_*`) vs. LFM2 (`src/lfm2_api.c`, `tools/lfm2_*`) mapping |
 

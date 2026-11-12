@@ -354,6 +354,7 @@ Start at the **[Documentation Hub (`docs/README.md`)](docs/README.md)** or jump 
 | [Benchmarks & Roofline](docs/BENCHMARKS.md) | Empirical `LFM2.c` vs. `llama.cpp` comparisons, RAM footprint, cold load times, and DRAM roofline math |
 | [Android Studio (Kotlin / Java)](docs/ANDROID_KOTLIN_INTEGRATION.md) | CMake/JNI setup, Kotlin Coroutines `Flow`, Java SDK, SAF Scoped Storage `fd`, and `lmkd` memory hooks |
 | [Android (Python / Kivy)](docs/ANDROID_KIVY_INTEGRATION.md) | NDK cross-compilation, `p4a` / `buildozer` recipe, async 60 FPS UI bridge, and SAF `detachFd()` |
+| [Windows 11 & macOS Porting](docs/WINDOWS_AND_MAC_PORTING.md) | Exact Win32 & Darwin porting boundaries (`mmap`, `WaitOnAddress`, `WSAPoll`/`kqueue`, `LfmUiBackend`) |
 | [Test Suite & QA](docs/TEST_SUITE.md) | 32 C test binaries, Python/JNI/Kotlin/HTTP suites, 5-tier parity verification, ASan/TSan, and static ELF packaging |
 | [Engineering Roadmap](docs/ROADMAP.md) | Five-phase `v1.0.0` milestone history and Gen-1 vs. LFM2 module lineage |
 
