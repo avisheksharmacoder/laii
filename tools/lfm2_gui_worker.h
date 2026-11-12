@@ -93,8 +93,9 @@ typedef struct {
 } LfmGuiFileEntry;
 
 typedef struct {
-    int  phase;       /* 0 = pre/answer, 1 = inside <think>, 2 = after </think> */
-    char pending[16];
+    int    phase;            /* 0 = pre/answer, 1 = inside <think>, 2 = after </think> */
+    bool   trim_answer_lead; /* Skip leading newlines right after </think> */
+    char   pending[16];
     size_t pending_len;
 } LfmGuiThinkParser;
 
@@ -302,14 +303,26 @@ static bool lfm_gui_pick_default_model(char *out, size_t cap) {
 
 /* -------- Streaming <think> Splitter + SSE JSON Parser -------- */
 
-static void lfm_gui_think_parser_init(LfmGuiThinkParser *tp) {
+static void lfm_gui_think_parser_init(LfmGuiThinkParser *tp, bool start_in_think) {
     memset(tp, 0, sizeof(*tp));
+    tp->phase = start_in_think ? 1 : 0;
 }
 
-static void lfm_gui_route_piece(LfmGuiString *think, LfmGuiString *answer, bool is_think,
+static void lfm_gui_route_piece(LfmGuiThinkParser *tp, LfmGuiString *think, LfmGuiString *answer,
                                 const char *s, size_t n) {
     if (!s || n == 0) return;
-    lfm_gui_str_append(is_think ? think : answer, s, n);
+    if (tp->phase == 1) {
+        lfm_gui_str_append(think, s, n);
+        return;
+    }
+    if (tp->trim_answer_lead) {
+        while (n > 0 && (*s == '\r' || *s == '\n')) {
+            s++;
+            n--;
+        }
+        if (n > 0) tp->trim_answer_lead = false;
+    }
+    if (n > 0) lfm_gui_str_append(answer, s, n);
 }
 
 static void lfm_gui_think_parser_feed(LfmGuiThinkParser *tp, const char *chunk, size_t n,
@@ -318,32 +331,38 @@ static void lfm_gui_think_parser_feed(LfmGuiThinkParser *tp, const char *chunk, 
     static const char CLOSE_TAG[] = "</think>";
 
     for (size_t i = 0; i < n; ++i) {
-        char c = chunk[i];
         if (tp->pending_len < sizeof(tp->pending) - 1) {
-            tp->pending[tp->pending_len++] = c;
+            tp->pending[tp->pending_len++] = chunk[i];
             tp->pending[tp->pending_len] = '\0';
         }
 
-        const char *target = (tp->phase == 1) ? CLOSE_TAG : OPEN_TAG;
-        size_t tlen = strlen(target);
-        if (tp->pending_len <= tlen && strncmp(tp->pending, target, tp->pending_len) == 0) {
-            if (tp->pending_len == tlen) {
-                tp->phase = (tp->phase == 1) ? 2 : 1;
-                tp->pending_len = 0;
+        while (tp->pending_len > 0) {
+            const char *target = (tp->phase == 1) ? CLOSE_TAG : OPEN_TAG;
+            size_t tlen = strlen(target);
+            if (tp->pending_len <= tlen && strncmp(tp->pending, target, tp->pending_len) == 0) {
+                if (tp->pending_len == tlen) {
+                    bool closing = (tp->phase == 1);
+                    tp->phase = closing ? 2 : 1;
+                    tp->trim_answer_lead = closing;
+                    tp->pending_len = 0;
+                    tp->pending[0] = '\0';
+                }
+                break;
             }
-            continue;
-        }
 
-        /* Mismatch: flush pending prefix cleanly */
-        lfm_gui_route_piece(think, answer, tp->phase == 1, tp->pending, tp->pending_len);
-        tp->pending_len = 0;
+            /* Mismatch: emit first byte and shift remaining prefix for tag resync */
+            lfm_gui_route_piece(tp, think, answer, &tp->pending[0], 1);
+            tp->pending_len--;
+            memmove(tp->pending, tp->pending + 1, tp->pending_len + 1);
+        }
     }
 }
 
 static void lfm_gui_think_parser_flush(LfmGuiThinkParser *tp, LfmGuiString *think, LfmGuiString *answer) {
     if (tp->pending_len > 0) {
-        lfm_gui_route_piece(think, answer, tp->phase == 1, tp->pending, tp->pending_len);
+        lfm_gui_route_piece(tp, think, answer, tp->pending, tp->pending_len);
         tp->pending_len = 0;
+        tp->pending[0] = '\0';
     }
 }
 
@@ -409,10 +428,11 @@ static const char *lfm_gui_find_json_str_field(const char *json, const char *key
     return out;
 }
 
-static bool lfm_gui_extract_sse_line(const char *line, char *out_delta, size_t delta_cap,
-                                     size_t *out_delta_len, char *out_finish, size_t finish_cap,
-                                     bool *out_done) {
+static bool lfm_gui_extract_sse_line_ex(const char *line, char *out_delta, size_t delta_cap,
+                                        size_t *out_delta_len, bool *out_is_reasoning,
+                                        char *out_finish, size_t finish_cap, bool *out_done) {
     if (out_delta_len) *out_delta_len = 0;
+    if (out_is_reasoning) *out_is_reasoning = false;
     if (out_delta && delta_cap > 0) out_delta[0] = '\0';
     if (out_finish && finish_cap > 0) out_finish[0] = '\0';
     if (out_done) *out_done = false;
@@ -433,7 +453,11 @@ static bool lfm_gui_extract_sse_line(const char *line, char *out_delta, size_t d
     const char *delta = strstr(p, "\"delta\"");
     if (delta) {
         size_t dl = 0;
-        if (lfm_gui_find_json_str_field(delta, "content", out_delta, delta_cap, &dl)) {
+        if (lfm_gui_find_json_str_field(delta, "reasoning_content", out_delta, delta_cap, &dl)) {
+            if (out_delta_len) *out_delta_len = dl;
+            if (out_is_reasoning) *out_is_reasoning = true;
+            any = true;
+        } else if (lfm_gui_find_json_str_field(delta, "content", out_delta, delta_cap, &dl)) {
             if (out_delta_len) *out_delta_len = dl;
             any = true;
         }
@@ -446,6 +470,13 @@ static bool lfm_gui_extract_sse_line(const char *line, char *out_delta, size_t d
         any = true;
     }
     return any;
+}
+
+static bool lfm_gui_extract_sse_line(const char *line, char *out_delta, size_t delta_cap,
+                                     size_t *out_delta_len, char *out_finish, size_t finish_cap,
+                                     bool *out_done) {
+    return lfm_gui_extract_sse_line_ex(line, out_delta, delta_cap, out_delta_len, NULL,
+                                       out_finish, finish_cap, out_done);
 }
 
 static void lfm_gui_json_append_escaped(LfmGuiString *dst, const char *s) {
@@ -500,6 +531,7 @@ static size_t lfm_gui_add_msg_locked(LfmGuiEngine *eng, LfmGuiRole role, const c
     LfmGuiMessage *m = &eng->msgs[eng->n_msgs];
     memset(m, 0, sizeof(*m));
     m->role = role;
+    m->think_expanded = true; /* Keep thinking trace visible & separated until collapsed */
     lfm_gui_str_init(&m->think);
     lfm_gui_str_init(&m->answer);
     if (text && text[0]) {
@@ -678,6 +710,15 @@ static void lfm_gui_worker_run_local(LfmGuiEngine *eng, const LfmGuiConfig *cfg,
     const char *stop_reason = "stop";
     uint64_t last_wake = lfm_gui_now_ms();
 
+    /*
+     * LFM3 ChatML template primes the prompt with "<think>", so model output
+     * starts immediately in thinking mode until "</think>". Other thinking
+     * checkpoints (e.g. LFM2.5-Thinking) emit "<think>...</think>" inline.
+     */
+    LfmGuiThinkParser tp;
+    bool is_lfm3 = (strcmp(eng->model_info.arch, "lfm3") == 0);
+    lfm_gui_think_parser_init(&tp, is_lfm3);
+
     while (true) {
         if (atomic_load(&eng->cancel_requested)) {
             stop_reason = "cancelled";
@@ -697,7 +738,7 @@ static void lfm_gui_worker_run_local(LfmGuiEngine *eng, const LfmGuiConfig *cfg,
                 pthread_mutex_lock(&eng->mu);
                 if (msg_idx < eng->n_msgs) {
                     LfmGuiMessage *m = &eng->msgs[msg_idx];
-                    lfm_gui_str_append(think_phase ? &m->think : &m->answer, utf8, written);
+                    lfm_gui_think_parser_feed(&tp, utf8, written, &m->think, &m->answer);
                 }
                 pthread_mutex_unlock(&eng->mu);
             }
@@ -721,7 +762,7 @@ static void lfm_gui_worker_run_local(LfmGuiEngine *eng, const LfmGuiConfig *cfg,
         if (msg_idx < eng->n_msgs) {
             LfmGuiMessage *m = &eng->msgs[msg_idx];
             if (written > 0) {
-                lfm_gui_str_append(think_phase ? &m->think : &m->answer, utf8, written);
+                lfm_gui_think_parser_feed(&tp, utf8, written, &m->think, &m->answer);
             }
             m->gen_tokens = gen_tokens;
             m->prefill_ms = ps.prefill_ms;
@@ -745,6 +786,7 @@ static void lfm_gui_worker_run_local(LfmGuiEngine *eng, const LfmGuiConfig *cfg,
     pthread_mutex_lock(&eng->mu);
     if (msg_idx < eng->n_msgs) {
         LfmGuiMessage *m = &eng->msgs[msg_idx];
+        lfm_gui_think_parser_flush(&tp, &m->think, &m->answer);
         m->streaming = false;
         m->gen_tokens = gen_tokens;
         m->prefill_ms = final_ps.prefill_ms;
@@ -862,7 +904,7 @@ static void lfm_gui_worker_run_server(LfmGuiEngine *eng, const LfmGuiConfig *cfg
     LfmGuiString rx;
     lfm_gui_str_init(&rx);
     LfmGuiThinkParser tp;
-    lfm_gui_think_parser_init(&tp);
+    lfm_gui_think_parser_init(&tp, false);
 
     bool headers_done = false;
     bool stream_done = false;
@@ -903,8 +945,10 @@ static void lfm_gui_worker_run_server(LfmGuiEngine *eng, const LfmGuiConfig *cfg
             char delta[2048];
             char fin[32];
             size_t dlen = 0;
+            bool is_reasoning = false;
             bool done = false;
-            if (lfm_gui_extract_sse_line(rx.data, delta, sizeof(delta), &dlen, fin, sizeof(fin), &done)) {
+            if (lfm_gui_extract_sse_line_ex(rx.data, delta, sizeof(delta), &dlen,
+                                            &is_reasoning, fin, sizeof(fin), &done)) {
                 if (done) {
                     stream_done = true;
                 } else {
@@ -916,7 +960,23 @@ static void lfm_gui_worker_run_server(LfmGuiEngine *eng, const LfmGuiConfig *cfg
                         pthread_mutex_lock(&eng->mu);
                         if (msg_idx < eng->n_msgs) {
                             LfmGuiMessage *m = &eng->msgs[msg_idx];
-                            lfm_gui_think_parser_feed(&tp, delta, dlen, &m->think, &m->answer);
+                            if (is_reasoning) {
+                                /* Server marked chunk as reasoning_content: enter think phase */
+                                if (tp.phase == 0) tp.phase = 1;
+                                lfm_gui_think_parser_feed(&tp, delta, dlen, &m->think, &m->answer);
+                            } else {
+                                /* If server finished reasoning and switched to content without emitting </think>, exit think */
+                                if (tp.phase == 1 && strncmp(delta, "</think>", 8) != 0 &&
+                                    strstr(delta, "</think>") == NULL) {
+                                    /* Let parser check prefix first unless server stripped </think>; if server omitted </think>, switch phase cleanly when reasoning already accumulated */
+                                    if (m->think.len > 0 && delta[0] != '<') {
+                                        lfm_gui_think_parser_flush(&tp, &m->think, &m->answer);
+                                        tp.phase = 2;
+                                        tp.trim_answer_lead = true;
+                                    }
+                                }
+                                lfm_gui_think_parser_feed(&tp, delta, dlen, &m->think, &m->answer);
+                            }
                             double sec = (double)(lfm_gui_now_ms() - t_start) / 1000.0;
                             m->gen_tokens = chunks;
                             m->decode_tok_s = sec > 0.05 ? ((double)chunks / sec) : 0.0;

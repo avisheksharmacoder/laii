@@ -168,8 +168,13 @@ static void test_sse_think_and_dir_scan(void) {
     bool done = false;
 
     const char *l1 = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\\n\\\"LFM\\\"\"}}]}";
-    assert(lfm_gui_extract_sse_line(l1, delta, sizeof(delta), &dlen, fin, sizeof(fin), &done));
-    assert(!done && strcmp(delta, "Hello\n\"LFM\"") == 0);
+    bool is_r = false;
+    assert(lfm_gui_extract_sse_line_ex(l1, delta, sizeof(delta), &dlen, &is_r, fin, sizeof(fin), &done));
+    assert(!done && !is_r && strcmp(delta, "Hello\n\"LFM\"") == 0);
+
+    const char *l1r = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step 1\"}}]}";
+    assert(lfm_gui_extract_sse_line_ex(l1r, delta, sizeof(delta), &dlen, &is_r, fin, sizeof(fin), &done));
+    assert(!done && is_r && strcmp(delta, "step 1") == 0);
 
     const char *l2 = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}";
     assert(lfm_gui_extract_sse_line(l2, delta, sizeof(delta), &dlen, fin, sizeof(fin), &done));
@@ -179,17 +184,31 @@ static void test_sse_think_and_dir_scan(void) {
     assert(lfm_gui_extract_sse_line(l3, delta, sizeof(delta), &dlen, fin, sizeof(fin), &done));
     assert(done);
 
+    /* Case A: LFM2.5-Thinking inline <think>...</think> with tag resync */
     LfmGuiThinkParser tp;
-    lfm_gui_think_parser_init(&tp);
+    lfm_gui_think_parser_init(&tp, false);
     LfmGuiString th, ans;
     lfm_gui_str_init(&th);
     lfm_gui_str_init(&ans);
     lfm_gui_think_parser_feed(&tp, "<thi", 4, &th, &ans);
-    lfm_gui_think_parser_feed(&tp, "nk>plan step</th", 16, &th, &ans);
-    lfm_gui_think_parser_feed(&tp, "ink>Final answer!", 17, &th, &ans);
+    lfm_gui_think_parser_feed(&tp, "nk>plan </th</th", 16, &th, &ans);
+    lfm_gui_think_parser_feed(&tp, "ink>\nFinal answer!", 18, &th, &ans);
     lfm_gui_think_parser_flush(&tp, &th, &ans);
-    assert(th.data && strcmp(th.data, "plan step") == 0);
+    assert(th.data && strcmp(th.data, "plan </th") == 0);
     assert(ans.data && strcmp(ans.data, "Final answer!") == 0);
+    lfm_gui_str_free(&th);
+    lfm_gui_str_free(&ans);
+
+    /* Case B: LFM3 prompt-primed thinking (start_in_think = true) */
+    lfm_gui_think_parser_init(&tp, true);
+    lfm_gui_str_init(&th);
+    lfm_gui_str_init(&ans);
+    lfm_gui_think_parser_feed(&tp, "thought 1", 9, &th, &ans);
+    lfm_gui_think_parser_feed(&tp, "</thi", 5, &th, &ans);
+    lfm_gui_think_parser_feed(&tp, "nk>\n\n42.", 8, &th, &ans);
+    lfm_gui_think_parser_flush(&tp, &th, &ans);
+    assert(th.data && strcmp(th.data, "thought 1") == 0);
+    assert(ans.data && strcmp(ans.data, "42.") == 0);
     lfm_gui_str_free(&th);
     lfm_gui_str_free(&ans);
 

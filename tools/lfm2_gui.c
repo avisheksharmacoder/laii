@@ -746,16 +746,19 @@ static void app_render_chat_pane(LfmApp *app, LfmUiRect area) {
             int32_t pad = 16;
             int32_t cw = max_col_w - 2 * pad;
             int32_t think_hdr_h = (tlen > 0) ? 28 : 0;
-            bool show_think_body = (tlen > 0) && (think_exp || (streaming && alen == 0));
+            bool show_think_body = (tlen > 0) && (think_exp || alen == 0);
             int32_t think_body_h = 0;
             if (show_think_body) {
                 think_body_h = lfm_ui_measure_wrapped_text(ui, LFM_UI_FONT_SMALL, tcopy ? tcopy : "",
-                                                           tlen, cw - 20, NULL) + 20;
+                                                           tlen, cw - 24, NULL) + 20;
             }
-            int32_t ans_h = lfm_ui_measure_markdown(ui, acopy ? acopy : "", alen, cw);
+            int32_t resp_hdr_h = (tlen > 0 && alen > 0) ? 20 : 0;
+            bool draw_ans = (alen > 0 || tlen == 0);
+            int32_t ans_h = draw_ans ? lfm_ui_measure_markdown(ui, acopy ? acopy : "", alen, cw) : 0;
             int32_t foot_h = 26;
             int32_t bh = 14 + (think_hdr_h ? think_hdr_h + 6 : 0) +
-                         (think_body_h ? think_body_h + 8 : 0) + ans_h + 10 + foot_h + 8;
+                         (think_body_h ? think_body_h + 10 : 0) +
+                         (resp_hdr_h ? resp_hdr_h + 4 : 0) + ans_h + 10 + foot_h + 8;
             LfmUiRect card = lfm_rect(col_x, cur_y, max_col_w, bh);
 
             bool visible = (card.y + card.h >= view.y - 60 && card.y <= view.y + view.h + 60);
@@ -766,9 +769,9 @@ static void app_render_chat_pane(LfmApp *app, LfmUiRect area) {
 
             if (think_hdr_h > 0) {
                 char th_lbl[64];
-                snprintf(th_lbl, sizeof(th_lbl), "%s Thinking (%zu chars)",
+                snprintf(th_lbl, sizeof(th_lbl), "%s Thinking Trace (%zu chars)",
                          show_think_body ? "▾" : "▸", tlen);
-                LfmUiRect tr = lfm_rect(card.x + pad, y_cursor, 210, 26);
+                LfmUiRect tr = lfm_rect(card.x + pad, y_cursor, 238, 26);
                 if (visible && lfm_ui_chip(ui, lfm_ui_hash_ptr("think_tog", (uint32_t)i), tr, th_lbl, show_think_body)) {
                     pthread_mutex_lock(&app->eng.mu);
                     if (i < app->eng.n_msgs) {
@@ -781,14 +784,23 @@ static void app_render_chat_pane(LfmApp *app, LfmUiRect area) {
                     LfmUiRect tbox = lfm_rect(card.x + pad, y_cursor, cw, think_body_h);
                     if (visible) {
                         lfm_ui_draw_card(ui, tbox, 8, ui->theme.bg_think, ui->theme.border);
-                        lfm_ui_draw_wrapped_text(ui, LFM_UI_FONT_SMALL, tbox.x + 10, tbox.y + 8,
-                                                 cw - 20, ui->theme.text_muted, tcopy ? tcopy : "", tlen);
+                        lfm_ui_draw_rect(ui, lfm_rect(tbox.x + 2, tbox.y + 6, 3, tbox.h - 12), ui->theme.warn);
+                        lfm_ui_draw_wrapped_text(ui, LFM_UI_FONT_SMALL, tbox.x + 14, tbox.y + 8,
+                                                 cw - 24, ui->theme.text_muted, tcopy ? tcopy : "", tlen);
                     }
-                    y_cursor += think_body_h + 8;
+                    y_cursor += think_body_h + 10;
                 }
             }
 
-            if (visible) {
+            if (resp_hdr_h > 0) {
+                if (visible) {
+                    lfm_ui_draw_text_cstr(ui, LFM_UI_FONT_SMALL, card.x + pad, y_cursor,
+                                          ui->theme.accent, "Response");
+                }
+                y_cursor += resp_hdr_h + 4;
+            }
+
+            if (draw_ans && visible) {
                 lfm_ui_draw_markdown(ui, card.x + pad, y_cursor, cw, acopy ? acopy : "", alen, streaming);
             }
             y_cursor += ans_h + 8;
